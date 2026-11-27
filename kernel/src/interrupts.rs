@@ -543,8 +543,12 @@ crate::ktest!(
         // NO_VECTOR: mapped after `begin_init`'s reset, which unmaps them);
         // MSI-X is on, INTx off. A request makes the device return a
         // buffer: its message arrives on the vector (so the entry is
-        // unmasked) and its handler runs (rng's doorbell rings).
+        // unmasked) and its handler runs (rng's doorbell rings); `fill`
+        // can return first, so the test waits for the ring.
         use crate::{kassert, kassert_eq};
+        // Give-up deadline for the MSI-X doorbell ring (the assertion is on
+        // the confirmed ring, not on time).
+        const RING_WAIT_NS: u64 = 5_000_000_000;
         let addr = crate::rng::ktest_device().ok_or("no virtio-rng bound")?;
         let v =
             crate::pci::msix_vectors().into_iter().find(|r| r.pci == addr).ok_or("virtio-rng has no MSI-X vector")?;
@@ -556,11 +560,72 @@ crate::ktest!(
             lumen_pci::msix::CONTROL_ENABLE
         );
         kassert!(command & lumen_pci::command::INTX_DISABLE != 0);
+        let before = crate::rng::stats();
         let (count, rings) = (crate::arch::idt::vector_count(v.idt_vector), crate::rng::ktest_rings());
         let mut buf = [0u8; 64];
         crate::rng::fill(&mut buf).map_err(|_| "fill refused")?;
-        kassert!(crate::arch::idt::vector_count(v.idt_vector) > count);
-        kassert!(crate::rng::ktest_rings() > rings);
+        let start = crate::time::now_ns();
+        let rings_at_return = crate::rng::ktest_rings();
+        let after = crate::rng::stats();
+        let virtio_on = crate::rng::sources().virtio;
+        let diag = |wake: Option<crate::virtio::Wake>, waited_ms: u64, after_count: u64, after_rings: u64| {
+            crate::ktest::diag(format_args!(
+                "msix_vector_delivered: vec {:#x} count {count}->{after_count}, rings {rings}->{after_rings}, \
+                 wake {wake:?}, waited {waited_ms} ms, virtio {virtio_on}, requests {}->{}, posts {}->{}, busy {}->{}",
+                v.idt_vector, before.requests, after.requests, before.posts, after.posts, before.busy, after.busy,
+            ));
+        };
+        // `busy` unchanged: no caller collided with the device during the
+        // request (ours or another's; conservative), so this `fill` took it;
+        // `requests` rising: it made a request; `posts` rising: it posted a
+        // buffer (`Device::one` posts none past its deadline);
+        // `sources().virtio` still on: the request didn't fail and lose the
+        // device (a seeded pool would still let `fill` return Ok).
+        if after.busy != before.busy || after.requests <= before.requests || after.posts <= before.posts || !virtio_on {
+            diag(None, 0, crate::arch::idt::vector_count(v.idt_vector), rings_at_return);
+        }
+        kassert_eq!(after.busy, before.busy);
+        kassert!(after.requests > before.requests);
+        kassert!(after.posts > before.posts);
+        kassert!(virtio_on);
+        // `rng::fill` -> `StatusHandle::wait_for` checks `queue.can_pop()`
+        // before blocking on the doorbell. QEMU writes the used ring before
+        // it sends the MSI-X message, and a vCPU polling `can_pop()` can see
+        // the used-ring entry first (most likely under KVM), so `fill` can return before
+        // the interrupt runs. Wait until the doorbell rings, bounded by a
+        // give-up deadline; `BELL.ring()` (AcqRel) runs after `VECTOR_COUNTS`
+        // is bumped in `idt::dispatch`, so once `ktest_rings()` (Acquire)
+        // rises both counts are visible.
+        let deadline = start.saturating_add(RING_WAIT_NS);
+        // `wake` is what the last wait returned: `CannotBlock` if this thread
+        // spun instead of blocking (the counts say whether it rang).
+        let wake = loop {
+            let wake = crate::rng::ktest_wait_ring(rings, deadline);
+            if wake != crate::virtio::Wake::CannotBlock
+                || crate::rng::ktest_rings() > rings
+                || crate::time::now_ns() >= deadline
+            {
+                break wake;
+            }
+            core::hint::spin_loop();
+        };
+        let waited_ns = crate::time::now_ns().saturating_sub(start);
+        let after_count = crate::arch::idt::vector_count(v.idt_vector);
+        let after_rings = crate::rng::ktest_rings();
+        // Seen locally and in a failed run's artifacts (CI keeps ktest.tap
+        // only on failure); an upper bound (it includes the wake-up), and
+        // counted per vector, not per request.
+        if rings_at_return == rings && after_rings > rings {
+            crate::ktest::diag(format_args!(
+                "msix_vector_delivered: the ring was seen at most {} us after fill returned (wake {wake:?})",
+                waited_ns / 1_000,
+            ));
+        }
+        if after_count <= count || after_rings <= rings {
+            diag(Some(wake), waited_ns / 1_000_000, after_count, after_rings);
+        }
+        kassert!(after_count > count);
+        kassert!(after_rings > rings);
         Ok(())
     }
 );
