@@ -276,3 +276,11 @@ tests = [
     "harness:test_libctest::test_native_ipc_retries_are_scoped_and_never_hide_persistent_failures[*]",
     "scenario:test_conformance::test_musl_libc_test_core",
 ]
+
+[[feature]]
+name = "M8 D3 git, sqlite3 and vim over a PTY gate on the Alpine developer image, 512 MiB (#395): unmodified Alpine `git` initializes a repo, commits on diverged branches, diffs, checks out, performs a three-way merge, logs and passes `git fsck --full --strict`; `sqlite3` runs WAL mode with commit/rollback, cross-process POSIX `fcntl` write-lock exclusion (`database is locked`), concurrent WAL snapshot reads, cross-process committed WAL reads through `-shm`, pre-close `wal_checkpoint(TRUNCATE)` emptying a non-empty `-wal`, `integrity_check` and host `sqlite3` verification of the persisted database; unmodified Alpine `vim` (`-u NONE -N -c 'set ttimeoutlen=0 showmode laststatus=2 statusline=size=%{&lines}x%{&columns}'`) edits and writes a file over a `/dev/ptmx` PTY driven by `/usr/local/bin/ptyrun --script` (confirming rendered file lines and `size=24x80`, `TIOCSWINSZ`/`SIGWINCH` redraw to `size=30x90`, `-- INSERT --`, typed text, `written`, exit 0 and no leftover swap file), with synced ext4 images passing `e2fsck -fn` and `debugfs` checks"
+milestone = "M8"
+tests = [
+    "scenario:test_alpine::test_local_git_and_sqlite3",
+    "scenario:test_alpine::test_vim_edits_a_file_over_pty",
+]
