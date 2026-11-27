@@ -955,9 +955,10 @@ fn is_xray_kind(kind: u16) -> bool {
 }
 
 /// Ktests: how long CPU 1 holds the lock in [`a_lock_wait`] after observing
-/// this CPU enter `SpinLock::lock`'s spin loop. Covers the TSC's granularity
-/// under TCG and the few-cycle window from an unordered `rdtsc` at
-/// `waits_started`.
+/// this CPU enter `SpinLock::lock`'s spin loop. It sets the floor
+/// `a_contended_lock_is_traced` asserts (half of it, in TSC ticks), and
+/// covers the TSC's granularity under TCG and the few-cycle window from an
+/// unordered `rdtsc` at `waits_started`.
 #[cfg(feature = "ktest")]
 const LOCK_WAIT_HOLD_NS: u64 = 1_000_000;
 
@@ -966,8 +967,9 @@ const LOCK_WAIT_HOLD_NS: u64 = 1_000_000;
 /// holding it for [`LOCK_WAIT_HOLD_NS`] before releasing it so the waiter's
 /// span covers the hold (both TSCs run at one rate). Fails if CPU 1 never
 /// takes the lock, never finishes, or times out after `sched::TEST_DEADLINE_NS`
-/// without observing `waits_started` advance. Returns the `lock` event
-/// recorded in this CPU's X-ray ring and the line of the `lock` call; also
+/// without observing `waits_started` advance. Returns the decoded `lock`
+/// event (`LockWait`) recorded in this CPU's X-ray ring and the line of the
+/// `lock` call; also
 /// checks that the uncontended holder recorded no wait for the lock and that
 /// neither ring missed events.
 ///
@@ -979,7 +981,6 @@ fn a_lock_wait(out: &mut [Event]) -> Result<(LockWait, u32), &'static str> {
     static HOT: crate::sync::SpinLock<u64> = crate::sync::SpinLock::new(0);
     static HELD: AtomicBool = AtomicBool::new(false);
     static BEFORE_WAIT: AtomicU32 = AtomicU32::new(0);
-    static LAST_WAIT: AtomicU32 = AtomicU32::new(0);
     static SAW_WAITER: AtomicBool = AtomicBool::new(false);
     static DONE: AtomicBool = AtomicBool::new(false);
 
@@ -988,12 +989,9 @@ fn a_lock_wait(out: &mut [Event]) -> Result<(LockWait, u32), &'static str> {
         *g += 1;
         let before = HOT.waits_started();
         BEFORE_WAIT.store(before, Ordering::Relaxed);
-        LAST_WAIT.store(before, Ordering::Relaxed);
         HELD.store(true, Ordering::Release);
         let saw = crate::smp::spin_until(crate::time::now_ns() + crate::sched::TEST_DEADLINE_NS, || {
-            let now = HOT.waits_started();
-            LAST_WAIT.store(now, Ordering::Relaxed);
-            now != before
+            HOT.waits_started() != before
         });
         SAW_WAITER.store(saw, Ordering::Relaxed);
         if saw {
@@ -1023,9 +1021,9 @@ fn a_lock_wait(out: &mut [Event]) -> Result<(LockWait, u32), &'static str> {
     }
     if !SAW_WAITER.load(Ordering::Relaxed) {
         crate::ktest::diag(format_args!(
-            "cpu 1 timed out waiting for waits_started: before={}, last={}",
+            "cpu 1 timed out waiting for waits_started: before={}, now={} (now above before: this cpu's wait came after cpu 1 gave up)",
             BEFORE_WAIT.load(Ordering::Relaxed),
-            LAST_WAIT.load(Ordering::Relaxed),
+            HOT.waits_started(),
         ));
         return Err("cpu 1 timed out before this cpu entered the lock's spin loop");
     }
@@ -1178,7 +1176,9 @@ crate::ktest!(
         // CPU (the ktest thread stays on its CPU) records the wait in its own
         // X-ray ring: the lock's address, how often it looked (at least once),
         // how long it waited (at least `LOCK_WAIT_HOLD_NS / 2` in TSC ticks,
-        // the floor set by the hold with /2 for calibration error, and at most
+        // half the hold: the hold and the floor are ticks of one clock, so
+        // calibration cancels, and the half is slack for the unordered rdtsc
+        // and the two CPUs' TSC rates; and at most
         // the whole call's TSC span on this same CPU), and the line of the
         // `lock` call (through `#[track_caller]`).
         use crate::{kassert, kassert_eq};

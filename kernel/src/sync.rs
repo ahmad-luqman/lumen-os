@@ -147,7 +147,8 @@ impl<T> SpinLock<T> {
     }
 
     /// How many contended [`lock`](Self::lock) calls have read their wait's
-    /// start TSC and entered the spin loop (for the ktests).
+    /// start TSC (in program order: see the comment at the bump) and entered
+    /// the spin loop (for the ktests).
     #[cfg(feature = "ktest")]
     pub(crate) fn waits_started(&self) -> u32 {
         self.waits_started.load(Ordering::Relaxed)
