@@ -3,6 +3,10 @@ core in M8 (D4, #396), gVisor's syscall suites in M9 and M10.
 
 The core runs every built static and dynamic test under its own runtest."""
 
+import os
+import sys
+
+import pytest
 from lumen_harness import libctest
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
@@ -16,6 +20,14 @@ def test_musl_libc_test_core(boot, tmp_path, artifacts):
     Timeouts and listed flaky failures get one retry, preserving both
     attempts. Missing EXIT lines and runner errors cannot be expected away.
     """
+    # libc-test is its own target (`make libc-test`, after `make deps-zig`):
+    # `make test` leaves it out, so a local run without it skips. CI builds
+    # it first, so there a missing build fails rather than skips (as
+    # test_libctest.py's _require_build and D1's developer-image guard do).
+    if not (libctest.BUILD / libctest.TESTS_FILE).is_file():
+        if os.environ.get("CI") and sys.platform == "linux":
+            pytest.fail("build/libc-test/tests.txt is missing: CI runs `make libc-test` first")
+        pytest.skip("no build/libc-test (run `make deps-zig libc-test`)")
     tests = libctest.read_tests()
     assert len(tests) == len(set(tests)) == 284
     assert sum(libctest.is_static(test) for test in tests) == 140
