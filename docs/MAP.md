@@ -721,6 +721,29 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   (`console_default`), `Winsize`, the `Output` sink, `Effects`/`Wake`, and
   `background_write_signal` (`SIGTTOU` or `EIO` for a background writer)
   (host-tested, incl. no allocation after construction).
+- `crates/lumen-sockabi`: Linux x86-64 socket ABI byte formats as pure
+  `no_std` logic (M9, #457): `sockaddr` (`Family`, `Call`, `SockAddr` with
+  `decode`/`decode_dest`/`encode`, `UnixName`, `UnixBytes`, `peek_family`,
+  `clamp_msg_namelen`: per-call `AF_INET` incl. `AF_UNSPEC` for
+  `Bind`/`SendTo`/`SendMsg`, `AF_INET6` incl. `SIN6_LEN_RFC2133` and
+  `udpv6_sendmsg` `AF_UNSPEC` no-address, `AF_UNIX` unnamed-for-`Bind`/
+  path/abstract/`SendTo`-empty no-address, `SendMsg` clamping and empty
+  no-address), `cmsg` (`CmsgIter`, `CmsgWriter`, `Cmsg`, `RightsIter`,
+  `Ucred` with signed `pid`, `cmsg_align`/`cmsg_len`/`cmsg_space`: x86-64
+  8-byte alignment, `SCM_MAX_FD` enforced on decoding by
+  `rights_fds`/`count_rights_fds`, and
+  `rights_capacity`/`push_rights`/`push_creds`/`mark_truncated` with
+  `MSG_CTRUNC`), `opt` (`OptKind` incl. `IntOrByte`, `OptVal` incl.
+  `IntOrByte` and `Timeout`, `Linger`, `Timeval`/`Timeout` with
+  `MAX_TIMEOUT_SECS`/`TIMEOUT_HZ`, `SockOpt` with `settable()` excluding
+  get-only options incl. `SO_SNDLOWAT`, `decode_opt` skipping `optlen < 4`
+  for string options, `write_opt`/`write_opt_for`, and `check_optlen` for
+  `SOL_SOCKET`/`IPPROTO_IP`/`IPPROTO_TCP` getsockopt covering the M9 census
+  options and `SO_*TIMEO_{OLD,NEW}`), and `abi` (pinned x86-64 wire structs
+  `SockaddrIn`, `SockaddrIn6`, `SockaddrUn`, `Msghdr`, `Cmsghdr`, `RawUcred`,
+  `RawLinger`, `RawTimeval`, packed `EpollEvent`, and socket constants
+  cross-checked against `linux-raw-sys`) (host-tested, incl. structured
+  fuzzing).
 - `crates/lumen-proc`: the POSIX process tree as logic (M8, #341;
   ARCHITECTURE section 8): `ProcTree` (pids from 2 to a maximum, wrapping,
   never one in use as a pid, pgid or sid; `spawn_init`, `spawn_root`,

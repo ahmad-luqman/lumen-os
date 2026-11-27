@@ -1,0 +1,6 @@
+# Features: networking and socket ABI. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Socket ABI: sockaddr, cmsg and option values (logic)"
+milestone = "M9"
+tests = ["cargo:lumen-sockabi"]
