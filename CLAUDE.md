@@ -9,7 +9,11 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 ```bash
 make deps            # pinned Limine + OVMF + Alpine busybox + Alpine minirootfs into build/deps (sha256-checked)
 make build           # the apps (build/apps/<name>.wasm, test apps build/apps/tests/), Linux binaries, then both kernels
-make rootfs          # deterministic Alpine minirootfs ext4 image (build/alpine-rootfs.ext4) + M7 dynamic binaries
+make rootfs          # deterministic Alpine minirootfs ext4 image (build/alpine-rootfs.ext4) + M7/M8 Linux binaries
+make deps-dev        # pinned Alpine developer packages (tools/alpine-packages.lock, sha256-checked)
+make rootfs-dev      # deterministic Alpine developer image (build/alpine-dev.ext4: gcc, g++, make, git, sqlite3, vim)
+make deps-zig        # pinned zig C cross-compiler for host-built Linux test binaries (sha256-checked)
+make libc-test       # fetch musl libc-test (pinned commit) and build it with zig into build/libc-test/
 make app NAME=foo    # a new app: apps/foo copied from apps/template (tools/new-app.sh); `make build` bundles it
 make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play; DESKTOP=1 starts the desktop; ROOTFS=1 attaches build/alpine-rootfs.ext4 via virtio-blk)
 make debug           # QEMU paused + gdb attached, stopped at kmain
@@ -166,18 +170,23 @@ one is its own PR that updates that doc first.
   and `SleepMutex` (interrupts left on, its waiters asleep: for code that may block, e.g. the VFS's).
   `smp.rs`: starting the other CPUs, `run_on`. `sched.rs`: kernel threads
   (each named by a `lumen_trace::ThreadName`, 16 bytes inline, #276; per-CPU run queues, preemption on the timer, `sleep`, `WaitQueue`
-  with or without a deadline, `spawn`/`join`, `scope`: threads borrowing from the caller, joined before it returns;
+  with or without a deadline, `wait_interruptible` and `wait_killable` returning `Wake` on pending signals (`Thread::sigpending`, `fatal_pending`, `kick`, #373),
+  `spawn`/`join`, `scope`: threads borrowing from the caller, joined before it returns;
+  SMP migration and work-stealing (`spawn_migratable`, `spawn_fork_child`, `affinity`/`set_affinity`, `online_mask`, `nice`/`set_nice`, `cpu_time`, `comm`/`set_current_comm`, #377, #380, #391);
+  per-thread ring-3 state (`UserSpaceGuard`, `current_address_space`/`replace_user_space`/`detach_user_space`, `current_user_thread`, `snapshot_user_fpu`/`restore_signal_fpu`, `set_restart_block`/`take_restart_block`);
   each run-queue change an X-ray `runq` event, `run_queue`: a queue's length both ways); `arch/x86_64/context.rs` switches threads.
-  `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
-  stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
-  I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
+  `arch/x86_64/`: GDT/TSS (per CPU), IDT (`TLB_SHOOTDOWN` on vector `0x3e`, #376; M6's deferred `#DB` handling, `DEFERRED_LSTAR_DB`/`DEFERRED_STUB_DB`), entry
+  stubs and the vector map, `percpu.rs` (GS base, CPU index, `loaded_space`, #376, `DebugTrap` pending debug traps, #384), `irq.rs` (nested interrupt disable),
+  `syscall.rs` (`SyscallFrame`, `SyscallReturn`, `unwind_to_kernel`), `fpu.rs` (M6's `FpuMode`, `UserFpuState`; `install_signal`, `signal_xfeature_layout`, #384),
+  local and I/O APIC, 8259 and PIT registers, serial, IST stacks. `user.rs`: ring-3 entry/exit (`run_elf_process`, `UserExit`, `UserFault`), fault-safe copies (`copy_from_user`, `copy_to_user`, `copy_to_user_partial`, `copy_cstr_from_user`, `.lumen_fixup`), non-faulting futex atomics (`read_u32_nofault`, `cmpxchg_u32`, `fault_in_writable`, `.lumen_fixup_nofault`, #373, #383), `handle_user_exception` and `dispatch_syscall`. `crash.rs`: crash
   reporter. `ktest.rs`: test runner (`lumen.ktest=` runs only the tests with given name prefixes). `script.rs`: rhai scripts (the shell's
   `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
   (plain text unless `lumen.ansi`), one on each virtual terminal (keyboard) and one in each terminal
   window (`run_in_window`, #155): `mod.rs` the consoles (`Console::place`: anywhere, a virtual terminal
   or a window; `closed`) and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
-  help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
+  help line; the system ones in `sysinfo.rs`, `ps` among them: the Linux
+  processes and their threads, #372, and `mem` showing the frame low-water mark `min_free`, #394), pipelines (`pipe.rs`: `cpus |
   where busy > 50`), deliberate faults (`crash.rs`) and `trace runq`/`trace xray`
   (`xray.rs`: run queues by X-ray and the scheduler, `park` holding the shell's CPU still, `spin` keeping
   threads spinning on the last CPU until stopped, #208). `fb.rs`:
@@ -223,7 +232,13 @@ one is its own PR that updates that doc first.
   button per window, the `Clock` (the RTC polled without animating, `rtc::now_quiet`, its last reading kept
   on errors; `desktop tick` moves it a minute ahead), its `taskbar` owner thread
   (`lumen.taskbar_wake_delay_ms=` holds back a poke's handling, for the scenarios). `klog.rs`: logger (and the ring `dmesg` reads; ktest kernels: `hold_repeats`, a sweep's repeated lines kept off serial, summarized, #347). `rtc.rs`: the CMOS RTC (`date`, `now_quiet` for pollers; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
-  `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
+  `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`,
+  `Counts::min_free` (free-frame low-water mark; `LowWaterGuard` in ktests, #394);
+  `REFS`, one count per frame of the bitmap's span (reserved by name as
+  `frame refcounts`; lumen-mm's `RefTable`), and `UserFrame` (#375: a
+  counted user frame, move-only; `alloc_user`, `from_owned`, `share_leaf`,
+  `from_leaf`, `into_raw`, `crate::mm` alone moving a reference; dropping
+  the last frees it; `user_count`).
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
   `mm/heap.rs`: the `#[global_allocator]`, growing in the heap window.
@@ -235,15 +250,28 @@ one is its own PR that updates that doc first.
   `flushed_through` the one maker of a `Flushed`, `catch_up` at the timer
   (`on_tick`; `TickFlushesOff` for the ktests) and `WAKEUP` interrupts,
   `join` at the top of `smp::ap_main`, `sync`: IPIs and a bounded wait,
-  only outside critical sections, `still_stuck` after a timeout).
+  only outside critical sections, `still_stuck` after a timeout), and
+  user address-space TLB shootdowns (#376: synchronous `shoot_down` over
+  vector `0x3e`, `arch::idt::TLB_SHOOTDOWN`, handled by `on_shootdown_ipi`,
+  `FULL_FLUSH_PAGES`, `STALL_WARN_NS`).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
-  MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
+  MMIO window, crash-report walk; `protect_user_range_with`, one walk
+  deciding each user leaf's rights, #375). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT.
   `mm/user_vm.rs`: per-process address spaces (`AddressSpace`: VMAs,
-  ELF loading, anonymous and file-backed `mmap` (`mmap_file`, `Sharing`,
+  ELF loading, streaming `from_images_with_stack` from `ImageSource` with
+  `rlimit`-sized stack (#381), anonymous and file-backed `mmap` (`mmap_file`, `Sharing`,
   #255), `munmap`/`mprotect`/`brk`, the page-fault paths (zero-fill, the
   page cache's pages, copy-on-write, dirty promotion, `FaultResult::BusError`),
-  `invalidate_file_from`, teardown; `pinned_pages`, `writable_maps` and
+  `invalidate_file_from`, `Mappers` and `invalidate_file_mappings`
+  (cross-space truncation invalidation + shootdown, #378), `futex_key`
+  (`linux::futex::KeyResolution`, #383), teardown (every counted frame released);
+  #375's `fork_copy` (private leaves read-only in both spaces with their
+  counts raised, shared anonymous pages populated and shared, page-cache
+  leaves refaulted), the copy-on-write split (`split_private_leaf`: reuse at
+  count 1, else copy, shoot down, then release), `users` with
+  `add_user`/`drop_user` (teardown at 0), and `active_mask`/`switch_loaded`
+  driving `mm::tlb::shoot_down` across active CPUs (#376); `pinned_pages`, `writable_maps` and
   `mapped_files` (`KeptFile`: a mapping's open reference and path; the
   `MappedFile` that `mmap_file` takes also carries its description's
   shared-write right, `O_RDWR` or not, which only `mmap_file` reads, into
@@ -293,10 +321,18 @@ one is its own PR that updates that doc first.
   serial shell blocks on (a 100 ms deadline as a safety net, counted and
   warned about; `serial` shows it); it polls, yielding, without that
   interrupt or before the boot CPU's scheduler runs, and blocks for good
-  without a UART; the UART's one reader.
+  without a UART; the UART's one reader; readiness subscriptions
+  (`subscribe_poll`, `note_poll_woken`, #374) and `wait_or`/`wake_reader`
+  for the console tty input thread (#389).
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
   decoding through `lumen_input::KeyDecoder`, each key event into
   `input::KEYS`, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
+  `tty.rs` (M8, #388, #389): terminal line disciplines (`Tty` over
+  `lumen_tty::LineDiscipline`, Lock 9a `SleepMutex`, readiness through
+  `KernelPollHead`, `read`/`write`/`ioctl`/`poll`, job control and
+  `leader_exit`), console tty instances (`tty::init`, `tty::console`) and
+  `ConsoleSession` (exclusive `tty-serial`/`tty-vt1..4` input threads for
+  running Linux root processes, #389).
   `time.rs`: TSC and LAPIC timer calibration (judged by each clock's
   tolerance; `lumen.stall_tsc_windows=`/`lumen.stall_timer_windows=` stall
   them for scenarios), the boot origin
@@ -364,9 +400,10 @@ one is its own PR that updates that doc first.
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
   `volume` and `sound`.
   `vfs/` (M7, #253; ARCHITECTURE section 9): `vfs/mod.rs` the kernel's VFS
-  tables (`KernelVfsTables`: lumen-vfs's `VfsTables` on `SleepMutex`), `init` (the
+  tables (`KernelVfsTables`: lumen-vfs's `VfsTables` on `SleepMutex`;
+  `KernelLocks`/`KernelLeafLock` and `KernelPollHead`, #374), `init` (the
   first ext4 virtio-blk volume at `/`, else a tmpfs root; `/tmp`, `/dev`,
-  `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
+  `/dev/pts` (#388), `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
   and the `mount`, `sync` and `vfstest` commands (`mount`'s `used`/`limit`:
   a tmpfs mount's quota, through `mounts_with_fs` and `tmpfs::quota_use`,
   #324; an errored ext4 volume's mode `ro,errors`, #349; `vfstest`: file
@@ -424,65 +461,153 @@ one is its own PR that updates that doc first.
   `ktest_util`, the ext4 ktest helpers `vfs/tests.rs` and `page_cache.rs`
   share: `FaultCache` (writes failed by number, pair or from one on,
   reads by range or after a write fault), `Mnt`, `mount`, `remount_ro`,
-  `set_clock`, the ktests' clock, `Ext4Shared::now`);
+  `set_clock`, the ktests' clock, `Ext4Shared::now`; `mknod` FIFOs, #386,
+  and `statfs`, #391);
   `vfs/tmpfs.rs` (its quota charging inodes, directory entries and symlink
   targets besides pages, #267: `charge`, the cost model, `InodeCharge`,
   `EntryCharge` and `Children`, the only code reserving or giving one back;
-  `quota_use`, a mount's `QuotaUse` for `mount`, #324),
-  `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
+  `quota_use`, a mount's `QuotaUse` for `mount`, #324; `mknod` FIFOs with
+  a boxed `FifoSlot` (`Option<Box<FifoSlot>>`), #386, and `statfs`, #391),
+  `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`,
+  `ptmx` with `TerminalOpen::{Ptmx, Alias, Console}` and `terminal_open`, #388, #389),
+  `vfs/devpts.rs` (M8, #388, #389: `/dev/pts` filesystem `Devpts` on dev
+  0:5, `PTY_MAX` = 256, `TtyEnd` open-description lifetime, `open`
+  allocating PTY pairs on `/dev/ptmx` and resolving `/dev/tty` and
+  `/dev/console`, `console_file`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `mounts`: an errored ext4 volume
   `ro,errors=remount-ro`, `format_mounts_of`, #349; `/proc/<pid>/maps` from
-  `AddressSpace::format_maps`, its lines `lumen_vm::maps`'s; the node
+  `AddressSpace::format_maps`, its lines `lumen_vm::maps`'s; `/proc/<pid>/exe`
+  updated on `execve`, #381; the node
   kinds, inode numbers, fds and numeric names `lumen_vfs::procfs`'s).
-  `linux/` (M6, M7; ARCHITECTURE section 8): `linux/mod.rs` the
-  `linux-raw-sys` re-exports, `M6_SYSCALLS` and `M7_SYSCALLS` (the numbers,
-  `syscall_name`; pinned by the `abi_constants_match_spec` and
-  `m7_abi_constants_match_spec` ktests, the latter with M7's flags and
-  struct layouts), `uname`'s payload and the `linux` command (`linux /path`
+  `linux/` (M6, M7, M8; ARCHITECTURE section 8): `linux/mod.rs` the
+  `linux-raw-sys` re-exports, `M6_SYSCALLS`, `M7_SYSCALLS` and
+  `M8_SYSCALLS` (the numbers, `syscall_name`; pinned by the
+  `abi_constants_match_spec`, `m7_abi_constants_match_spec` and
+  `m8_abi_constants_match_spec` ktests, the latter two with their flags and
+  struct layouts, #371), `uname`'s payload, `pub use process::timer`, and the `linux` command (`linux /path`
   from the VFS, `run_exec`: load, run, count frames, the path as `exe`, the thread named after the path's last component, #276);
-  `linux/exec.rs` `Exec` (#255: a binary and its `PT_INTERP` interpreter
-  read and parsed once, each read from a file with its `ImageFile` (none
-  for a boot module), naming its maps lines and giving its path, `load` through `AddressSpace::from_images`;
-  `ExecError`, each read naming its file);
-  `linux/process.rs` `ProcessState` (#254: the private 1024-slot FD table
-  of `OpenFile`s, `install_current_fd`/`insert_current_fd`/`dup_current_fd`(`_from`)/
-  `close_current_fd`, close and exit releasing POSIX and `flock` locks
-  outside `ACTIVE_PROCS` (`release_fd`); the advisory locks' one wait
-  queue and release count (`lock_releases`, `locks_released`,
-  `wait_for_lock_release`: `F_SETLKW` and blocking `flock`, #254);
-  `Stdio`: fds 0/1/2 on `/dev/console` and `/` as
-  cwd, opened before a run or it is refused; `Cwd`, `umask`;
-  `open_kernel_file`; the console bridge; `in_test_process` for ktests;
-  `RegisteredProcess`: the test seams' process, taken down when it drops, #264);
+  `linux/init.rs` `linux::init`, called at boot after the VFS to start pid 1
+  (`process::start_init`: a kernel-owned process with no threads, every
+  exit's reaper, #372), the console ttys (`tty::init`, #389), and the timer
+  worker (`linux::timer::init`, #392);
+  `linux/exec.rs` `Exec` (#255, #381: `ExecFile`, `open_path`/`open_inode`,
+  streaming a binary and its `PT_INTERP` interpreter through `ImageSource`
+  with its `ImageFile` (none for a boot module), naming its maps lines and
+  giving its path, `load`/`load_with_stack` through
+  `AddressSpace::from_images_with_stack`; `ExecError` and `to_errno`, each
+  read naming its file);
+  `linux/process.rs` processes and threads (#372, #379, #380, #381, #382,
+  #384, #385, #387, #388, #389, #391), with child modules enforcing owner
+  privacy: `Process` (a thread group: pid, `mm`, `files`, `fs`, `signal`,
+  `exe_path`, console state, `exit`, each written only through its owner
+  methods such as `record_exit`), `UserThread` (a tid, its process,
+  `clear_child_tid`, robust list; held in the scheduler thread's
+  `UserThreadState::linux`, so a syscall finds it lock-free through
+  `current_thread`/`current_process`), `KernelFile` (combined `end_refs`,
+  in-flight `IoFile` refcount guard, optional `PipeEnd` and `TtyEnd`, #379,
+  #386, #388), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
+  vfork and thread clone validation, #380, #382), `process/table.rs`
+  (`ProcTable` behind `PROCS`: lumen-proc's tree, processes by pid, threads
+  by tid, `WaitResult`, `link_init`/`link_root`/`link_thread`/
+  `unlink_thread`/`exit_in_tree`/`wait`/`setsid`/`setpgid`/`getpgid`/
+  `getsid`/`priority`/`process_time`, `check` cross-checking them in the
+  ktests), `process/files.rs` (`Files`: the 1024-slot FD table of
+  `KernelFile`s, shared/exclusive `FilesAccess` leases, `ReservedFd`,
+  `fork_copy`, `prepare_exec`/`copy_exec_into`; `FsState`/`FsInner` for
+  `Cwd` and umask, #379, #380, #381), `process/signal.rs` (`SignalState`,
+  `ThreadSignals`, `Delivery`, `HandlerDelivery`, group exit/stop/cont,
+  `wait_signal`, `sigaltstack`, `rlimit_stack`, `ctty`, #384, #385, #388),
+  `lookup`/`lookup_thread`, `fork_current`, `de_thread` (#381, #382),
+  `register_current` and `take_current` (a run's takedown in the design's
+  exit order: detach, unlink, release `mm`/`files`/`fs`, then the tree, its
+  `NoMem` retried), `install_current_fd`/`insert_current_fd`/
+  `dup_current_fd`(`_from`)/`close_current_fd` (close and exit releasing
+  POSIX and `flock` locks outside `PROCS`, `release_fd`), `ps_rows` for the shell's `ps`,
+  the advisory locks' wait queue and release count (`lock_releases`,
+  `locks_released`, `wait_for_lock_release`: `F_SETLKW` and blocking
+  `flock`, #254), `Stdio` (fds 0/1/2 on `/dev/console` bound to the console
+  tty when interactive, `/` as cwd; opened before a run or the run is
+  refused), `open_kernel_file`, `ConsoleIo`
+  (`Capture`, `Serial`, `Vt(VtId)`), `in_test_process` (`add_ktest_thread`,
+  `with_process_user`), and `RegisteredProcess` (#264);
+  `linux/signal.rs` (#373, #384: `RestartBlock`, `ERESTARTSYS`,
+  `interrupted_with`, `exit_to_user` syscall/fork return hook,
+  `exit_to_user_from_interrupt` non-IST return hook, `force_fault`,
+  `force_sigsegv`, `force_debug_trap`, `exception` translating CPU faults
+  to `SigInfo`) and `linux/signal/frame.rs` (`deliver`/`restore`:
+  `rt_sigframe` copy-out/copy-in and FPU/XSTATE snapshot/restore outside
+  siglock, `FrameFailure`/`FailureReason`, #384);
+  `linux/futex.rs` (#383: `FutexKey` (`Private`, `Anon`, `File`,
+  `SharedFrame`), `KeyResolution`, 256-bucket `FUTEX_BUCKETS` over
+  `lumen_futex::FutexTable`, `wait`/`wake`/`requeue`, `release_user_sync`
+  clearing `clear_child_tid` and walking the robust list on thread exit);
+  `linux/pipe.rs` (#386: `PipeObject` over `SleepMutex<lumen_pipe::Pipe>`,
+  `readers`/`writers` `WaitQueue`s and `KernelPollHead`, `read`/`write`/
+  `set_capacity`/`fionread`/`poll_open`/`deliver_sigpipe`, `PipeEnd`,
+  `PipeInode` for anonymous `pipefs` on dev 0:6, `FifoSlot` and
+  `open_fifo` for ext4/tmpfs FIFOs);
+  `linux/timer.rs` (`#[path = "timer.rs"]` under `process`, re-exported as
+  `linux::timer`, #392: `Timers`, `TimerId` (`Real`, `Posix`),
+  `PosixTimer`, `TimerNotify`, global `TIMERS` deadline map with boot-CPU
+  `on_tick` wakeup and timer worker thread from `timer::init`,
+  `create`/`set`/`get`/`delete`/`overrun`/`delivered`/`clear`);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
-  `dispatch` (each number in one arm, its constant as the pattern) and the
-  shared copy helpers, a module per cluster holding its handlers (`fd`,
+  `dispatch` (each number in one arm, its constant as the pattern; M7's and
+  M8's `not_implemented` stubs are gone; of the M8 table's rows only
+  `sendfile` and `membarrier` stay `-ENOSYS`; with `clone3`, `execveat`,
+  `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` they
+  make up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
+  (ARCHITECTURE section 8, "Stays `-ENOSYS` in M8")), `unmap_past`
+  (#378) and the shared copy helpers, `time.rs` (`RawTimespec`,
+  `read_timespec`, `write_timespec`, `ERESTARTNOHAND`, #383, shared by `futex`,
+  `poll` and `signal` (`rt_sigtimedwait`)), and a module per cluster holding its handlers (`fd`,
   `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, with #255's
   `mmap` of a descriptor and `msync` (ktests in `mem/tests.rs`), `proc`;
-  `fd` holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
-  terminals by `VfsInode::is_tty` to the console, and the syscall ktests'
+  M8's clusters, #371: `task` (`exit`, `exit_group`, the ids,
+  `set_tid_address`, `clone`, `fork`, `vfork`, `execve` with shebangs and
+  `ArgBudget`, `wait4`, `waitid`, `setpgid`, `setsid`, `getpgid`, `getsid`,
+  `getpgrp`, #380, #381, #382, #387), `signal` (`rt_sigaction`,
+  `rt_sigprocmask`, `rt_sigreturn`, `rt_sigpending`, `rt_sigtimedwait`,
+  `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigsuspend`, `sigaltstack`,
+  `kill`, `tkill`, `tgkill`, `pause`, `restart_syscall`, #384, #385),
+  `futex` (`futex`, `set_robust_list`, `get_robust_list`, `nanosleep`,
+  `clock_nanosleep`, #383), `poll` (`poll`, `ppoll`, `select`, `pselect6`
+  over `wait_ready` and `PollWait`, #374, #385), `pipe` (`pipe`, `pipe2`,
+  `dup`, `dup2`, `dup3`, `mknod`, `mknodat`, #386), `timer` (`alarm`,
+  `getitimer`, `setitimer`, `timer_create`, `timer_settime`,
+  `timer_gettime`, `timer_getoverrun`, `timer_delete`, #392) and `sys`
+  (`sched_yield`, `sched_setaffinity`, `sched_getaffinity`, `getpriority`,
+  `setpriority`, `getrusage`, `sysinfo`, `prctl`, `statfs`, `fstatfs`,
+  `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391);
+  `fd` holds `open`/`openat`/`lseek` (with `open_fifo`, #386, and
+  `devpts::open`, #388, #389) and descriptor I/O/`ioctl` (`FIONREAD`, tty
+  requests) through the table, routing terminals by `VfsInode::is_tty`
+  to their tty or the process's `ConsoleIo`, and the syscall ktests'
   shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_fd_of`: a failure
   naming the path, `ktest_open`, `ktest_install` and `ktest_install_file`:
   a descriptor on a volume no mount holds, `ktest_failed_at`,
   `KtestTmpFile`, `ktest_unlink`), `dir` `getcwd`,
   `getdents64` (the filesystem's `readdir` cursor in `dir_cursor`), `chdir`
-  and `fchdir`; every M7 syscall implemented, the stubs gone with #255's
-  `msync`; `lock` holds `fcntl` and `flock`: `lock_or_wait`, the retry loop
+  and `fchdir`; `lock` holds `fcntl` (incl. `F_DUPFD*`, `F_GETPIPE_SZ`/
+  `F_SETPIPE_SZ`, #379, #386) and `flock`: `lock_or_wait`, the retry loop
   over the wait queue, and `POSIX_WAITERS`, `F_SETLKW`'s `EDEADLK`
   records), and `at.rs` the file syscalls' shared parts: `reg`/`FromReg`,
   decoding a register into a handler's parameter type (`Fd`, with `Fd::file`
   the descriptor lookup, `Dirfd`, `Mode`, the VFS flags, `UserPtr`,
   `u32`/`i32`: the low 32 bits), `UserPath` (a path argument copied in),
   `start_dir` and its `Start` (the one dirfd resolution, and the only way
-  to lumen-vfs's path operations: `open`, `resolve`, `mkdir`, `unlink`,
+  to lumen-vfs's path operations: `open`, `resolve`, `mkdir`, `mknod`, `unlink`,
   `readlink`, `symlink`, `Start::link`, `Start::rename`) and
   `stat_from_metadata`/`statx_from_metadata`; the handlers' rules are in
   ARCHITECTURE section 8, "Handlers".
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested; the `life`
   command's and the Life app's, a path dependency of `apps/`, #202).
-- `crates/lumen-elf`: ELF symbol-table reader (host-tested); `shebang`
+- `crates/lumen-elf`: ELF symbol-table reader and `loader` (`ElfHeader`,
+  bounded header-only parsing `parse_headers`/`parse_headers_with_pie_base`/
+  `parse_interp_headers`, `validate_interp`, `tests/allocations.rs`, #381)
+  (host-tested); `shebang`
   (#343: a `#!` header from a file's first `BINPRM_BUF_SIZE` (256) bytes,
   as Linux's `load_script`: `parse` giving a `Shebang` (interpreter, at most
   one argument) or a `ShebangError` with its errno; `Nesting`, at most
@@ -586,13 +711,21 @@ one is its own PR that updates that doc first.
   kernel-stack layout (`StackWindow`: `StackSlot`s, freed ones kept as
   joined free ranges tagged with a TLB `Generation`, first fit once a
   `Flushed` covers it, #300; a model with out-of-order give-backs and a
-  page-table count host-test it) and lock-free stack registry.
+  page-table count host-test it), lock-free stack registry (`Registry`,
+  `KERNEL_STACK_RESERVE` and `register_user` reserving slots for kernel
+  threads, #382), and
+  `frame::RefTable` (#375: the kernel's per-frame reference counts over
+  caller storage, `set_one`/`inc`/`dec` giving `Remaining`, overflow,
+  underflow and re-initialisation refused; host-tested incl. a model and
+  racing last decrements).
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-vm`: a process's user address space as logic: the user
   layout (`USER_MIN`/`USER_MAX`, `PIE_BASE`, `MMAP_TOP`, the initial stack's
-  `USER_STACK_TOP`/`USER_STACK_SIZE`/`USER_STACK_BOTTOM`), `Prot`, `Vma`s
-  anonymous or file-backed (`Backing`, `FileMapping`), the `VmaMap` (sorted
+  `USER_STACK_TOP`/`USER_STACK_SIZE`/`USER_STACK_BOTTOM`, `StackLimit` and
+  `StackSize::from_rlimit`/`arg_limit`, #381, #391), `Prot`, `Vma`s
+  anonymous (private or shared, `Backing::Anonymous { shared }`, #375) or
+  file-backed (`Backing`, `Backing::is_shared`, `FileMapping`), the `VmaMap` (sorted
   by start in a `BTreeMap`: `map` with `MapPlace` hint/fixed/no-replace,
   `unmap`, `protect`, coalescing), the `Brk` cursor, and `maps`
   (`write_maps`: `/proc/<pid>/maps` lines, the heap split at the break's
@@ -614,19 +747,22 @@ one is its own PR that updates that doc first.
   feature, the ktest kernel's) and `MemBlockDevice` (in memory: injected
   errors, power loss) (host-tested).
 - `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
-  `FileSystem`/`VfsInode` traits (names as bytes, #268; `Escaped`, a name's
+  `FileSystem`/`VfsInode` traits (`StatFs`, #391; names as bytes, #268; `Escaped`, a name's
   bytes as text, never lossily; `FileSystem::errored`, read-only after an
   error, a `MountInfo`'s `errored`, #349), the path and symlink resolver
   (`resolve_parent`'s `ParentTarget`, its last component a `Final`: root,
-  `.`, `..` or a name, #309), the mount
+  `.`, `..` or a name, #309; `NamedPath` and `resolve_named_path`, #381), the mount
   table and the Lock-9 inode and dentry caches (`VfsTables`, generic over a
   `LockFamily`: the kernel's and the host tests'; `mounts_with_fs`, each
   mount with its filesystem; `InodeCache` dropping no inode under Lock 9,
   handing back each one it lets go, `Released`, #320, and keeping removed
   directories' parents for `..`, `record_removed_dir`/`removed_dir_parent`,
   #318), `OpenFile` (its inode,
-  `inode()`, read from its `OpenGuard`, #264) and the `FdTable`
-  (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
+  `inode()`, read from its `OpenGuard`, #264; M7's `inc_fd_ref`/`dec_fd_ref`)
+  and the `FdTable` (`MAX_FDS` fds; `reserve`/`install`/`cancel`,
+  `FdReservation`, `try_preallocated`, `src/tests/hazards.rs`, #379, #381),
+  `poll` (`PollMask`, `PollWaker`, `Pollable`, `PollGuard`, `PollHead`,
+  #374), the namespace operations (`open_inode`, `mkdir_at`, `mknod_at` (#386),
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
   call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,
   whose `WouldBlock` alone names the holder; `PosixWaitGraph`, who waits
@@ -661,9 +797,11 @@ one is its own PR that updates that doc first.
 - `crates/lumen-signal`: Linux x86-64 signals as logic (M8, #339;
   ARCHITECTURE section 6): `Signal`, `SigSet`, `Blocked` (never `SIGKILL`
   or `SIGSTOP`), `DefaultAction`; `pending` (`PendingSignals`: a process's
-  shared queue and one per thread, `ThreadSlot`, `Target`, `SigInfo`
-  (`fault` with `si_addr`), `SenderClass`, `Disposition`, stop/continue
-  cancellation, `select_target`); `frame` (`build`: an `rt_sigframe` image,
+  shared queue and one per thread, `PendingSignal`, `ThreadSlot`, `Target`, `SigInfo`
+  (`fault` with `si_addr`, `timer`/`set_timer_overrun`), `SenderClass`, `Disposition`, stop/continue
+  cancellation, `select_target`, timer enqueue/dequeue/discard); `timer`
+  (#392: `Setting` with `realtime`, `forward`, `missed`, `delivered`,
+  `enqueue_refused`, `alarm_seconds`, `tests/timers.rs`); `frame` (`build`: an `rt_sigframe` image,
   `FrameImage`; `restore`: `rt_sigreturn`'s checks, `Restored`,
   `ValidatedFp`, `FpFallback`, `RestoreConfig`); `restart` (`decide`:
   `ERESTART*` against the handler and `SA_RESTART`, `RESTART_SYSCALL`);
@@ -695,10 +833,14 @@ one is its own PR that updates that doc first.
   `ExitAction`s (`Notify`, `Released`, `HangupThenContinue`), `stop`/`cont`
   giving a `StateChange`; `wait4_request`/`waitid_request` and `wait`
   (`WaitReady`, `Report`); `setsid`, `setpgid`, `getpgid`, `getsid`,
-  `tcsetpgrp`, `pgrp_members`, `is_orphaned_pgrp`), `WaitStatus` (`word`,
+  `tcsetpgrp`, `tcsetpgrp_job_control`, `Controlling`, `Sigttou`,
+  `Tcsetpgrp`, `PidRef`/`retain_pid` (#388), `pgrp_members`,
+  `is_orphaned_pgrp`; a process's threads,
+  `add_thread`/`remove_thread`/`threads`, their tids busy, #372;
+  `check_invariants` behind `test-util`), `WaitStatus` (`word`,
   `siginfo`), `ExitStatus`, `RusageSlot`/`SlotRef`, `Errno`/`Bug`/`Error`
-  (host-tested, incl. a model and what each operation allocates,
-  `tests/alloc.rs`).
+  (host-tested, incl. a model, `tests/alloc.rs`: what each operation
+  allocates, `tests/threads.rs` (#382), and `src/tests/pid.rs` (#341, #388)).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
@@ -709,7 +851,8 @@ one is its own PR that updates that doc first.
   a path's last component, the name a binary run by `linux /path` gets; `From<&str>`, the kernel's
   names, refuses one that wouldn't fit by a debug assertion; names written as literals at a call
   naming a thread are linted, `tests/harness/test_thread_names.py`; app names are at most 11 bytes).
-- `crates/lumen-time`: timekeeping arithmetic: calibration (windows'
+- `crates/lumen-time`: timekeeping arithmetic: `slice_ticks` (nice-weighted
+  scheduler slice, #377), calibration (windows'
   steadiness, the ones with the smallest bounds filling in, how far off a
   median can be for either rate, `tsc_error_ppm`, a window slow to read
   stretched, the verdict against each clock's tolerance, `within_bounds`,
@@ -871,7 +1014,8 @@ one is its own PR that updates that doc first.
   `wasmtime` and checks the app interface's shape.
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built; virtio devices through `Devices`; `press`/`type_text` for keys,
-  `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
+  `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`,
+  `audit.py` (also checks `.lumen_fixup_nofault`, #373), `status.py`,
   `wasm.py` (the built apps checked: `wasmtime` validation with the
   proposals past rustc's defaults that wasmtime-py can switch off
   switched off (`OFF`, each a real `Config` setting), and a reader for custom sections,
@@ -913,20 +1057,28 @@ one is its own PR that updates that doc first.
   and kept, a WARN or ERROR failing it unless allowed or host-timed;
   `PROMPT`), `klog.py` (the kernel log line's format, as kernel/src/klog.rs
   prints it; `HOST_TIMED`, the warnings a loaded host can cause on its own,
-  each tied to the kernel's text, and `unexpected_warnings`, a run's "no
+  each tied to the kernel's text — incl. the 2 s TLB shootdown stall warning, #376 — and `unexpected_warnings`, a run's "no
   warning" check without them; `HOLDING`, `HELD_BACK`, `HELD_ALL`: a
   `klog::hold_repeats` guard's lines), `rootfs.py` (matched `e2fsprogs` discovery,
-  per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, `debugfs`
+  per-test `alpine-rootfs.ext4` (`copy_rootfs`) and `alpine-dev.ext4`
+  (`copy_dev_rootfs`, CoW clone via `cp -c`/`--reflink=auto`, #344) copy
+  isolation, `e2fsck -fn`, `debugfs`
   and `debugfs_names` (reading an image back, any error line failing),
   `llvm-readobj` dynamic musl ELF checks, `run_busybox`: a `linux
   /bin/busybox` run's output, exit code and leaked frames (`BusyboxRun`,
   `BUSYBOX_EXIT`), #324, and `warm_up`: one uncounted
   `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts),
-  `libctest.py` (#345: musl libc-test transcripts, one `EXIT <path> <code>`
-  line per test, read as pass, fail or error, a runner error never a
-  verdict; `tests/conformance/libc-test-xfail.txt`, each entry a reason and
-  an issue, a listed pass failing the run; the built binaries' linkage
-  checked; `run_native`, the host reference run, `runtest -t 30`).
+  `syscalls.py` (#337: M8 syscall census — stdlib-only `build` turning
+  `strace -f -X raw` traces into `tests/linux/m8-census.toml`, and `report`
+  comparing it against the kernel's dispatch table and planned milestones),
+  `libctest.py` (#345, #396: musl libc-test transcripts, one
+  `EXIT <path> <code>` line per test, read as `Outcome` (`PASS`, `FAIL`,
+  `TIMEOUT`, `ERROR`), a runner error never a verdict;
+  `tests/conformance/libc-test-xfail.txt`, each entry a reason and an issue
+  with optional `flaky` kind, a listed pass failing the run; single retry on
+  timeouts and flaky failures with `RETRY ` prefix; `NATIVE_RETRY_FAILURES`,
+  #422; the built binaries' linkage checked; `run_native`, the host
+  reference run, `runtest -t 30`).
 - `tools/fetch-zig.sh` (`make deps-zig`, #368): zig 0.15.2 into
   `build/deps/zig`, sha256-pinned per host, ziglang.org then two community
   mirrors, installed under `build/deps/zig.lock`; a C cross-compiler for
@@ -934,16 +1086,47 @@ one is its own PR that updates that doc first.
   libc-test`, #369, after `tools/fetch-libc-test.sh`'s pinned checkout):
   libc-test's `src/functional` and `src/regression`, static and dynamic,
   with `zig cc -target x86_64-linux-musl` into `build/libc-test/`
-  (`tests.txt`, `not-built.txt`).
-- `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
+  (`tests.txt`, `not-built.txt`). `tools/syscall-census.sh` and
+  `tools/census/workloads.sh` (#337): Docker/Podman strace census on stock
+  Alpine x86-64 generating `tests/linux/m8-census.toml`.
+- `tools/mkrootfs.sh`, `tools/mkrootfs-dev.sh`, `tools/linux-m7/`,
+  `tools/linux-m8/`: deterministic `build/alpine-rootfs.ext4`
   assembly (`s_flags` saying signed directory hashes on every host,
-  `tools/ext4-signed-hash.sh`, #308) and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
+  `tools/ext4-signed-hash.sh`, #308); `tools/mkrootfs-dev.sh` (`make
+  rootfs-dev`, #344) builds `build/alpine-dev.ext4` from the minirootfs,
+  `build/linux/*`, and the Alpine v3.21 closure of `gcc`, `g++`, `make`,
+  `musl-dev`, `binutils`, `git`, `sqlite`, `vim` resolved and unpacked by
+  `tools/alpine-lock.py` (`tools/alpine-packages.{txt,lock}`), fetched by
+  `tools/fetch-alpine-packages.sh` (`make deps-dev`) with durable GitHub
+  release mirror `tools/mirror-alpine-packages.sh` (`alpine-apk-mirror`);
+  `tools/linux-m7/` `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
   for #255's exit scenarios, and `libm7.so`;
   `m7_vfs`, #254's exit scenarios' program: `posix`, `locks`, `keep` (a
   tree left for fsck), and `lock-hold`/`lock-probe`, two processes at once,
-  every check a raw syscall by number).
-- `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests
-  (incl. `test_rootfs.py`),
+  every check a raw syscall by number); `tools/linux-m8/` (#371): M8's
+  test programs, built the same way into `build/linux/` and staged in both
+  images, sharing `common.rs` (the raw `syscall`, `say!`, argv, `Fail`):
+  `m8_proc` (`fork-wait`, plus submodules `exec.rs` (#381), `signals.rs`
+  (#384), `signal_waits.rs` (#385), `futex.rs` (#383, #390), `threads.rs`
+  (#382, #390), `sessions.rs` (#387), `timers.rs` (#392), `small.rs`
+  (#391)), `m8_io` (`console-poll`, #374, #389; `pipes`, #386), `m8_vm`
+  (`shootdown`, #390), `m8_pty` (PTY integration checks, #388), and
+  `ptyrun` (D3's PTY runner: `--script <file> -- <program>` scripted PTY
+  master and interactive console-to-PTY relay, #395).
+- `tests/scenarios/`: QEMU tests, incl. `test_linux_user.py` (M6/M7 ring-3
+  entry, faults, ABI, busybox and `dlopen`), `test_linux_proc.py`
+  (processes, `fork`/`exec`/shebangs, signals/`sigaltstack`, signal waits,
+  `futex`/nanosleep, pthreads, sessions/groups, interval/POSIX timers, small
+  syscalls, MT stress), `test_linux_io.py` (`poll`/`select` on console,
+  pipes/FIFOs, PTY termios/job control, `ash -i` console job control),
+  `test_linux_vm.py` (cross-CPU `munmap`/`mprotect` TLB shootdowns),
+  `test_alpine.py` (Alpine minirootfs coreutils plus M8's D1 `ash` #393,
+  D2 `gcc`/`g++`/`make` #394, D3 `git`/`sqlite3` and `vim` over `ptyrun`
+  #395 gates), `test_conformance.py` (D4 musl `libc-test` core against
+  `tests/conformance/libc-test-xfail.txt`, #396), and `test_smp.py`
+  (incl. MT stress, #390). `tests/harness/`: harness self-tests
+  (incl. `test_rootfs.py`, `test_rootfs_dev.py`, `test_libctest.py`,
+  `test_syscalls.py`, `test_ci_config.py`),
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs
   `# unconfirmed: <why>`, and lumen_harness types raw only where it
   implements it; `test_thread_names.py`, a lint: every thread name written

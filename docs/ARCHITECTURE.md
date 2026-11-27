@@ -4185,10 +4185,15 @@ Lumen runs two kinds of user code:
   is `-ENOSYS`, though recent Linux reads only `eax`), passing the
   registers of the syscall's Linux signature, in order, to a handler in its
   cluster's module (`fd`, `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's
-  `mem` and `proc`). An M7 syscall not yet implemented is a stub logging
-  like an unknown one (with its name) and returning `-ENOSYS`. Wave 3's
-  handlers follow three rules:
-  1. **Decode first.** An M7 arm decodes each register with
+  `mem` and `proc`; M8's `task`, `signal`, `futex`, `poll`, `pipe`, `timer`
+  and `sys`, the clusters listed under "B0's stubs" below, #371, plus
+  `time.rs` (#383) shared by blocking syscalls). M7's and M8's stubs are
+  gone; of the M8 table's rows only `sendfile` and `membarrier` stay
+  `-ENOSYS`; with `clone3`, `execveat`, `futex_waitv`, the scheduler-policy
+  calls, `signalfd*` and `times` they make up `ENOSYS_BY_DECISION` in
+  `tools/harness/lumen_harness/syscalls.py` ("Stays `-ENOSYS` in M8"
+  below). M7's and M8's handlers follow three rules:
+  1. **Decode first.** An M7 or M8 arm decodes each register with
      `syscall/at.rs`'s `reg` into the handler's parameter type, as Linux
      reads it: an `int`, `mode_t` or flags argument is the register's low
      32 bits (`Fd`, `Dirfd`, where `AT_FDCWD` sign- or zero-extended is the
@@ -4253,8 +4258,8 @@ Lumen runs two kinds of user code:
 | 10 | `mprotect(addr, len, prot)` | updates VMA rights (splitting sub-VMAs when needed) and mapped PTEs (preserving `PROT_NONE` frames, section 5); returns `0` on `len == 0` (page-aligned `addr`), `-ENOMEM` on any unmapped hole; local `invlpg` in M6–M7, cross-CPU shootdown in M8 |
 | 11 | `munmap(addr, len)` | unmaps pages, frees frames, splits/removes VMAs; ignores unmapped holes, returns `-EINVAL` on `len == 0` or misaligned `addr` |
 | 12 | `brk(addr)` | tracks a byte-granular heap cursor (backing VMAs page-aligned); returns current `brk` on `addr == 0`, exact requested `addr` on success, and unchanged current `brk` on any failure (`addr < initial_brk`, VMA overlap, OOM)—never `-ENOMEM` |
-| 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | requires `sigsetsize == 8` (`-EINVAL` otherwise); rejects non-null `act` for `SIGKILL`/`SIGSTOP` (`-EINVAL`); stores a per-process 64-entry `sigaction` table so `oldact` preserves prior handlers/`SIG_IGN`; real signal dispatch arrives in M8 |
-| 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | requires `sigsetsize == 8`; maintains per-thread signal mask (silently dropping `SIGKILL`/`SIGSTOP`); real delivery arrives in M8 |
+| 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | requires `sigsetsize == 8` (`-EINVAL` otherwise); rejects non-null `act` for `SIGKILL`/`SIGSTOP` (`-EINVAL`); stores a per-process 64-entry `sigaction` table so `oldact` preserves prior handlers/`SIG_IGN`; real signal dispatch landed in M8 (#384; see the M8 table below) |
+| 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | requires `sigsetsize == 8`; maintains per-thread signal mask (silently dropping `SIGKILL`/`SIGSTOP`); real delivery landed in M8 (#384; see the M8 table below) |
 | 16 | `ioctl(fd, req, arg)` | returns `-EBADF` for unopened/closed fds; on fd 0/1/2: `TCGETS` (`0x5401`) fills a default `struct termios`, `TCSETS`/`TCSETSW`/`TCSETSF` (`0x5402`–`0x5404`) succeed as no-ops (0), and `TIOCGWINSZ` (`0x5413`) fills `struct winsize` with console rows/cols; all other requests `-ENOTTY` |
 | 19 | `readv(fd, iov, iovcnt)` | validates `0 <= iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, skips zero-length spans without dereferencing `iov_base`, reads from fd 0 (needed by `musl` `__stdio_read` for buffered stdin) |
 | 20 | `writev(fd, iov, iovcnt)` | validates `0 <= iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, skips zero-length spans without dereferencing `iov_base`, writes each span to fd 1/2 |
@@ -4278,8 +4283,9 @@ Lumen runs two kinds of user code:
 
 In addition to the 30 table entries above, M6 includes console `poll(2)` (syscall 7)
 to satisfy Rust `std`'s `sanitize_standard_fds` startup check (`poll([0, 1, 2], 3, 0)`)
-and `busybox` `lineedit` stdin readiness waits; full pipe/socket/PTY `poll`/`ppoll`/`select`
-arrives in M8.
+and `busybox` `lineedit` stdin readiness waits; pipe and PTY
+`poll`/`ppoll`/`select` landed in M8 (#374, #386, #388; see the M8 table
+below). Sockets are M9.
 
 #### M7 POSIX VFS, file-backed `mmap`, and dynamic-linking syscalls (designed in #246)
 
@@ -4334,8 +4340,7 @@ computed from the inode too, so relative `chdir`s never grow it), and
 filesystem's own `readdir` cursor (`d_off`: the cursor past each entry),
 which stays stable as entries come and go (section 9, with ext4's two
 exceptions there), so a model of busybox `rm -r`'s loop, reading on while
-it unlinks, empties a directory; the other M7 numbers not yet implemented
-are stubs (wave 3).
+it unlinks, empties a directory (the M7 stubs went with `msync`, #255).
 
 The design #246 set out for this, and the behaviour of each rerouted call:
 Console FDs 0/1/2 become `OpenFile` entries backed by the process's `ConsoleIo`
@@ -4648,8 +4653,10 @@ nor that list.
 - **M6 scope for `busybox ash`:** M6 runs embedded/test static `musl` binaries
   (including `busybox ash -s` exercising built-in commands such as `echo`,
   `pwd`, `export`, arithmetic, loops, and `exit` over serial without job
-  control). Interactive `lineedit`, pipes, and external subprocesses require
-  `fork`/`pipe`/`dup2`/`wait4`/PTYs and arrive in M8.
+  control). Interactive `lineedit`, pipes, and external subprocesses landed
+  in M8 with `fork`/`pipe`/`dup2`/`wait4`/PTYs (see the M8 table;
+  #393's `test_alpine::test_ash_scripts_and_pipelines` checks scripts,
+  external commands and pipelines).
 - **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`; designed in #246, built in #255 (the loader copies segment bytes; the file-backed part is ld-musl's `mmap(fd)` of libraries); `dlopen` of `libm7.so` checked by `test_linux_user::test_dynamic_musl_binary_and_dlopen`, M7):**
   - **`crates/lumen-elf` parser extension:** `LoadedElf::parse_headers_with_pie_base(ehdr, phdrs, file_size, pie_base)`
     accepts an optional `PT_INTERP` header (at most one; rejects duplicate
@@ -4710,7 +4717,8 @@ nor that list.
     applet per `linux` line (`test_alpine::test_alpine_minirootfs_coreutils`;
     `tools/linux-m7/m7_test.rs` with `libm7.so` for `dlopen` and file `mmap`
     from ring 3). `ash` scripts running external commands, shell
-    redirections (`dup`/`dup2`), and pipelines arrive in M8.
+    redirections (`dup`/`dup2`), and pipelines landed in M8 (#393,
+    `test_alpine::test_ash_scripts_and_pipelines`; see the M8 table).
 
 ### Processes and threads (designed in #336, M8)
 
@@ -10833,12 +10841,12 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
 
 **M8's tests (designed in #336).**
 
-- **Scenario files.** B0 adds `tests/scenarios/test_linux_proc.py`
+- **Scenario files.** `tests/scenarios/test_linux_proc.py`
   (processes, threads, signals, `futex`, timers, sessions, the small
   syscalls), `test_linux_io.py` (pipes, FIFOs, readiness, PTYs, the
   console as a tty), `test_linux_vm.py` (cross-CPU shootdowns) and
-  `test_conformance.py` (libc-test), each empty until its issue's first
-  test; the gates extend `test_alpine.py`, and C11 extends `test_smp.py`.
+  `test_conformance.py` (libc-test); the gates extend `test_alpine.py`, and
+  C11 extends `test_smp.py`.
 - **Feature files.** Each feature goes in its area's file:
   `process.toml` (B1, C1, C2, C3, C8, C12), `signal.toml` (C5, C6, C13),
   `futex.toml` (C4), `pipe.toml` (B3, C7), `tty.toml` (C9, C10; these five
@@ -10846,10 +10854,10 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
   `smp.toml` (C11), `elf.toml` (C2's lumen-elf changes), `fs.toml` (B8,
   `mknod`), `user.toml` (B0's ABI and census tests, and the gates beside
   M7's `test_alpine` rows).
-- **`tools/linux-m8/` test programs** (B0's skeleton): `m8_proc`
+- **`tools/linux-m8/` test programs**: `m8_proc`
   (processes, threads, signals, faults, `futex`, timers, sessions, the
-  small calls), `m8_io` (pipes, FIFOs, `poll`/`select`, PTYs), `m8_vm`
-  (shootdowns) and `ptyrun` (D3: opens `/dev/ptmx`, starts its argument
+  small calls), `m8_io` (pipes, FIFOs, `poll`/`select`, console readiness),
+  `m8_pty` (PTYs), `m8_vm` (shootdowns) and `ptyrun` (D3: opens `/dev/ptmx`, starts its argument
   on the slave as a session leader with it as its controlling terminal;
   `--script <file> -- <program> [args...]` drives the program directly
   over the PTY master, used by D3's vim scenario, while the interactive
