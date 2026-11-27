@@ -4278,7 +4278,7 @@ Lumen runs two kinds of user code:
 | 218 | `set_tid_address(tidptr)` | stores `clear_child_tid` pointer and returns current TID |
 | 228 | `clock_gettime(clockid, tp)` | `CLOCK_REALTIME` (0, from RTC/boot offset), `CLOCK_MONOTONIC` (1), `CLOCK_MONOTONIC_RAW` (4), `CLOCK_REALTIME_COARSE` (5), `CLOCK_MONOTONIC_COARSE` (6), `CLOCK_BOOTTIME` (7) |
 | 231 | `exit_group(status)` | terminates the process and frees its `AddressSpace` and FD table |
-| 302 | `prlimit64(pid, res, new, old)` | validates `pid == 0 \|\| pid == current_pid` (`-ESRCH` otherwise) and `res < RLIM_NLIMITS` (16, `-EINVAL` otherwise); M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), and `RLIM_INFINITY` for other valid resources when `old` is non-null; writable per-process limit enforcement arrives in M10 |
+| 302 | `prlimit64(pid, res, new, old)` | validates `pid == 0 \|\| pid == current_pid` (`-ESRCH` otherwise) and `res < RLIM_NLIMITS` (16, `-EINVAL` otherwise); M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), and `RLIM_INFINITY` for other valid resources when `old` is non-null; writable per-process limits came later (`RLIMIT_STACK` in C12, `RLIMIT_NOFILE` and `RLIMIT_NPROC` in #435, the rest in M10: the M8 row) |
 | 318 | `getrandom(buf, len, flags)` | rejects unknown flag bits (`-EINVAL`), fills user buffer from `crate::rng` (section 7) via `copy_to_user`, and returns bytes written |
 
 In addition to the 30 table entries above, M6 includes console `poll(2)` (syscall 7)
@@ -4508,7 +4508,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 
 | # | Syscall | M8 behaviour | Issue |
 |---|---|---|---|
-| 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` is the low 32 bits, past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed or `O_PATH` fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; only each entry's `revents` is written back, including after an interrupt; an interrupted `poll` with an unwritable `fds` is `-EFAULT` with no restart block; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block, stored and returned through `Err(linux::signal::interrupted_with(block))`), as Linux's `poll` | B3 |
+| 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` is the low 32 bits, past the caller's soft `RLIMIT_NOFILE` `-EINVAL` (since #435; 1024 by default); a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed or `O_PATH` fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; only each entry's `revents` is written back, including after an interrupt; an interrupted `poll` with an unwritable `fds` is `-EFAULT` with no restart block; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block, stored and returned through `Err(linux::signal::interrupted_with(block))`), as Linux's `poll` | B3 |
 | 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | `sigsetsize != 8` is `-EINVAL`; copy `act` first (`-EFAULT` precedes invalid `sig`); `sig` outside 1..=64 is `-EINVAL`; a non-null `act` for `SIGKILL`/`SIGSTOP` is `-EINVAL`; atomically swap the action under `signal`, then copy `oldact` (its `-EFAULT` does not undo the install); unknown `sa_flags` bits are cleared before storing (and in `oldact`), as Linux's `do_sigaction` does; `SIG_IGN`, or `SIG_DFL` on a default-ignored signal, discards that signal's pending entries (`PendingSignals::disposition_changed`); `SA_RESTORER` is needed to deliver a handler (`frame::build`'s `MissingRestorer` forces `SIGSEGV`; musl always sets it); `SA_NOCLDWAIT` or `SIG_IGN` on `SIGCHLD` makes `ProcTree::exit` reap the children (`autoreap`) | C5 |
 | 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | `sigsetsize != 8` is `-EINVAL`; copy `set` first (`-EFAULT` precedes bad `how`); `Blocked::apply` (a bad `how` is `-EINVAL` when `set` is non-null), then copy `oldset` (its `-EFAULT` does not undo the mask); unblocking a pending signal sets `sigpending`, so it is delivered before the call returns | C5 |
 | 15 | `rt_sigreturn()` | section 6, "Signals"; returns the restored `rax`; a frame `restore` refuses forces `SIGSEGV` | C5 |
@@ -4579,7 +4579,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 292 | `dup3(oldfd, newfd, flags)` | `flags` other than `O_CLOEXEC` `-EINVAL`; `oldfd == newfd` `-EINVAL`; else `dup2` with `FD_CLOEXEC` from `flags` | C7 |
 | 293 | `pipe2(fds, flags)` | `O_CLOEXEC` and `O_NONBLOCK` (each end's own description); `O_DIRECT` (packet mode: a deviation) and any other flag `-EINVAL`; two slots reserved first (`-EMFILE`); a bad `fds` `-EFAULT`, both reservations dropped without installing either descriptor; section 10 | C7 |
 | 297 | `rt_tgsigqueueinfo(tgid, tid, sig, info)` | copy `info` first (`-EFAULT`); then `tgid`/`tid <= 0` gives `-EINVAL`; otherwise as `rt_sigqueueinfo`, to one thread | C5 |
-| 302 | `prlimit64(pid, res, new, old)` | M6's checks; a write to `RLIMIT_STACK` (`rlim_cur > rlim_max` `-EINVAL`) is kept and used by the next `execve` (its stack and argument budget, section 8). Since #435, `RLIMIT_NOFILE` and `RLIMIT_NPROC` writes are kept per process (inherited across `fork`, kept across `execve`) and enforced: every fd allocation (`open`, `openat`, `pipe`, `pipe2`, `dup`, `dup2`/`dup3` to a target at or past the limit `-EBADF`, `fcntl(F_DUPFD*)` with `arg` at or past it `-EINVAL`) returns `-EMFILE` with no free fd below the soft limit, and an `RLIMIT_NOFILE` hard limit above `MAX_FDS` (1024) is refused with `-EPERM`, as Linux refuses one above `nr_open`; `fork`, `vfork` and `clone` return `-EAGAIN` once the extant user tasks (processes other than init, non-leader threads, unreaped zombies) reach the soft `RLIMIT_NPROC`. Unlike Linux, root is not exempt: Lumen has one uid, 0, and no capabilities, so an exemption would make the limit unenforceable (libc-test's `pthread_atfork-errno-clobber` sets it to 0 and expects `fork` to fail). Every other resource's write is still checked and ignored until M10. The census: gcc and g++ raise the stack to 64 MiB and `cc1`/`cc1plus` read it back | C12 |
+| 302 | `prlimit64(pid, res, new, old)` | M6's checks; a write to `RLIMIT_STACK` (`rlim_cur > rlim_max` `-EINVAL`) is kept and used by the next `execve` (its stack and argument budget, section 8). Since #435, `RLIMIT_NOFILE` and `RLIMIT_NPROC` writes are kept per process (inherited across `fork`, kept across `execve`) and enforced: `open`, `openat`, `pipe`, `pipe2` and `dup` return `-EMFILE` with no free fd below the soft limit; `dup2`/`dup3` to a target at or past it `-EBADF`; `fcntl(F_DUPFD*)` with `arg` at or past it `-EINVAL`; `poll`/`ppoll` with `nfds` past it `-EINVAL`; the kernel's own installs (`Stdio`, the fork and exec copies) aren't limited; and an `RLIMIT_NOFILE` hard limit above `MAX_FDS` (1024) is refused with `-EPERM`, as Linux refuses one above `nr_open`; `fork`, `vfork` and `clone` return `-EAGAIN` once the extant user tasks (processes other than init, non-leader threads, unreaped zombies) reach the soft `RLIMIT_NPROC`. Unlike Linux, root is not exempt: Lumen has one uid, 0, and no capabilities, so an exemption would make the limit unenforceable (libc-test's `pthread_atfork-errno-clobber` sets it to 0 and expects `fork` to fail). Every other resource's write is still checked and ignored until M10. The census: gcc and g++ raise the stack to 64 MiB and `cc1`/`cc1plus` read it back | C12 |
 | 309 | `getcpu(cpu, node, cache)` | the current CPU's index and node 0 (either pointer may be `NULL`); with no vDSO, musl's `sched_getcpu` makes this syscall | C12 |
 | 324 | `membarrier(cmd, flags, cpu_id)` | **`-ENOSYS`**: musl registers `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED` when it starts a thread, ignores the result, and its barrier falls back to signalling each thread (the census: git, pthread, vim over the pty) | — |
 
@@ -4616,8 +4616,9 @@ nor that list.
   and `accept4` (288), `AF_UNIX` (`socketpair`, `SCM_RIGHTS`), `epoll_*`
   (on section 10's readiness interface), `eventfd2`, and `timerfd_*`.
 - **M10 (JIT VM & Tier-1 runtimes):** `mremap`, `madvise` (`MADV_DONTNEED`,
-  `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64` (every
-  resource), and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery (`sysinfo`
+  `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64` (the
+  resources not yet enforced: `RLIMIT_STACK` since C12, `RLIMIT_NOFILE` and
+  `RLIMIT_NPROC` since #435), and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery (`sysinfo`
   moved to M8 with #337's census).
 
 ### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` loader built #255, designed in #246; `dlopen` through ld-musl's file `mmap` built #255, M7)
@@ -4784,7 +4785,7 @@ pub struct SignalState {
     group_stop: Option<GroupStop>,           // signal, threads to park, generation
     timers: Timers,                          // ITIMER_REAL and POSIX timers (C13)
     ctty: Option<Arc<Tty>>,                  // controlling terminal (C9/C10)
-    rlimit_stack: StackLimit,                 // private soft <= hard; only soft sizes the next execve
+    rlimits: Rlimits,                         // stack, nproc, nofile: each soft <= hard; #435 enforces nproc/nofile
 }
 pub struct ThreadSignals {
     slot: ThreadSlot,                        // lumen_signal::pending's
@@ -5142,7 +5143,7 @@ before `ProcTree::fork`, which can't be undone (lumen-proc has no
 
 The child's `SignalState` copies the dispositions, the caller's mask and
 alternate stack (cleared only for `CLONE_VM` without `CLONE_VFORK`),
-the controlling terminal and `rlimit_stack`; it has an
+the controlling terminal and its `Rlimits` (stack, nproc, nofile); it has an
 empty pending set and no timers (neither `timer_create`'s nor
 `ITIMER_REAL`: not inherited, as on Linux). The child's registers are the
 parent's at the `syscall`, with `rax` = 0 and `rsp` = `newsp` if
@@ -11632,13 +11633,12 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   four outcomes: pass, fail, timeout and error. It compares them with
   `tests/conformance/libc-test-xfail.txt`, whose entries each carry a path,
   reason and issue. A runner error is never covered; a test with no `EXIT`
-  counts as not run. The list has 26 strict expected failures, leaving
-  258 tests required to pass: 10 native musl failures (#398: `mntent`,
+  counts as not run. The list has 22 strict expected failures, leaving
+  262 tests required to pass: 10 native musl failures (#398: `mntent`,
   `strptime`, `wordexp`, `regex-backref-oob`, `regexec-backref`, each static
   and dynamic; likely fixed in musl after 1.2.5), 4 PI-futex failures
   (#397: `pthread_mutex_pi` and `pthread_robust`, each linkage), 6 SysV IPC
-  failures (#432), 2 socket failures
-  (#434, M9), and 4 non-stack resource-limit failures (#435, M10).
+  failures (#432), and 2 socket failures (#434, M9).
   The native reference set remains 274 passes out of 284 (`NATIVE_PASS`
   in `tests/harness/test_libctest.py`); the 10 #398 failures are not missing
   Lumen interfaces.
