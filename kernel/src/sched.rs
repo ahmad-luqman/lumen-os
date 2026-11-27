@@ -2815,7 +2815,7 @@ pub(crate) fn running_cpus() -> Vec<usize> {
 /// bounded by it, so a thread that never runs fails the test instead of
 /// hanging it.
 #[cfg(feature = "ktest")]
-const TEST_DEADLINE_NS: u64 = 10_000_000_000;
+pub(crate) const TEST_DEADLINE_NS: u64 = 10_000_000_000;
 
 /// `spawn_on` for tests: the error as a diag line and a test failure.
 #[cfg(feature = "ktest")]

@@ -1317,6 +1317,10 @@ def test_minimize_and_restore(boot):
     # `minimize` and `restore` through `ui invoke`, each refused when there
     # is nothing to do. Each step ends with the screen a full repaint
     # would draw.
+    def colours_state(rows: list[dict[str, str]], *, minimized: str, focused: str) -> bool:
+        c = gui.one(rows, "Colours rows", title="Colours")
+        return c["minimized"] == minimized and c["focused"] == focused
+
     m = boot_tablet(boot)
     gui.start_desktop(m)
     wid = gui.window(m, "Colours")["id"]
@@ -1325,7 +1329,7 @@ def test_minimize_and_restore(boot):
         m,
         "Colours minimized",
         lambda: gui.windows(m),
-        lambda r: gui.one(r, "Colours rows", title="Colours")["minimized"] == "yes",
+        lambda r: colours_state(r, minimized="yes", focused="no"),
     )
     assert [(w["title"], w["focused"], w["minimized"]) for w in rows] == [
         ("Colours", "no", "yes"),
@@ -1341,7 +1345,10 @@ def test_minimize_and_restore(boot):
     # Its taskbar button restores it.
     gui.click(m, *gui.centre(gui.node(gui.taskbar(m), "button", "Colours")))
     rows = gui.wait_for(
-        m, "Colours restored", lambda: gui.windows(m), lambda r: r[0]["title"] == "Colours"
+        m,
+        "Colours restored",
+        lambda: gui.windows(m),
+        lambda r: colours_state(r, minimized="no", focused="yes"),
     )
     assert [(w["title"], w["z"], w["focused"], w["minimized"]) for w in rows] == [
         ("Colours", "0", "yes", "no"),

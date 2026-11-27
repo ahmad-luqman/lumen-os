@@ -32,6 +32,9 @@ pub struct SpinLock<T> {
     /// its own last store (coherence), so it reads its own id exactly while
     /// it holds the lock, even with `Relaxed` loads.
     owner: AtomicU32,
+    /// See [`waits_started`](Self::waits_started).
+    #[cfg(feature = "ktest")]
+    waits_started: AtomicU32,
     value: UnsafeCell<T>,
 }
 
@@ -45,7 +48,12 @@ unsafe impl<T: Send> Send for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
     pub const fn new(value: T) -> Self {
-        Self { owner: AtomicU32::new(FREE), value: UnsafeCell::new(value) }
+        Self {
+            owner: AtomicU32::new(FREE),
+            #[cfg(feature = "ktest")]
+            waits_started: AtomicU32::new(0),
+            value: UnsafeCell::new(value),
+        }
     }
 
     /// Take the lock, spinning while another CPU holds it.
@@ -79,6 +87,12 @@ impl<T> SpinLock<T> {
                     while owner != FREE {
                         if spins == 0 {
                             since = arch::rdtsc();
+                            // `rdtsc` isn't ordered by atomics, so another CPU
+                            // may see this bump a few cycles before `since` is
+                            // read; the ktest's hold covers that window.
+                            // Nothing is published through `waits_started`.
+                            #[cfg(feature = "ktest")]
+                            self.waits_started.fetch_add(1, Ordering::Relaxed);
                         }
                         spins += 1;
                         core::hint::spin_loop();
@@ -130,6 +144,14 @@ impl<T> SpinLock<T> {
     fn held_here(&self) -> bool {
         let _irq = arch::irq::push_off();
         self.owner.load(Ordering::Relaxed) == owner_id()
+    }
+
+    /// How many contended [`lock`](Self::lock) calls have read their wait's
+    /// start TSC (in program order: see the comment at the bump) and entered
+    /// the spin loop (for the ktests).
+    #[cfg(feature = "ktest")]
+    pub(crate) fn waits_started(&self) -> u32 {
+        self.waits_started.load(Ordering::Relaxed)
     }
 
     /// Access the value even if the lock is held.

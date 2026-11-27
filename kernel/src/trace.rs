@@ -954,65 +954,101 @@ fn is_xray_kind(kind: u16) -> bool {
     kind::stream_of(kind) == Stream::Xray
 }
 
-/// Ktests: make this CPU and CPU 1 take one lock in turn until one of them
-/// had to wait, and return that `lock` event, the ring it was read from
-/// (the waiting CPU's, which also recorded it: checked), and the line of
-/// the `lock` call that CPU made. Waits for the effect (up to 10 s, a
-/// safety net); times nothing.
+/// Ktests: how long CPU 1 holds the lock in [`a_lock_wait`] after observing
+/// this CPU enter `SpinLock::lock`'s spin loop. It sets the floor
+/// `a_contended_lock_is_traced` asserts (half of it, in TSC ticks), and
+/// covers the TSC's granularity under TCG and the few-cycle window from an
+/// unordered `rdtsc` at `waits_started`.
 #[cfg(feature = "ktest")]
-fn a_lock_wait(out: &mut [Event]) -> Result<(LockWait, usize, u32), &'static str> {
+const LOCK_WAIT_HOLD_NS: u64 = 1_000_000;
+
+/// Ktests: make CPU 1 hold a lock until this CPU has read its wait's start TSC
+/// and entered `SpinLock::lock`'s spin loop (`waits_started`), then keep
+/// holding it for [`LOCK_WAIT_HOLD_NS`] before releasing it so the waiter's
+/// span covers the hold (both TSCs run at one rate). Fails if CPU 1 never
+/// takes the lock, never finishes, or times out after `sched::TEST_DEADLINE_NS`
+/// without observing `waits_started` advance. Returns the decoded `lock`
+/// event (`LockWait`) recorded in this CPU's X-ray ring and the line of the
+/// `lock` call; also
+/// checks that the uncontended holder recorded no wait for the lock and that
+/// neither ring missed events.
+///
+/// The ktest thread stays on its CPU (`since` and both ring reads rely on
+/// `arch::cpu_index()` staying unchanged across the call).
+#[cfg(feature = "ktest")]
+fn a_lock_wait(out: &mut [Event]) -> Result<(LockWait, u32), &'static str> {
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     static HOT: crate::sync::SpinLock<u64> = crate::sync::SpinLock::new(0);
-    /// The line of each CPU's `lock` call (this CPU, CPU 1).
-    static LINES: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
-    static STOP: AtomicBool = AtomicBool::new(false);
+    static HELD: AtomicBool = AtomicBool::new(false);
+    static BEFORE_WAIT: AtomicU32 = AtomicU32::new(0);
+    static SAW_WAITER: AtomicBool = AtomicBool::new(false);
     static DONE: AtomicBool = AtomicBool::new(false);
-    /// Take it once, holding it a little so the other CPU finds it held.
-    fn take(slot: usize) {
-        let (mut g, line) = (HOT.lock(), line!());
-        LINES[slot].store(line, Ordering::Relaxed);
-        *g += 1;
-        for _ in 0..64 {
-            core::hint::spin_loop();
-        }
-    }
+
     fn on_cpu_1() {
-        while !STOP.load(Ordering::Relaxed) {
-            take(1);
+        let mut g = HOT.lock();
+        *g += 1;
+        let before = HOT.waits_started();
+        BEFORE_WAIT.store(before, Ordering::Relaxed);
+        HELD.store(true, Ordering::Release);
+        let saw = crate::smp::spin_until(crate::time::now_ns() + crate::sched::TEST_DEADLINE_NS, || {
+            HOT.waits_started() != before
+        });
+        SAW_WAITER.store(saw, Ordering::Relaxed);
+        if saw {
+            crate::time::spin(LOCK_WAIT_HOLD_NS);
         }
+        drop(g);
         DONE.store(true, Ordering::Release);
     }
-    STOP.store(false, Ordering::Relaxed);
+
+    HELD.store(false, Ordering::Relaxed);
+    SAW_WAITER.store(false, Ordering::Relaxed);
     DONE.store(false, Ordering::Relaxed);
-    let rings = [arch::cpu_index(), 1];
+
+    let me = arch::cpu_index();
     let addr = core::ptr::from_ref(&HOT).addr() as u64;
-    let since = rings.map(|c| xray_ring(c).map_or(0, |r| r.written()));
+    let since = xray_ring(me).ok_or("no X-ray ring for this cpu")?.written();
+    let holder_since = xray_ring(1).ok_or("no X-ray ring for cpu 1")?.written();
+
     crate::smp::run_on_test(1, on_cpu_1)?;
-    let deadline = crate::time::now_ns() + 10_000_000_000;
-    let mut found = None;
-    while found.is_none() && crate::time::now_ns() < deadline {
-        for _ in 0..1000 {
-            take(0);
-        }
-        for (slot, &c) in rings.iter().enumerate() {
-            let (events, _) = xray_since(c, since[slot], out)?;
-            if let Some(e) = events.iter().find(|e| LockWait::decode(e).is_some_and(|w| w.lock == addr)) {
-                found = Some((*e, slot));
-                break;
-            }
-        }
+    if !crate::smp::job_reached(1, || HELD.load(Ordering::Acquire)) {
+        return Err("cpu 1 never took the lock");
     }
-    STOP.store(true, Ordering::Relaxed);
+    let (g, line) = (HOT.lock(), line!());
+    drop(g);
     if !crate::smp::job_reached(1, || DONE.load(Ordering::Acquire)) {
-        return Err("cpu 1 didn't stop taking the lock");
+        return Err("cpu 1 didn't finish holding the lock");
     }
-    let (e, slot) = found.ok_or("no lock event for the lock in 10 s")?;
-    if usize::from(e.cpu) != rings[slot] {
-        crate::ktest::diag(format_args!("cpu {}'s ring: {}", rings[slot], Describe(&e)));
-        return Err("a lock event in another CPU's ring");
+    if !SAW_WAITER.load(Ordering::Relaxed) {
+        crate::ktest::diag(format_args!(
+            "cpu 1 timed out waiting for waits_started: before={}, now={} (now above before: this cpu's wait came after cpu 1 gave up)",
+            BEFORE_WAIT.load(Ordering::Relaxed),
+            HOT.waits_started(),
+        ));
+        return Err("cpu 1 timed out before this cpu entered the lock's spin loop");
     }
-    let w = LockWait::decode(&e).ok_or("not a lock event")?;
-    Ok((w, rings[slot], LINES[slot].load(Ordering::Relaxed)))
+
+    let ours = |e: &Event| LockWait::decode(e).filter(|w| w.lock == addr).map(|w| (*e, w));
+    let (events, missed) = xray_since(me, since, out)?;
+    if missed > 0 {
+        crate::ktest::diag(format_args!("cpu {me}'s X-ray ring missed {missed} events"));
+        return Err("this cpu's X-ray ring missed events");
+    }
+    let (e, w) = events.iter().find_map(ours).ok_or("no lock event recorded for the contended lock")?;
+    if usize::from(e.cpu) != me {
+        crate::ktest::diag(format_args!("cpu {me}'s ring: {}", Describe(&e)));
+        return Err("a lock event stamped with another CPU");
+    }
+    let (holder_events, holder_missed) = xray_since(1, holder_since, out)?;
+    if holder_missed > 0 {
+        crate::ktest::diag(format_args!("cpu 1's X-ray ring missed {holder_missed} events"));
+        return Err("cpu 1's X-ray ring missed events");
+    }
+    if let Some((he, _)) = holder_events.iter().find_map(ours) {
+        crate::ktest::diag(format_args!("cpu 1's ring unexpectedly recorded: {}", Describe(&he)));
+        return Err("the uncontended holder recorded a lock wait");
+    }
+    Ok((w, line))
 }
 
 /// Ktests: claim an MSI vector (once a boot: vectors are never freed), send
@@ -1135,19 +1171,29 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_contended_lock_is_traced() {
-        // This CPU and CPU 1 take one lock in turn until one of them had to
-        // wait, which then says so in its own X-ray ring: the lock's
-        // address, how often it looked (at least once), how long it waited
-        // (more than nothing, less than the whole contention took), and
-        // the line of that CPU's `lock` call (through `#[track_caller]`).
+        // CPU 1 holds a lock until this CPU has started spinning on it and
+        // keeps holding it for `LOCK_WAIT_HOLD_NS` before releasing it; this
+        // CPU (the ktest thread stays on its CPU) records the wait in its own
+        // X-ray ring: the lock's address, how often it looked (at least once),
+        // how long it waited (at least `LOCK_WAIT_HOLD_NS / 2` in TSC ticks,
+        // half the hold: the hold and the floor are ticks of one clock, so
+        // calibration cancels, and the half is slack for the unordered rdtsc
+        // and the two CPUs' TSC rates; and at most
+        // the whole call's TSC span on this same CPU), and the line of the
+        // `lock` call (through `#[track_caller]`).
         use crate::{kassert, kassert_eq};
         let mut out = ring_buffer();
+        // The ktest thread stays on its CPU; `a_lock_wait`'s `since` and both
+        // reads depend on it.
+        let cpu = arch::cpu_index();
+        let floor = crate::time::tsc().ok_or("no calibrated TSC")?.ticks(LOCK_WAIT_HOLD_NS / 2);
+        kassert!(floor > 0);
         let t0 = arch::rdtsc();
-        let (w, cpu, line) = a_lock_wait(&mut out)?;
+        let (w, line) = a_lock_wait(&mut out)?;
         let t1 = arch::rdtsc();
-        crate::ktest::diag(format_args!("cpu {cpu} waited: {w:?}"));
+        crate::ktest::diag(format_args!("cpu {cpu} waited: {w:?} (floor {floor} ticks)"));
         kassert!(w.spins > 0);
-        kassert!(w.waited > 0 && w.waited <= t1 - t0);
+        kassert!(w.waited >= floor && w.waited <= t1 - t0);
         kassert!(line > 0);
         kassert_eq!(w.line, line);
         Ok(())
@@ -1191,8 +1237,9 @@ crate::ktest!(
         kassert!(events.iter().filter_map(RunQueue::decode).any(|rq| rq.cpu == 1));
         let irq = events.iter().find(|e| Irq::decode(e).is_some_and(|irq| irq.vector == vector));
         kassert_eq!(irq.map(|e| e.cpu), Some(1));
-        let (_, waiter, _) = a_lock_wait(&mut out)?;
-        crate::ktest::diag(format_args!("msi vector {vector:#x} on cpu 1; cpu {waiter} waited for the lock"));
+        let _ = a_lock_wait(&mut out)?;
+        // The ktest thread stays on `me`; `a_lock_wait` waited on `me`.
+        crate::ktest::diag(format_args!("msi vector {vector:#x} on cpu 1; cpu {me} waited for the lock"));
         for _ in 0..2 * XRAY_EVENTS {
             record_irq(Irq { vector: 0, rip: 0 });
         }
