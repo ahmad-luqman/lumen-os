@@ -175,9 +175,9 @@ one is its own PR that updates that doc first.
   SMP migration and work-stealing (`spawn_migratable`, `spawn_fork_child`, `affinity`/`set_affinity`, `online_mask`, `nice`/`set_nice`, `cpu_time`, `comm`/`set_current_comm`, #377, #380, #391);
   per-thread ring-3 state (`UserSpaceGuard`, `current_address_space`/`replace_user_space`/`detach_user_space`, `current_user_thread`, `snapshot_user_fpu`/`restore_signal_fpu`, `set_restart_block`/`take_restart_block`);
   each run-queue change an X-ray `runq` event, `run_queue`: a queue's length both ways); `arch/x86_64/context.rs` switches threads.
-  `arch/x86_64/`: GDT/TSS (per CPU), IDT (`TLB_SHOOTDOWN` on vector `0x3e`, #376; deferred `#DB` handling, `DEFERRED_LSTAR_DB`/`DEFERRED_STUB_DB`, #384), entry
+  `arch/x86_64/`: GDT/TSS (per CPU), IDT (`TLB_SHOOTDOWN` on vector `0x3e`, #376; M6's deferred `#DB` handling, `DEFERRED_LSTAR_DB`/`DEFERRED_STUB_DB`), entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index, `loaded_space`, #376, `DebugTrap` pending debug traps, #384), `irq.rs` (nested interrupt disable),
-  `syscall.rs` (`SyscallFrame`, `SyscallReturn`, `unwind_to_kernel`), `fpu.rs` (`FpuMode`, `UserFpuState`, `install_signal`, `signal_xfeature_layout`, #384),
+  `syscall.rs` (`SyscallFrame`, `SyscallReturn`, `unwind_to_kernel`), `fpu.rs` (M6's `FpuMode`, `UserFpuState`; `install_signal`, `signal_xfeature_layout`, #384),
   local and I/O APIC, 8259 and PIT registers, serial, IST stacks. `user.rs`: ring-3 entry/exit (`run_elf_process`, `UserExit`, `UserFault`), fault-safe copies (`copy_from_user`, `copy_to_user`, `copy_to_user_partial`, `copy_cstr_from_user`, `.lumen_fixup`), non-faulting futex atomics (`read_u32_nofault`, `cmpxchg_u32`, `fault_in_writable`, `.lumen_fixup_nofault`, #373, #383), `handle_user_exception` and `dispatch_syscall`. `crash.rs`: crash
   reporter. `ktest.rs`: test runner (`lumen.ktest=` runs only the tests with given name prefixes). `script.rs`: rhai scripts (the shell's
   `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
@@ -461,13 +461,13 @@ one is its own PR that updates that doc first.
   `ktest_util`, the ext4 ktest helpers `vfs/tests.rs` and `page_cache.rs`
   share: `FaultCache` (writes failed by number, pair or from one on,
   reads by range or after a write fault), `Mnt`, `mount`, `remount_ro`,
-  `set_clock`, the ktests' clock, `Ext4Shared::now`);
+  `set_clock`, the ktests' clock, `Ext4Shared::now`; `mknod` FIFOs, #386,
+  and `statfs`, #391);
   `vfs/tmpfs.rs` (its quota charging inodes, directory entries and symlink
   targets besides pages, #267: `charge`, the cost model, `InodeCharge`,
   `EntryCharge` and `Children`, the only code reserving or giving one back;
   `quota_use`, a mount's `QuotaUse` for `mount`, #324; `mknod` FIFOs with
-  embedded `FifoSlot`, #386, and `statfs`, #391; ext4 also gains `mknod`
-  FIFOs and `statfs`),
+  a boxed `FifoSlot` (`Option<Box<FifoSlot>>`), #386, and `statfs`, #391),
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`,
   `ptmx` with `TerminalOpen::{Ptmx, Alias, Console}` and `terminal_open`, #388, #389),
   `vfs/devpts.rs` (M8, #388, #389: `/dev/pts` filesystem `Devpts` on dev
@@ -527,7 +527,8 @@ one is its own PR that updates that doc first.
   the advisory locks' wait queue and release count (`lock_releases`,
   `locks_released`, `wait_for_lock_release`: `F_SETLKW` and blocking
   `flock`, #254), `Stdio` (fds 0/1/2 on `/dev/console` bound to the console
-  tty when interactive, `/` as cwd), `open_kernel_file`, `ConsoleIo`
+  tty when interactive, `/` as cwd; opened before a run or the run is
+  refused), `open_kernel_file`, `ConsoleIo`
   (`Capture`, `Serial`, `Vt(VtId)`), `in_test_process` (`add_ktest_thread`,
   `with_process_user`), and `RegisteredProcess` (#264);
   `linux/signal.rs` (#373, #384: `RestartBlock`, `ERESTARTSYS`,
@@ -552,12 +553,15 @@ one is its own PR that updates that doc first.
   `on_tick` wakeup and timer worker thread from `timer::init`,
   `create`/`set`/`get`/`delete`/`overrun`/`delivered`/`clear`);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
-  `dispatch` (each number in one arm, its constant as the pattern; every M7
-  and M8 syscall is implemented — `not_implemented` stubs are gone, with
-  only `sendfile` and `membarrier` staying `-ENOSYS` by design), `unmap_past`
+  `dispatch` (each number in one arm, its constant as the pattern; M7's and
+  M8's `not_implemented` stubs are gone; of the M8 table's rows only
+  `sendfile` and `membarrier` stay `-ENOSYS`; with `clone3`, `execveat`,
+  `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` they
+  make up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
+  (ARCHITECTURE section 8, "Stays `-ENOSYS` in M8")), `unmap_past`
   (#378) and the shared copy helpers, `time.rs` (`RawTimespec`,
-  `read_timespec`, `write_timespec`, `ERESTARTNOHAND`, shared by `futex`
-  and `poll`, #383), and a module per cluster holding its handlers (`fd`,
+  `read_timespec`, `write_timespec`, `ERESTARTNOHAND`, #383, shared by `futex`,
+  `poll` and `signal` (`rt_sigtimedwait`)), and a module per cluster holding its handlers (`fd`,
   `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, with #255's
   `mmap` of a descriptor and `msync` (ktests in `mem/tests.rs`), `proc`;
   M8's clusters, #371: `task` (`exit`, `exit_group`, the ids,
@@ -578,7 +582,8 @@ one is its own PR that updates that doc first.
   `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391);
   `fd` holds `open`/`openat`/`lseek` (with `open_fifo`, #386, and
   `devpts::open`, #388, #389) and descriptor I/O/`ioctl` (`FIONREAD`, tty
-  requests) through the table, and the syscall ktests'
+  requests) through the table, routing terminals by `VfsInode::is_tty`
+  to their tty or the process's `ConsoleIo`, and the syscall ktests'
   shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_fd_of`: a failure
   naming the path, `ktest_open`, `ktest_install` and `ktest_install_file`:
   a descriptor on a volume no mount holds, `ktest_failed_at`,
@@ -753,9 +758,9 @@ one is its own PR that updates that doc first.
   handing back each one it lets go, `Released`, #320, and keeping removed
   directories' parents for `..`, `record_removed_dir`/`removed_dir_parent`,
   #318), `OpenFile` (its inode,
-  `inode()`, read from its `OpenGuard`, #264; `inc_fd_ref`/`dec_fd_ref`,
-  #379) and the `FdTable` (`MAX_FDS` fds; `reserve`/`install`/`cancel`,
-  `FdReservation`, `try_preallocated`, `tests/hazards.rs`, #379, #381),
+  `inode()`, read from its `OpenGuard`, #264; M7's `inc_fd_ref`/`dec_fd_ref`)
+  and the `FdTable` (`MAX_FDS` fds; `reserve`/`install`/`cancel`,
+  `FdReservation`, `try_preallocated`, `src/tests/hazards.rs`, #379, #381),
   `poll` (`PollMask`, `PollWaker`, `Pollable`, `PollGuard`, `PollHead`,
   #374), the namespace operations (`open_inode`, `mkdir_at`, `mknod_at` (#386),
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
@@ -834,8 +839,8 @@ one is its own PR that updates that doc first.
   `add_thread`/`remove_thread`/`threads`, their tids busy, #372;
   `check_invariants` behind `test-util`), `WaitStatus` (`word`,
   `siginfo`), `ExitStatus`, `RusageSlot`/`SlotRef`, `Errno`/`Bug`/`Error`
-  (host-tested, incl. a model, `tests/alloc.rs`, `tests/threads.rs` (#382),
-  and `tests/pid.rs` (#388)).
+  (host-tested, incl. a model, `tests/alloc.rs`: what each operation
+  allocates, `tests/threads.rs` (#382), and `src/tests/pid.rs` (#341, #388)).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
@@ -1067,8 +1072,8 @@ one is its own PR that updates that doc first.
   `strace -f -X raw` traces into `tests/linux/m8-census.toml`, and `report`
   comparing it against the kernel's dispatch table and planned milestones),
   `libctest.py` (#345, #396: musl libc-test transcripts, one
-  `EXIT <path> <code>` line per test, read as `Outcome::{PASS, FAIL,
-  TIMEOUT, ERROR}`, a runner error never a verdict;
+  `EXIT <path> <code>` line per test, read as `Outcome` (`PASS`, `FAIL`,
+  `TIMEOUT`, `ERROR`), a runner error never a verdict;
   `tests/conformance/libc-test-xfail.txt`, each entry a reason and an issue
   with optional `flaky` kind, a listed pass failing the run; single retry on
   timeouts and flaky failures with `RETRY ` prefix; `NATIVE_RETRY_FAILURES`,
