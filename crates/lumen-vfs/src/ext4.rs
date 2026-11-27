@@ -4,6 +4,8 @@
 //! of a time as unsigned), and the first block `ext4plus`'s `delete_file`
 //! frees of an inode, with where that block's bit is in the block bitmap
 //! (`ext4plus` keeps its block maps and bitmaps to itself; #330).
+//! Writable mounts also check allocation counts and ownership through
+//! [`check_allocation`] before enabling writes (#355).
 //!
 //! The first two follow Linux (`fs/ext4/inode.c`'s `ext4_iget`,
 //! `fs/ext4/ext4.h`'s `ext4_encode_extra_time`/`ext4_decode_extra_time`,
@@ -11,6 +13,7 @@
 //! (`fs/ext4/ext4_extents.h`, `fs/ext4/indirect.c`).
 
 use alloc::vec;
+use alloc::vec::Vec;
 use core::time::Duration;
 
 use crate::types::{DevId, Timespec};
@@ -375,11 +378,653 @@ impl Geometry {
     }
 }
 
+/// Count clear bits only within `bits`, excluding bitmap padding.
+pub fn bitmap_free_count(bitmap: &[u8], bits: usize) -> Option<u64> {
+    if bits > bitmap.len().checked_mul(8)? {
+        return None;
+    }
+    let whole = bits / 8;
+    let used: u64 = bitmap[..whole].iter().map(|b| u64::from(b.count_ones())).sum();
+    let tail = if bits.is_multiple_of(8) { 0 } else { (bitmap[whole] & ((1 << (bits % 8)) - 1)).count_ones() };
+    Some(bits as u64 - used - u64::from(tail))
+}
+
+/// Visit every data and map block, including unwritten extents and mappings
+/// beyond EOF. For a map block, `visit` must fill the supplied buffer after
+/// checking ownership; rejecting a duplicate before reading bounds cyclic
+/// maps. Extent depth is at most five, indirect depth at most three.
+pub fn visit_inode_blocks<E>(
+    i_block: &[u8; 60],
+    extents: bool,
+    block_size: usize,
+    mut visit: impl FnMut(u64, Option<&mut [u8]>) -> Result<(), E>,
+) -> Result<(), BlockMapError<E>> {
+    fn extents_walk<E>(
+        node: &[u8],
+        want: Option<u16>,
+        bs: usize,
+        visit: &mut impl FnMut(u64, Option<&mut [u8]>) -> Result<(), E>,
+    ) -> Result<(), BlockMapError<E>> {
+        let depth = extent_header(node, want)?;
+        for i in 0..usize::from(le16(node, 2)) {
+            if depth == 0 {
+                let at = 12 + i * 12;
+                let encoded = le16(node, at + 4);
+                let len = if encoded > 32768 { encoded - 32768 } else { encoded };
+                let start = u64::from(le32(node, at + 8)) | (u64::from(le16(node, at + 6)) << 32);
+                if start == 0 || len == 0 {
+                    return Err(BlockMapError::Corrupt);
+                }
+                for block in start..start + u64::from(len) {
+                    visit(block, None).map_err(BlockMapError::Read)?;
+                }
+            } else {
+                let mut child = vec![0; bs];
+                visit(extent_index_child(node, i), Some(&mut child)).map_err(BlockMapError::Read)?;
+                extents_walk(&child, Some(depth - 1), bs, visit)?;
+            }
+        }
+        Ok(())
+    }
+    fn indirect_walk<E>(
+        block: u64,
+        depth: u32,
+        bs: usize,
+        visit: &mut impl FnMut(u64, Option<&mut [u8]>) -> Result<(), E>,
+    ) -> Result<(), BlockMapError<E>> {
+        if block == 0 {
+            return Ok(());
+        }
+        if depth == 0 {
+            return visit(block, None).map_err(BlockMapError::Read);
+        }
+        let mut buf = vec![0; bs];
+        visit(block, Some(&mut buf)).map_err(BlockMapError::Read)?;
+        for word in buf.as_chunks::<4>().0 {
+            indirect_walk(u64::from(u32::from_le_bytes(*word)), depth - 1, bs, visit)?;
+        }
+        Ok(())
+    }
+    if !(1024..=65536).contains(&block_size) || !block_size.is_power_of_two() {
+        return Err(BlockMapError::Corrupt);
+    }
+    if extents {
+        extents_walk(i_block, None, block_size, &mut visit)
+    } else {
+        for i in 0..15 {
+            indirect_walk(u64::from(le32(i_block, i * 4)), i.saturating_sub(11) as u32, block_size, &mut visit)?;
+        }
+        Ok(())
+    }
+}
+
+/// Why an allocation check could not establish that writing is safe.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AllocationError<E> {
+    Read(E),
+    Invalid(&'static str),
+    Count { group: Option<u32>, bitmap: &'static str, recorded: u64, actual: u64 },
+    Block { block: u64, problem: &'static str },
+}
+
+impl<E: core::fmt::Debug> core::fmt::Display for AllocationError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Read(e) => write!(f, "allocation metadata read failed: {e:?}"),
+            Self::Invalid(why) => write!(f, "invalid allocation metadata: {why}"),
+            Self::Count { group, bitmap, recorded, actual } => {
+                if let Some(group) = group {
+                    write!(f, "group {group} ")?;
+                } else {
+                    write!(f, "superblock ")?;
+                }
+                write!(f, "{bitmap} free count {recorded} != bitmap {actual}")
+            }
+            Self::Block { block, problem } => write!(f, "block {block} {problem}"),
+        }
+    }
+}
+
+/// Allocated blocks with no owner are leaks, never a reason to refuse writes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AllocationReport {
+    pub leaked_blocks: u64,
+}
+
+struct AllocationGroup {
+    block_bitmap: u64,
+    inode_bitmap_block: u64,
+    inode_table: u64,
+    inodes: Vec<u8>,
+    inode_count: usize,
+}
+
+fn bit_set(bits: &[u8], bit: usize) -> bool {
+    bits[bit / 8] & (1 << (bit % 8)) != 0
+}
+
+fn set_bit(bits: &mut [u8], bit: usize) {
+    bits[bit / 8] |= 1 << (bit % 8);
+}
+
+struct AllocationCheck<'a, R> {
+    read: &'a mut R,
+    geometry: Geometry,
+    allocated: Vec<u8>,
+    owned: Vec<u8>,
+}
+
+impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
+    fn claim(&mut self, block: u64) -> Result<(), AllocationError<E>> {
+        let problem = if block < u64::from(self.geometry.first_data_block) || block >= self.geometry.blocks_count {
+            Some("is outside the volume")
+        } else if !bit_set(&self.allocated, block as usize) {
+            Some("is mapped but free")
+        } else if bit_set(&self.owned, block as usize) {
+            Some("is mapped twice")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(AllocationError::Block { block, problem });
+        }
+        set_bit(&mut self.owned, block as usize);
+        Ok(())
+    }
+
+    fn read_block(&mut self, block: u64, buf: &mut [u8]) -> Result<(), AllocationError<E>> {
+        let off = self
+            .geometry
+            .block_byte(block)
+            .ok_or(AllocationError::Block { block, problem: "is outside the volume" })?;
+        (self.read)(off, buf).map_err(AllocationError::Read)
+    }
+
+    fn inode(&mut self, raw: &[u8]) -> Result<(), AllocationError<E>> {
+        // i_file_acl is private in ext4plus, like i_block; Linux's high
+        // half is present only for a 64-bit filesystem.
+        let acl =
+            u64::from(le32(raw, 0x68)) | if self.geometry.is_64bit { u64::from(le16(raw, 0x76)) << 32 } else { 0 };
+        if acl != 0 {
+            self.claim(acl)?;
+        }
+        let mode = le16(raw, 0) & 0xf000;
+        let flags = le32(raw, 0x20);
+        let blocks = u64::from(le32(raw, 0x1c)) | (u64::from(le16(raw, 0x74)) << 32);
+        let acl_sectors = if acl == 0 { 0 } else { self.geometry.block_size / 512 };
+        let fast_symlink = mode == 0xa000 && blocks == acl_sectors && flags & 0x80000 == 0;
+        // Zero-mode reserved inodes (notably the bad-block inode) may map
+        // blocks. Bitmap membership, not links/dtime/size, decides liveness.
+        if flags & 0x1000_0000 != 0 || fast_symlink || !matches!(mode, 0 | 0x4000 | 0x8000 | 0xa000) {
+            return Ok(());
+        }
+        let map: &[u8; 60] = raw[0x28..0x64].try_into().unwrap();
+        visit_inode_blocks(map, flags & 0x80000 != 0, self.geometry.block_size as usize, |block, buf| {
+            self.claim(block)?;
+            if let Some(buf) = buf {
+                self.read_block(block, buf)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| match e {
+            BlockMapError::Read(e) => e,
+            _ => AllocationError::Invalid("inode block map"),
+        })
+    }
+}
+
+/// Check bitmap/descriptor/superblock counts before walking every allocated
+/// inode's data and metadata. No writes occur. Fixed metadata and the resize
+/// inode's reserved GDT references are included; duplicate or free mappings
+/// fail closed. The memory bound is two bits per volume block plus the inode
+/// bitmaps, group records, two block buffers and at most five map blocks.
+///
+/// Shared external xattr blocks conservatively fail as duplicate ownership:
+/// this checker does not certify their reference counts. Read-only callers
+/// should skip this check entirely.
+pub fn check_allocation<E>(
+    sb: &[u8; 1024],
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), E>,
+) -> Result<AllocationReport, AllocationError<E>> {
+    use AllocationError::{Count, Invalid, Read};
+    let geometry = Geometry::from_superblock(sb).map_err(|_| Invalid("block geometry"))?;
+    let bs = geometry.block_size as usize;
+    let first = u64::from(geometry.first_data_block);
+    if geometry.bigalloc || first != u64::from(bs == 1024) || le32(sb, 0x60) & 0x10 != 0 {
+        return Err(Invalid("unsupported allocation geometry"));
+    }
+    let blocks = geometry.blocks_count;
+    if blocks.checked_mul(bs as u64).is_none() {
+        return Err(Invalid("volume byte size overflows"));
+    }
+    let groups = (blocks - first).div_ceil(u64::from(geometry.blocks_per_group));
+    let ipg = le32(sb, 0x28) as usize;
+    let isz = usize::from(le16(sb, 0x58));
+    let inodes = u64::from(le32(sb, 0));
+    if ipg == 0
+        || ipg > bs * 8
+        || isz < 128
+        || isz > bs
+        || !isz.is_power_of_two()
+        || inodes == 0
+        || inodes.div_ceil(ipg as u64) != groups
+    {
+        return Err(Invalid("inode geometry"));
+    }
+    let dsz = if geometry.is_64bit { usize::from(le16(sb, 0xfe)) } else { 32 };
+    if !matches!(dsz, 32 | 64) || (geometry.is_64bit && dsz != 64) {
+        return Err(Invalid("descriptor size"));
+    }
+    let bytes = usize::try_from(blocks.div_ceil(8)).map_err(|_| Invalid("volume too large"))?;
+    let mut check = AllocationCheck { read: &mut read, geometry, allocated: Vec::new(), owned: Vec::new() };
+    for bits in [&mut check.allocated, &mut check.owned] {
+        bits.try_reserve_exact(bytes).map_err(|_| Invalid("no memory for allocation bitmap"))?;
+        bits.resize(bytes, 0);
+    }
+    let mut descriptors = Vec::new();
+    let mut bitmap = vec![0; bs];
+    let mut free_blocks = 0;
+    let mut free_inodes = 0;
+    for group in 0..groups {
+        let mut desc = [0; 64];
+        (check.read)((first + 1) * bs as u64 + group * dsz as u64, &mut desc[..dsz]).map_err(Read)?;
+        let address =
+            |at| u64::from(le32(&desc, at)) | if dsz == 64 { u64::from(le32(&desc, at + 32)) << 32 } else { 0 };
+        let count = |at| u64::from(le16(&desc, at)) | if dsz == 64 { u64::from(le16(&desc, at + 32)) << 16 } else { 0 };
+        // Uninitialized bitmaps need checksum-aware synthesis, which the
+        // writable profile already excludes (GDT_CSUM/METADATA_CSUM).
+        if le16(&desc, 0x12) & 3 != 0 {
+            return Err(Invalid("uninitialized bitmap"));
+        }
+        let start = first + group * u64::from(geometry.blocks_per_group);
+        let real = (blocks - start).min(u64::from(geometry.blocks_per_group)) as usize;
+        let mut g = AllocationGroup {
+            block_bitmap: address(0),
+            inode_bitmap_block: address(4),
+            inode_table: address(8),
+            inodes: vec![0; bs],
+            inode_count: (inodes - group * ipg as u64).min(ipg as u64) as usize,
+        };
+        check.read_block(g.block_bitmap, &mut bitmap)?;
+        let actual = bitmap_free_count(&bitmap, real).unwrap();
+        if actual != count(0xc) {
+            return Err(Count { group: Some(group as u32), bitmap: "block", recorded: count(0xc), actual });
+        }
+        free_blocks += actual;
+        for bit in 0..real {
+            if bit_set(&bitmap, bit) {
+                set_bit(&mut check.allocated, start as usize + bit);
+            }
+        }
+        check.read_block(g.inode_bitmap_block, &mut g.inodes)?;
+        let actual = bitmap_free_count(&g.inodes, g.inode_count).unwrap();
+        if actual != count(0xe) {
+            return Err(Count { group: Some(group as u32), bitmap: "inode", recorded: count(0xe), actual });
+        }
+        free_inodes += actual;
+        descriptors.push(g);
+    }
+    let recorded_blocks =
+        u64::from(le32(sb, 0xc)) | if geometry.is_64bit { u64::from(le32(sb, 0x158)) << 32 } else { 0 };
+    for (bitmap, recorded, actual) in
+        [("block", recorded_blocks, free_blocks), ("inode", u64::from(le32(sb, 0x10)), free_inodes)]
+    {
+        if recorded != actual {
+            return Err(Count { group: None, bitmap, recorded, actual });
+        }
+    }
+    let gdt_blocks = (groups * dsz as u64).div_ceil(bs as u64);
+    let reserved = u64::from(le16(sb, 0xce));
+    let has_super = |g: u64| {
+        if g == 0 {
+            return true;
+        }
+        if le32(sb, 0x5c) & 0x200 != 0 {
+            // sparse_super2
+            return g == u64::from(le32(sb, 0x24c)) || g == u64::from(le32(sb, 0x250));
+        }
+        if le32(sb, 0x64) & 1 == 0 || g == 1 {
+            return true;
+        }
+        [3, 5, 7].into_iter().any(|base| {
+            let mut n = g;
+            while n > 1 && n.is_multiple_of(base) {
+                n /= base;
+            }
+            n == 1
+        })
+    };
+    for (i, g) in descriptors.iter().enumerate() {
+        if has_super(i as u64) {
+            let start = first + i as u64 * u64::from(geometry.blocks_per_group);
+            for block in start..start + 1 + gdt_blocks {
+                check.claim(block)?;
+            }
+        }
+        check.claim(g.block_bitmap)?;
+        check.claim(g.inode_bitmap_block)?;
+        for index in 0..(ipg * isz).div_ceil(bs) as u64 {
+            // Claim index zero before adding anything to an untrusted
+            // 64-bit address. A successful claim bounds it to the volume.
+            check.claim(g.inode_table + index)?;
+        }
+    }
+    if le32(sb, 0x60) & 0x100 != 0 {
+        // MMP
+        check.claim(u64::from(le32(sb, 0x168)) | (u64::from(le32(sb, 0x16c)) << 32))?;
+    }
+    // Reserved GDT space must not overlap a bitmap, table or live GDT.
+    // Clear these temporary claims so the resize inode can own them once.
+    for group in 0..groups {
+        if has_super(group) {
+            let start = first + group * u64::from(geometry.blocks_per_group) + 1 + gdt_blocks;
+            if 1 + gdt_blocks + reserved > (blocks - (start - 1 - gdt_blocks)).min(u64::from(geometry.blocks_per_group))
+            {
+                return Err(Invalid("reserved GDT past group"));
+            }
+            for block in start..start + reserved {
+                check.claim(block)?;
+            }
+        }
+    }
+    for group in 0..groups {
+        if has_super(group) {
+            let start = first + group * u64::from(geometry.blocks_per_group) + 1 + gdt_blocks;
+            for block in start..start + reserved {
+                check.owned[block as usize / 8] &= !(1 << (block % 8));
+            }
+        }
+    }
+    // The resize inode owns reserved GDT blocks legitimately. Walk it
+    // first, rejecting duplicates within it, then reserve any remaining
+    // GDT blocks before any other inode can claim them.
+    let resize = le32(sb, 0x5c) & 0x10 != 0;
+    if resize {
+        if inodes < 7 || !bit_set(&descriptors[6 / ipg].inodes, 6 % ipg) {
+            return Err(Invalid("resize inode is free"));
+        }
+        let off = descriptors[6 / ipg].inode_table * bs as u64 + (6 % ipg * isz) as u64;
+        let mut raw = [0; 128];
+        (check.read)(off, &mut raw).map_err(Read)?;
+        check.inode(&raw)?;
+    }
+    for group in 0..groups {
+        if has_super(group) {
+            let start = first + group * u64::from(geometry.blocks_per_group) + 1 + gdt_blocks;
+            for block in start..start + reserved {
+                if block >= blocks || !bit_set(&check.owned, block as usize) {
+                    check.claim(block)?;
+                }
+            }
+        }
+    }
+    // The internal journal is an ordinary allocated inode in this pass.
+    if le32(sb, 0x5c) & 4 != 0 {
+        let ino = u64::from(le32(sb, 0xe0));
+        if ino == 0 || ino > inodes || !bit_set(&descriptors[(ino as usize - 1) / ipg].inodes, (ino as usize - 1) % ipg)
+        {
+            return Err(Invalid("journal inode is free"));
+        }
+    }
+    let mut table = vec![0; bs];
+    for (group, g) in descriptors.iter().enumerate() {
+        for index in (0..g.inode_count).step_by(bs / isz) {
+            check.read_block(g.inode_table + (index * isz / bs) as u64, &mut table)?;
+            for slot in 0..(bs / isz).min(g.inode_count - index) {
+                let ino = group * ipg + index + slot + 1;
+                if bit_set(&g.inodes, index + slot) && !(resize && ino == 7) {
+                    check.inode(&table[slot * isz..slot * isz + 128])?;
+                }
+            }
+        }
+    }
+    let leaked_blocks = (first..blocks)
+        .filter(|&b| bit_set(&check.allocated, b as usize) && !bit_set(&check.owned, b as usize))
+        .count() as u64;
+    Ok(AllocationReport { leaked_blocks })
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
 
     use super::*;
+
+    #[test]
+    fn allocation_bitmap_count_matches_bit_model() {
+        for byte in 0..=255 {
+            let bitmap = [byte, !byte];
+            for bits in 0..=16 {
+                let model = (0..bits).filter(|i| bitmap[i / 8] & (1 << (i % 8)) == 0).count() as u64;
+                assert_eq!(bitmap_free_count(&bitmap, bits), Some(model));
+            }
+            assert_eq!(bitmap_free_count(&bitmap, 17), None);
+        }
+        assert_eq!(bitmap_free_count(&[], 0), Some(0));
+    }
+
+    #[test]
+    fn allocation_walk_includes_extent_nodes_and_unwritten_blocks() {
+        let tree = root(1, &[index(0, 20)]);
+        let leaf = extent_node(BS, 84, 0, &[extent(0, 2, 30), extent(7, 32770, 40)]);
+        let mut seen = Vec::new();
+        visit_inode_blocks(&tree, true, BS, |b, buf| {
+            seen.push(b);
+            if let Some(buf) = buf {
+                assert_eq!(b, 20);
+                buf.copy_from_slice(&leaf);
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(seen, [20, 30, 31, 40, 41]);
+        let mut count = 0;
+        visit_inode_blocks(&root(0, &[extent(0, 32768, 100)]), true, BS, |_, _| {
+            count += 1;
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(count, 32768);
+    }
+
+    #[test]
+    fn allocation_walk_includes_all_indirect_levels_and_rejects_cycles() {
+        let mut words = [0; 15];
+        words[11] = 10;
+        words[12] = 20;
+        words[13] = 30;
+        words[14] = 40;
+        let maps = [(20, 21), (30, 31), (31, 32), (40, 41), (41, 42), (42, 43)];
+        let mut seen = Vec::new();
+        visit_inode_blocks(&block_map(words), false, BS, |b, buf| {
+            seen.push(b);
+            if let Some(buf) = buf {
+                let next = maps.iter().find(|(at, _)| *at == b).unwrap().1;
+                buf.copy_from_slice(&indirect(&[next]));
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(seen, [10, 20, 21, 30, 31, 32, 40, 41, 42, 43]);
+        let mut reads = 0;
+        let mut seen = Vec::new();
+        let cyclic = root(1, &[index(0, 20), index(1, 20)]);
+        let err = visit_inode_blocks(&cyclic, true, BS, |b, buf| {
+            if seen.contains(&b) {
+                return Err("duplicate");
+            }
+            seen.push(b);
+            if let Some(buf) = buf {
+                reads += 1;
+                buf.copy_from_slice(&extent_node(BS, 84, 0, &[]));
+            }
+            Ok(())
+        });
+        assert_eq!(err, Err(BlockMapError::Read("duplicate")));
+        assert_eq!(reads, 1);
+        assert_eq!(
+            visit_inode_blocks(&root(1, &[index(0, 20)]), true, BS, |_, _| Err("io")),
+            Err(BlockMapError::Read("io"))
+        );
+        assert_eq!(visit_inode_blocks(&root(6, &[]), true, BS, |_, _| Ok::<_, ()>(())), Err(BlockMapError::Corrupt));
+    }
+
+    fn put16(img: &mut [u8], at: usize, value: u16) {
+        img[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put32(img: &mut [u8], at: usize, value: u32) {
+        img[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    // One partial 1 KiB group: superblock, GDT, two bitmaps, one inode
+    // table block and root data. Only inode 2 is in use.
+    fn allocation_image() -> Vec<u8> {
+        let mut img = vec![0; 32 * BS];
+        let sb = &mut img[BS..2 * BS];
+        put32(sb, 0, 8);
+        put32(sb, 4, 32);
+        put32(sb, 0xc, 25);
+        put32(sb, 0x10, 7);
+        put32(sb, 0x14, 1);
+        put32(sb, 0x20, 32);
+        put32(sb, 0x28, 8);
+        put16(sb, 0x58, 128);
+        put32(&mut img, 2 * BS, 3);
+        put32(&mut img, 2 * BS + 4, 4);
+        put32(&mut img, 2 * BS + 8, 5);
+        put16(&mut img, 2 * BS + 0xc, 25);
+        put16(&mut img, 2 * BS + 0xe, 7);
+        img[3 * BS] = 0x3f;
+        img[4 * BS] = 2;
+        put16(&mut img, 5 * BS + 128, 0x4000);
+        put32(&mut img, 5 * BS + 128 + 0x28, 6);
+        img
+    }
+
+    fn checked(img: &[u8]) -> Result<AllocationReport, AllocationError<()>> {
+        check_allocation(img[BS..2 * BS].try_into().unwrap(), |off, buf| {
+            let src = img.get(off as usize..off as usize + buf.len()).ok_or(())?;
+            buf.copy_from_slice(src);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn allocation_counts_check_both_bitmaps_and_both_superblock_totals_first() {
+        let img = allocation_image();
+        assert_eq!(checked(&img), Ok(AllocationReport { leaked_blocks: 0 }));
+        for (at, wide, bitmap, group, actual) in [
+            (2 * BS + 0xc, false, "block", Some(0), 25),
+            (2 * BS + 0xe, false, "inode", Some(0), 7),
+            (BS + 0xc, true, "block", None, 25),
+            (BS + 0x10, true, "inode", None, 7),
+        ] {
+            for delta in [-1, 1] {
+                let mut bad = img.clone();
+                let recorded = (actual as i64 + delta) as u64;
+                if wide {
+                    put32(&mut bad, at, recorded as u32);
+                } else {
+                    put16(&mut bad, at, recorded as u16);
+                }
+                let result = check_allocation(bad[BS..2 * BS].try_into().unwrap(), |off, buf| {
+                    assert!(off < (5 * BS) as u64, "count failure must precede inode table reads");
+                    buf.copy_from_slice(&bad[off as usize..off as usize + buf.len()]);
+                    Ok::<_, ()>(())
+                });
+                assert_eq!(result, Err(AllocationError::Count { group, bitmap, recorded, actual }));
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_ownership_rejects_free_duplicate_and_fixed_metadata_aliases() {
+        let img = allocation_image();
+        for (block, problem) in
+            [(7, "is mapped but free"), (6, "is mapped twice"), (3, "is mapped twice"), (32, "is outside the volume")]
+        {
+            let mut bad = img.clone();
+            // A second pointer in the same inode must count, even past EOF.
+            put32(&mut bad, 5 * BS + 128 + 0x2c, block);
+            assert_eq!(checked(&bad), Err(AllocationError::Block { block: u64::from(block), problem }));
+        }
+        let mut leaked = img.clone();
+        leaked[3 * BS] |= 0x40;
+        put16(&mut leaked, 2 * BS + 0xc, 24);
+        put32(&mut leaked, BS + 0xc, 24);
+        assert_eq!(checked(&leaked), Ok(AllocationReport { leaked_blocks: 1 }));
+        // Allocated special inodes' rdev is not a block map; external
+        // xattrs still are owned and must have an allocated bit.
+        put16(&mut leaked, 5 * BS + 128, 0x2000);
+        put32(&mut leaked, 5 * BS + 128 + 0x28, u32::MAX);
+        put32(&mut leaked, 5 * BS + 128 + 0x68, 7);
+        assert_eq!(checked(&leaked), Ok(AllocationReport { leaked_blocks: 1 }));
+        put32(&mut leaked, 5 * BS + 128 + 0x68, 8);
+        assert_eq!(checked(&leaked), Err(AllocationError::Block { block: 8, problem: "is mapped but free" }));
+    }
+
+    #[test]
+    fn allocation_reserved_gdt_belongs_only_to_resize_inode() {
+        let mut img = allocation_image();
+        // Insert one reserved GDT block before the bitmaps and table.
+        img.copy_within(3 * BS..7 * BS, 4 * BS);
+        put32(&mut img, 2 * BS, 4);
+        put32(&mut img, 2 * BS + 4, 5);
+        put32(&mut img, 2 * BS + 8, 6);
+        img[4 * BS] = 0x7f;
+        img[5 * BS] = 2 | 0x40;
+        put32(&mut img, BS + 0xc, 24);
+        put16(&mut img, 2 * BS + 0xc, 24);
+        put32(&mut img, BS + 0x10, 6);
+        put16(&mut img, 2 * BS + 0xe, 6);
+        put32(&mut img, BS + 0x5c, 0x10);
+        put16(&mut img, BS + 0xce, 1);
+        put32(&mut img, 6 * BS + 128 + 0x28, 7);
+        put16(&mut img, 6 * BS + 6 * 128, 0x8000);
+        put32(&mut img, 6 * BS + 6 * 128 + 0x28, 3);
+        assert_eq!(checked(&img), Ok(AllocationReport { leaked_blocks: 0 }));
+        let mut bad = img.clone();
+        put32(&mut bad, 6 * BS + 128 + 0x2c, 3);
+        assert_eq!(checked(&bad), Err(AllocationError::Block { block: 3, problem: "is mapped twice" }));
+        let mut bad = img.clone();
+        put32(&mut bad, 6 * BS + 6 * 128 + 0x2c, 3);
+        assert_eq!(checked(&bad), Err(AllocationError::Block { block: 3, problem: "is mapped twice" }));
+        // A bitmap placed in reserved GDT space is never a resize alias.
+        put32(&mut img, 2 * BS, 3);
+        img.copy_within(4 * BS..5 * BS, 3 * BS);
+        assert_eq!(checked(&img), Err(AllocationError::Block { block: 3, problem: "is mapped twice" }));
+    }
+
+    #[test]
+    fn allocation_metadata_read_errors_and_invalid_maps_fail_closed() {
+        let img = allocation_image();
+        for fail_at in [2 * BS, 3 * BS, 4 * BS, 5 * BS] {
+            let result = check_allocation(img[BS..2 * BS].try_into().unwrap(), |off, buf| {
+                if off == fail_at as u64 {
+                    return Err(fail_at);
+                }
+                buf.copy_from_slice(&img[off as usize..off as usize + buf.len()]);
+                Ok(())
+            });
+            assert_eq!(result, Err(AllocationError::Read(fail_at)));
+        }
+        let mut bad = img.clone();
+        put32(&mut bad, 5 * BS + 128 + 0x20, 0x80000);
+        assert_eq!(checked(&bad), Err(AllocationError::Invalid("inode block map")));
+        // An extent tree node is owned even when its leaf has no data.
+        let tree = root(1, &[index(0, 7)]);
+        bad[5 * BS + 128 + 0x28..5 * BS + 128 + 0x64].copy_from_slice(&tree);
+        assert_eq!(checked(&bad), Err(AllocationError::Block { block: 7, problem: "is mapped but free" }));
+        bad[3 * BS] |= 0x40;
+        put16(&mut bad, 2 * BS + 0xc, 24);
+        put32(&mut bad, BS + 0xc, 24);
+        bad[7 * BS..8 * BS].copy_from_slice(&extent_node(BS, 84, 0, &[]));
+        assert_eq!(checked(&bad), Ok(AllocationReport { leaked_blocks: 1 }));
+        // Two leaf entries sharing a map node fail before rereading it.
+        let tree = root(1, &[index(0, 7), index(1, 7)]);
+        bad[5 * BS + 128 + 0x28..5 * BS + 128 + 0x64].copy_from_slice(&tree);
+        assert_eq!(checked(&bad), Err(AllocationError::Block { block: 7, problem: "is mapped twice" }));
+    }
 
     /// What `ext4plus`'s setters write for a `Duration` (its
     /// `duration_to_timestamp`), base word and extra word.

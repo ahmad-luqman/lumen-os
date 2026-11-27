@@ -7939,6 +7939,24 @@ call order (#355's comments).
       cleanly, so a mount that refused a volume without the bit would mount
       every boot read-only. `e2fsck -p` therefore skips the volume: run
       `e2fsck -f`.
+    - *Checked at mount instead (#355):* since nothing on disk marks an
+      errored volume, every writable mount checks the allocation state
+      before allowing writes (`lumen_vfs::ext4`'s checker over the
+      adapter's raw readers): each group's bitmap free counts against its
+      descriptor's, their sums against the superblock's, then every block
+      the in-use inodes map (extent nodes, indirect blocks at every level,
+      xattr blocks) and the fixed metadata (superblock and backups, group
+      descriptors, the resize inode's reserved descriptors, bitmaps, inode
+      tables) against the block bitmap. A count above its bitmap (#350's
+      crash case), a mapped block that's free (#355's failed truncate after
+      a reboot), a block mapped twice, or allocation metadata that can't be
+      read mounts the volume read-only with one warning (`run e2fsck -f`);
+      a shared external xattr block is treated the same, conservatively
+      (its reference count isn't checked). Allocated blocks no inode maps
+      (leaks) are harmless and counted at `debug`. Read-only mounts skip the
+      check. It reads every bitmap and inode table and walks each in-use
+      inode's map: about 40 to 60 ms per mount on the Alpine images under
+      TCG.
     - Tested by `ktest:lumen_kernel::vfs::ext4::ext4_a_write_error_makes_the_volume_read_only`
       (a fault in `unlink`, `rename` and `rmdir`, then every write-type
       operation `EROFS`, reads working, the device's bytes unchanged

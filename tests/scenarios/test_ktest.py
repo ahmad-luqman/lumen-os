@@ -315,6 +315,13 @@ VFS_HOLDABLE_LINES = (*VFS_SWEEP_LINES, *VFS_ERRORED_LINES)
 # ext4_allocation_corruption_keeps_the_first_failure_cause's device-first leg.
 VFS_ERRORED_UNGUARDED = 13
 VFS_EXACT_LINES = {
+    # #355: one count mismatch, and both extent/block-map crash states.
+    (
+        rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: group 0 block free count 250 != bitmap 249; "
+        r"run e2fsck -f"
+    ): 1,
+    rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: block \d+ is mapped but free; run e2fsck -f": 2,
+    rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: block \d+ is mapped twice; run e2fsck -f": 2,
     # page_quota_release_saturates_and_detached_quota_reports_nospc
     r"ERROR vfs: quota ktest \(16384 bytes\): released 20480 bytes with only 8192 reserved": 1,
     r"ERROR vfs: quota ktest \(16384 bytes\): dropped with 12289 bytes still reserved": 1,

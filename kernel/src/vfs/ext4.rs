@@ -1573,7 +1573,23 @@ impl Ext4FileSystem {
                 warn!(target: "vfs", "ext4 on {dev:?}: mounting read-only: {why} (ro_compat {ro_compat_bits:#x})");
             }
         }
-        let read_only = hw_read_only || forced.is_some();
+        // Check the device's allocation state before constructing any writer.
+        // This also catches a previous boot's failed truncate/count write,
+        // which errors=remount-ro could not mark durably (#355, #350).
+        let mut read_only = hw_read_only || forced.is_some();
+        if !read_only {
+            let started = time::now_ns();
+            match lumen_vfs::ext4::check_allocation(&raw_sb, |off, buf| bcache.read_at(off, buf)) {
+                Ok(report) => {
+                    debug!(target: "vfs", "ext4 on {dev:?}: allocation check: {} us, {} leaked blocks",
+                        time::now_ns().saturating_sub(started) / 1000, report.leaked_blocks);
+                }
+                Err(why) => {
+                    warn!(target: "vfs", "ext4 on {dev:?}: mounting read-only: {why}; run e2fsck -f");
+                    read_only = true;
+                }
+            }
+        }
         // Read-only: `ext4plus` would file a new or renamed entry by the
         // signed hash, and every by-hash read but `lookup`'s (which walks
         // after a miss) sits behind a read-only check.
@@ -10247,7 +10263,8 @@ fn check_block_bitmap_mismatch(img: Vec<u8>, padding: Option<usize>) -> Result<(
             set_block_bit(bits, bit, false);
         }
     }
-    let m = mount(img.clone(), 350)?;
+    let m = setup;
+    inject_bitmap_after_mount(&m, bitmap, &img[bitmap as usize..bitmap as usize + bs])?;
     let f = m.root.lookup(b"f").map_err(|_| "lookup")?;
     kassert!(!m.fs.read_only());
     kassert!(free_blocks(&m.fs) > 0);
@@ -10302,8 +10319,9 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         // Every valid inode is allocated, but both counts promise room (#350).
         let mut img = crate::vfs::build_minimal_ext4_image_blocks(256);
-        img[3 * 4096..4 * 4096].fill(0xff);
         let m = mount(img.clone(), 351)?;
+        img[3 * 4096..4 * 4096].fill(0xff);
+        inject_bitmap_after_mount(&m, 3 * 4096, &img[3 * 4096..4 * 4096])?;
         kassert!(!m.fs.read_only());
         kassert!(free_inodes(&m.fs) > 0);
         guard_bitmap_scans(&m, 3 * 4096, 4096, 4096);
@@ -10436,7 +10454,8 @@ crate::ktest!(
         let bitmap = block_bitmap_offset(&setup.fs)?;
         let mut img = image(&setup)?;
         img[bitmap as usize..bitmap as usize + 4096].fill(0xff);
-        let m = mount(img.clone(), 358)?;
+        let m = setup;
+        inject_bitmap_after_mount(&m, bitmap, &img[bitmap as usize..bitmap as usize + 4096])?;
         let before = free_inodes(&m.fs);
         let nlink = m.root.stat().map_err(|_| "stat before")?.nlink;
         // Inode allocation writes first. Dir::init then finds the lying
@@ -10472,7 +10491,8 @@ crate::ktest!(
             let bitmap = block_bitmap_offset(&setup.fs)?;
             let mut img = image(&setup)?;
             img[bitmap as usize..bitmap as usize + 4096].fill(0xff);
-            let m = mount(img, 359)?;
+            let m = setup;
+            inject_bitmap_after_mount(&m, bitmap, &img[bitmap as usize..bitmap as usize + 4096])?;
             let op = m.fs.shared.op("writeback");
             let dev_before = m.dev_bytes();
             if device_first {
@@ -10580,6 +10600,166 @@ crate::ktest!(
         kassert!(!m.fs.errored());
         kassert_eq!(m.dev_bytes(), dev_before);
         // The scenario's exact counts also reject a stray sync/fsync WARN.
+        Ok(())
+    }
+);
+
+/// Runtime allocator regressions inject corruption after a healthy mount,
+/// so mount-time validation cannot mask the allocator's own defenses.
+#[cfg(feature = "ktest")]
+fn inject_bitmap_after_mount(m: &ktest_util::Mnt, offset: u64, bytes: &[u8]) -> Result<(), &'static str> {
+    m.cache.write_at(offset, bytes).map_err(|_| "inject bitmap")?;
+    m.cache.sync().map_err(|_| "persist injected bitmap")?;
+    m.cache.writes.store(0, Ordering::Release);
+    Ok(())
+}
+
+#[cfg(feature = "ktest")]
+fn mount_check_report(img: &[u8]) -> Result<lumen_vfs::ext4::AllocationReport, lumen_vfs::ext4::AllocationError<()>> {
+    lumen_vfs::ext4::check_allocation(img[1024..2048].try_into().unwrap(), |off, dst| {
+        let bytes = img.get(off as usize..off as usize + dst.len()).ok_or(())?;
+        dst.copy_from_slice(bytes);
+        Ok(())
+    })
+}
+
+#[cfg(feature = "ktest")]
+fn assert_mount_forced_ro(img: Vec<u8>, minor: u32, why: &str) -> Result<(), &'static str> {
+    use crate::{kassert, kassert_eq};
+    let m = ktest_util::mount(img.clone(), minor)?;
+    kassert!(m.fs.read_only());
+    kassert!(!m.fs.errored()); // a forced mount, not a runtime write failure
+    kassert_eq!(m.root.create(b"refused", 0o644).err(), Some(VfsError::RoFs));
+    kassert_eq!(m.fs.sync(), Ok(()));
+    kassert_eq!(m.cache.writes.load(Ordering::Acquire), 0);
+    kassert_eq!(m.dev_bytes(), img);
+    let mut log = vec![0; crate::klog::RING_BYTES];
+    let (n, _) = crate::klog::copy_recent(&mut log);
+    let log = core::str::from_utf8(&log[..n]).map_err(|_| "log utf8")?;
+    let prefix = alloc::format!("WARN  vfs: ext4 on {:?}: mounting read-only:", DevId::makedev(0, minor));
+    let lines: Vec<_> = log.lines().filter(|line| line.contains(&prefix)).collect();
+    kassert_eq!(lines.len(), 1);
+    kassert!(lines[0].contains(why));
+    kassert!(lines[0].ends_with("; run e2fsck -f"));
+    Ok(())
+}
+
+crate::ktest!(
+    fn ext4_mount_consistent_image_is_writable() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        for (img, minor) in [
+            (crate::vfs::build_minimal_ext4_image_blocks(256), 400),
+            (build_1k_blockmap_image(128), 401),
+            (UNSIGNED_HASH_IMAGE.to_vec(), 402),
+        ] {
+            let m = mount(img, minor)?;
+            kassert!(!m.fs.read_only());
+            let f = m.root.create(b"mount-check", 0o644).map_err(|_| "create")?;
+            kassert_eq!(f.write_at(0, b"persist"), Ok(7));
+            m.fs.sync().map_err(|_| "sync")?;
+            let again = mount(image(&m)?, minor)?;
+            kassert!(!again.fs.read_only());
+            kassert_eq!(read_all(&again.root.lookup(b"mount-check").map_err(|_| "lookup")?)?, b"persist");
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_group_count_above_bitmap_is_read_only() {
+        use crate::vfs::write_u16le as w16;
+        let mut img = crate::vfs::build_minimal_ext4_image_blocks(256);
+        w16(&mut img, 4096 + 0x0c, 250); // bitmap has only 249 free
+        assert_mount_forced_ro(img, 403, "group 0 block free count 250 != bitmap 249")?;
+        Ok(())
+    }
+);
+
+/// Two persisted files and their inode offsets, for raw crash-state edits.
+#[cfg(feature = "ktest")]
+fn mount_check_files(extents: bool) -> Result<(Vec<u8>, usize, usize), &'static str> {
+    use self::ktest_util::*;
+    let img = if extents { crate::vfs::build_minimal_ext4_image_blocks(256) } else { build_1k_blockmap_image(128) };
+    let m = mount(img, 404)?;
+    let a = m.root.create(b"a", 0o644).map_err(|_| "create a")?;
+    let b = m.root.create(b"b", 0o644).map_err(|_| "create b")?;
+    a.write_at(0, b"a").map_err(|_| "write a")?;
+    b.write_at(0, b"b").map_err(|_| "write b")?;
+    m.fs.sync().map_err(|_| "sync files")?;
+    Ok((image(&m)?, inode_offset(&m.fs, a.ino() as u32)? as usize, inode_offset(&m.fs, b.ino() as u32)? as usize))
+}
+
+crate::ktest!(
+    fn ext4_mount_mapped_free_block_is_read_only() {
+        use crate::kassert;
+        use crate::vfs::{write_u16le as w16, write_u32le as w32};
+        for extents in [false, true] {
+            let (mut img, a, _) = mount_check_files(extents)?;
+            let bs = if extents { 4096 } else { 1024 };
+            let at = a + if extents { 0x3c } else { 0x28 };
+            let block = u32::from_le_bytes(img[at..at + 4].try_into().unwrap());
+            let bitmap = if extents { 2 * bs } else { 3 * bs };
+            let bit = block as usize - usize::from(!extents);
+            set_block_bit(&mut img[bitmap..bitmap + bs], bit, false);
+            let gd = if extents { bs } else { 2 * bs };
+            let free = u16::from_le_bytes(img[gd + 0xc..gd + 0xe].try_into().unwrap()) + 1;
+            w16(&mut img, gd + 0xc, free);
+            w32(&mut img, 1024 + 0xc, u32::from(free));
+            // Counts agree: it must be the stale mapping that refuses writes.
+            kassert!(
+                matches!(mount_check_report(&img), Err(lumen_vfs::ext4::AllocationError::Block { block: b, problem: "is mapped but free" }) if b == u64::from(block))
+            );
+            assert_mount_forced_ro(
+                img,
+                if extents { 406 } else { 405 },
+                &alloc::format!("block {block} is mapped but free"),
+            )?;
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_two_inodes_mapping_one_block_is_read_only() {
+        for extents in [false, true] {
+            let (mut img, a, b) = mount_check_files(extents)?;
+            let map = img[a + 0x28..a + 0x64].to_vec();
+            img[b + 0x28..b + 0x64].copy_from_slice(&map);
+            assert_mount_forced_ro(img, if extents { 408 } else { 407 }, "is mapped twice")?;
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_leaked_blocks_remains_writable() {
+        use crate::vfs::{write_u16le as w16, write_u32le as w32};
+        use crate::{kassert, kassert_eq};
+        let mut img = crate::vfs::build_minimal_ext4_image_blocks(256);
+        set_block_bit(&mut img[2 * 4096..3 * 4096], 255, true);
+        w16(&mut img, 4096 + 0xc, 248);
+        w32(&mut img, 1024 + 0xc, 248);
+        kassert_eq!(mount_check_report(&img).map_err(|_| "check leak")?.leaked_blocks, 1);
+        let m = ktest_util::mount(img, 409)?;
+        kassert!(!m.fs.read_only());
+        kassert!(m.root.create(b"allowed", 0o644).is_ok());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_read_only_skips_allocation_check() {
+        use crate::{kassert, kassert_eq};
+        let m = ktest_util::mount(crate::vfs::build_minimal_ext4_image_blocks(256), 410)?;
+        // A read of either bitmap would fail. A forced hardware-RO mount
+        // must never attempt either read, even if it would ignore the error.
+        m.cache.fail_reads_in(2 * 4096, 4 * 4096, 1);
+        let backend: Arc<dyn LatchableCache> = m.cache.clone();
+        let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, 411), true).map_err(|_| "ro mount")?;
+        kassert!(fs.read_only());
+        kassert_eq!(m.cache.range_reads_left(), 1);
+        kassert_eq!(m.cache.writes.load(Ordering::Acquire), 0);
         Ok(())
     }
 );

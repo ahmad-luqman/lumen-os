@@ -488,3 +488,16 @@ tests = [
 name = "Named filesystem device IDs are pairwise distinct (#433)"
 milestone = "M8"
 tests = ["cargo:lumen-vfs"]
+
+[[feature]]
+name = "Writable ext4 mounts check allocation counts and every inode's block ownership; inconsistent volumes mount read-only with one e2fsck warning, leaks remain writable, and read-only mounts skip the check (#355)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_consistent_image_is_writable",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_group_count_above_bitmap_is_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_mapped_free_block_is_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_two_inodes_mapping_one_block_is_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_leaked_blocks_remains_writable",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_read_only_skips_allocation_check",
+]
