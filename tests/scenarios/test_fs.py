@@ -729,9 +729,9 @@ def test_flock_and_atomic_rename(boot, tmp_path):
     pid = int(expect_screen(m, r"^hold: pid=(\d+) ready$", 30)[1])
 
     def step(name, *probes):
-        # A key (confirmed reaching the keyboard's queue), then the holder's
+        # A canonical newline (confirmed at the keyboard), then the holder's
         # line for the step it took, then the probes.
-        confirmed_keys(m, "n")
+        confirmed_keys(m, "\n")
         expect_screen(m, rf"^hold: {name}$", 20)
         run_m7_vfs(
             m, f"lock-probe /m7.lock {pid} {' '.join(probes)}", [f"probe {p}" for p in probes]
@@ -752,7 +752,7 @@ def test_flock_and_atomic_rename(boot, tmp_path):
     step("released", "w0+0=unlck", "w0+300=unlck")
     step("relocked", "w0+0=w0+100")
     # It exits holding [0,100), which its exit gives up.
-    confirmed_keys(m, "n")
+    confirmed_keys(m, "\n")
     expect_screen(m, rf"^hold: done\nlinux: {M7_VFS} exit=0 leaked_frames=-?\d+$", 20)
     run_m7_vfs(m, f"lock-probe /m7.lock {pid} w0+0=unlck", ["probe w0+0=unlck"])
     # No warning or error while the holder ran: the steps that matched on

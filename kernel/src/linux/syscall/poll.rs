@@ -240,6 +240,13 @@ fn poll_file(file: &KernelFile, waker: Option<&Arc<dyn PollWaker>>, guards: &mut
         }
         return mask;
     }
+    if let Some(end) = file.tty() {
+        let (mask, guard) = end.tty.poll(end.master, file.access_mode(), waker);
+        if let Some(guard) = guard {
+            guards.push(guard);
+        }
+        return mask;
+    }
     match file.inode().pollable() {
         Some(pollable) => {
             let (mask, guard) = pollable.poll(file.access_mode(), waker);
@@ -1073,6 +1080,12 @@ crate::ktest!(
             let urandom_fd = ktest_open(0, b"/dev/urandom", OpenFlags::O_RDONLY)?;
             let console_rw_fd = ktest_open(0, b"/dev/console", OpenFlags::O_RDWR)?;
             let tty_rw_fd = ktest_open(0, b"/dev/console", OpenFlags::O_RDWR)?;
+            // C10: bind a physical console descriptor, then restore Capture.
+            // Readiness belongs to the description, not the polling process's bridge.
+            process::with_current_console(|c| c.io = ConsoleIo::Serial);
+            let physical_console = ktest_open(0, b"/dev/console", OpenFlags::O_RDWR);
+            process::with_current_console(|c| c.io = ConsoleIo::Capture);
+            let physical_console = physical_console?;
             let path_fd = ktest_open(0, b"/tmp", OpenFlags::O_PATH)?;
 
             // Every M7 always-ready kind reports `POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM`
@@ -1094,6 +1107,7 @@ crate::ktest!(
                 (1, all_ev, out_only),
                 (console_rw_fd.raw(), all_ev, always),
                 (tty_rw_fd.raw(), all_ev, always),
+                (physical_console.raw(), all_ev, out_only),
                 // O_PATH and closed fds -> POLLNVAL; negative fd -> 0.
                 (path_fd.raw(), all_ev, PollMask::NVAL.bits()),
                 (99, all_ev, PollMask::NVAL.bits()),

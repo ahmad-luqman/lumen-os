@@ -12,3 +12,23 @@ tests = ["cargo:lumen-tty", "scenario:test_linux_io::test_pty_termios_and_job_co
 name = "Controlling-terminal detach preserves a concurrent acquisition; expired PID reservations are reclaimed"
 milestone = "M8"
 tests = ["cargo:lumen-proc", "ktest:lumen_kernel::tty::pty_detach_preserves_a_new_controlling_terminal"]
+
+[[feature]]
+name = "Serial and VT consoles as terminals; interactive ash job control"
+milestone = "M8"
+tests = ["scenario:test_linux_io::test_console_ash_job_control", "ktest:lumen_kernel::tty::console_input_backpressure_flush_and_stop", "ktest:lumen_kernel::tty::console_descriptors_poll_and_interruptible_read"]
+
+[[feature]]
+name = "Console serial output preserves the line discipline's processed bytes"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::arch::x86_64::serial::tty_output_preserves_processed_bytes"]
+
+[[feature]]
+name = "VT tty key encoding and verbatim processed output, including split UTF-8"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::tty::console_vt_key_encoding_and_processed_output"]
+
+[[feature]]
+name = "Console Ctrl-C discards deterministically queued input suffixes"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::tty::console_ctrl_c_flushes_queued_suffix"]

@@ -340,7 +340,15 @@ impl Stdio {
     /// VFS mounts `/dev` at boot, so only a broken boot sees one). Opens
     /// files, so may sleep: never call it holding a spinlock.
     pub fn open() -> Result<Self, VfsError> {
-        let opened = Self::open_from(b"/dev/console");
+        Self::open_console(ConsoleIo::Capture)
+    }
+
+    /// Open each stdio description once, binding physical consoles to their tty.
+    pub(crate) fn open_console(io: ConsoleIo) -> Result<Self, VfsError> {
+        let opened = match crate::tty::console(io) {
+            Some(tty) => Self::open_bound(b"/dev/console", Some(tty)),
+            None => Self::open_from(b"/dev/console"),
+        };
         if let Err(e) = &opened {
             log::error!(target: "linux", "cannot open a process's stdio (/dev/console) and working directory (/): {e:?}");
         }
@@ -350,9 +358,18 @@ impl Stdio {
     /// [`Stdio::open`] with `console` for the console's path, not logged:
     /// the seam the refusal's ktest opens a missing path through.
     fn open_from(console: &[u8]) -> Result<Self, VfsError> {
+        Self::open_bound(console, None)
+    }
+
+    fn open_bound(console: &[u8], tty: Option<Arc<crate::tty::Tty>>) -> Result<Self, VfsError> {
         let mut fds = FdTable::new();
         for (fd, flags) in [(0, OpenFlags::O_RDONLY), (1, OpenFlags::O_WRONLY), (2, OpenFlags::O_WRONLY)] {
-            let file = Arc::new(open_kernel_file(console, flags, 0)?);
+            let file = open_kernel_file(console, flags, 0)?;
+            let file = match &tty {
+                Some(tty) => crate::vfs::devpts::console_file(file, Arc::clone(tty)).map_err(|_| VfsError::Io)?,
+                None => file,
+            };
+            let file = Arc::new(file);
             // A fresh table: nothing is displaced.
             drop(fds.insert_at(fd, file, false)?);
         }
@@ -369,8 +386,22 @@ pub enum ConsoleIo {
     Capture,
     /// Interactive serial console (`serial_in` + `klog::LockedSerial`).
     Serial,
-    /// Interactive virtual terminal (`vt::wait_key` + `term::write_str_to`).
-    Vt(usize),
+    /// Interactive virtual terminal, validated before console ownership starts.
+    Vt(VtId),
+}
+
+/// A console VT index checked before constructing a physical console route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VtId(usize);
+
+impl VtId {
+    pub fn new(index: usize) -> Option<Self> {
+        (index < crate::term::VTS).then_some(Self(index))
+    }
+
+    pub fn index(self) -> usize {
+        self.0
+    }
 }
 
 /// POD representation of Linux x86-64 `struct kernel_sigaction` (32 bytes,
@@ -2125,7 +2156,7 @@ pub fn write_console(io: ConsoleIo, bytes: &[u8]) {
                 let _ = klog::burst_held(bytes);
             });
         }
-        ConsoleIo::Vt(vt) => write_vt_utf8(vt, bytes),
+        ConsoleIo::Vt(vt) => write_vt_utf8(vt.index(), bytes),
     }
 }
 
@@ -2133,13 +2164,23 @@ pub fn write_console(io: ConsoleIo, bytes: &[u8]) {
 /// multi-byte UTF-8 sequences across chunk/write boundaries and replacing only
 /// genuinely invalid byte sequences with U+FFFD.
 fn write_vt_utf8(vt: usize, bytes: &[u8]) {
-    let (mut tail, mut tail_len) = with_current_console(|proc| {
+    let (tail, tail_len) = with_current_console(|proc| {
         let t = proc.vt_utf8;
         let l = proc.vt_utf8_len as usize;
         proc.vt_utf8_len = 0;
         (t, l)
     });
 
+    let (tail, tail_len) = write_vt_utf8_stream(vt, bytes, tail, tail_len);
+    with_current_console(|proc| {
+        proc.vt_utf8 = tail;
+        proc.vt_utf8_len = tail_len as u8;
+    });
+}
+
+/// Stream console output with caller-owned UTF-8 state, preserving split codepoints.
+/// Invalid input produces replacement characters; incomplete tails are returned.
+fn write_vt_utf8_stream(vt: usize, bytes: &[u8], mut tail: [u8; 4], mut tail_len: usize) -> ([u8; 4], usize) {
     let mut scratch = [0u8; 516];
     for chunk in bytes.chunks(512) {
         scratch[..tail_len].copy_from_slice(&tail[..tail_len]);
@@ -2180,17 +2221,22 @@ fn write_vt_utf8(vt: usize, bytes: &[u8]) {
         }
     }
 
-    with_current_console(|proc| {
-        proc.vt_utf8 = tail;
-        proc.vt_utf8_len = tail_len as u8;
-    });
+    (tail, tail_len)
 }
 
 /// Translate a framebuffer VT keyboard event into VT100/UTF-8 input bytes
 /// (up to 4 bytes). Returns `0` for keys that emit no terminal bytes (such as
 /// bare modifiers or unhandled function keys).
-fn vt_key_to_bytes(key: KbdKey, out: &mut [u8; 4]) -> usize {
+pub(crate) fn vt_key_to_bytes(key: KbdKey, out: &mut [u8; 4]) -> usize {
     match key {
+        KbdKey::Enter => {
+            out[0] = b'\n';
+            1
+        }
+        KbdKey::Backspace => {
+            out[0] = 0x08;
+            1
+        }
         KbdKey::Char(ch) => {
             let mapped = if ch == '\r' { '\n' } else { ch };
             let bytes = mapped.encode_utf8(out).as_bytes();
@@ -2226,7 +2272,7 @@ pub fn stdin_ready(io: ConsoleIo) -> bool {
             if with_current_console(|c| c.has_unread()) {
                 return true;
             }
-            while let Some(key) = crate::vt::read_key(vt) {
+            while let Some(key) = crate::vt::read_key(vt.index()) {
                 let mut enc = [0u8; 4];
                 let n = vt_key_to_bytes(key, &mut enc);
                 if n > 0 {
@@ -2378,7 +2424,7 @@ fn serial_read_window() {
     }
 }
 
-fn read_vt(vt: usize, dst: &mut [u8], interruptible: bool) -> Result<usize, u32> {
+fn read_vt(vt: VtId, dst: &mut [u8], interruptible: bool) -> Result<usize, u32> {
     loop {
         if let Some(first) = with_current_console(ConsoleState::pop_unread) {
             if first == 0x04 {
@@ -2402,7 +2448,7 @@ fn read_vt(vt: usize, dst: &mut [u8], interruptible: bool) -> Result<usize, u32>
             return Ok(n);
         }
         let key = if interruptible {
-            match crate::vt::read_key(vt) {
+            match crate::vt::read_key(vt.index()) {
                 Some(key) => key,
                 None => {
                     wait_console(ConsoleIo::Vt(vt))?;
@@ -2410,7 +2456,7 @@ fn read_vt(vt: usize, dst: &mut [u8], interruptible: bool) -> Result<usize, u32>
                 }
             }
         } else {
-            crate::vt::wait_key(vt)
+            crate::vt::wait_key(vt.index())
         };
         let mut enc = [0u8; 4];
         let len = vt_key_to_bytes(key, &mut enc);

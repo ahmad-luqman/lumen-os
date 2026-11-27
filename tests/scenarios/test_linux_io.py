@@ -61,9 +61,9 @@ def _console_poll_run(m) -> tuple[int, int, int]:
     m.expect(r"lumen> ", 10)
     assert CRASH_BEGIN not in m.output[start:]
 
-    # A safety-step hit means the wait found IRQ-queued input at the 100 ms
-    # step without a notify setting `fired` (a dropped notify). It does not
-    # detect an IRQ that never queued input. Check cleanup on every exit too.
+    # C10's terminal pollers subscribe to the discipline, with no timed
+    # console recheck. The legacy safety counter stays zero; the subscriber
+    # count includes the terminal and must return to zero on every exit.
     hits, woken, subs = _serial_poll(m)
     assert hits == 0, (hits, woken, subs)
     assert subs == 0, (hits, woken, subs)
@@ -77,13 +77,12 @@ def test_poll_and_select_on_console(boot, tmp_path):
     time is written back (0 on timeout; `rem < asked` and `rem + elapsed >= asked`
     when woken); invalid/O_PATH descriptors report POLLNVAL / ready / EBADF.
 
-    COM1 must report input by interrupt. `serial poll` requires no wait to find
-    IRQ-queued input at the 100 ms safety step without a notify (`hits == 0`),
-    and all subscribers to unsubscribe on every exit. Repeat up to `ATTEMPTS` runs:
-    a run with no wake is legitimate (input can arrive before syscall entry),
-    but `ATTEMPTS` without one fails. `woken >= 1` proves notify reached a subscriber
-    and set `fired`, not that IRQ 4 readied the thread promptly: a dropped
-    `wake_one()` with `fired` kept is still counted as woken at the safety step.
+    COM1 must report input by interrupt. C10's input thread feeds the tty,
+    whose notifications wake pollers. `serial poll` counts those notifications
+    and checks that all subscriptions are removed. Repeat up to `ATTEMPTS`:
+    input can legitimately arrive before a poll subscribes, but twenty runs
+    without a notification fail. The kernel test separately confirms a blocked
+    poller wakes, so this counter is not a wall-clock latency assertion.
     """
     disk = copy_rootfs(tmp_path)
     m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
@@ -101,7 +100,7 @@ def test_poll_and_select_on_console(boot, tmp_path):
             break
     else:
         raise AssertionError(
-            f"no console wait was woken by IRQ 4's notify in {ATTEMPTS} runs: {(hits, woken, subs)}"
+            f"no console poll subscription was notified in {ATTEMPTS} runs: {(hits, woken, subs)}"
         )
 
     m.send_line("exit")
@@ -184,5 +183,85 @@ def test_pty_termios_and_job_control(boot, tmp_path):
     m.expect(rf"linux: {re.escape(program)} exit=0 leaked_frames=-?\d+\n", 30)
     m.expect(r"lumen> ", 10)
     assert CRASH_BEGIN not in m.output[start:]
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_console_ash_job_control(boot, tmp_path):
+    """C10: ash owns the console, controls real jobs, and returns it to Lumen."""
+    from lumen_harness.gui import type_confirmed
+    from lumen_harness.screen import expect_screen
+
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+    start = len(m.output)
+    prompt = r"[~/][^\n]* # "
+    m.send_line("linux /bin/busybox ash -i")
+    m.expect(prompt, 30)
+
+    def command(text, result):
+        m.send_line(text)
+        m.expect(re.compile(result, re.MULTILINE), 30)
+        m.expect(prompt, 30)
+
+    command("printf 'console-pipe\\n' | /bin/busybox tr a-z A-Z", r"^CONSOLE-PIPE\r?$")
+    m.send_line("/bin/busybox ash -c 'printf \"BG_%s\\n\" READY; while :; do sleep 1; done' &")
+    # The child can print after the prompt. Require its completed output line;
+    # the split format keeps a partially echoed command from matching readiness.
+    m.expect(re.compile(r"BG_READY\r?\n"), 30)
+    command("jobs", r"Running.*ash -c")
+    command("kill $!; wait $!; printf 'BG_DONE\\n'", r"^BG_DONE\r?$")
+
+    m.send_line(
+        "/bin/busybox ash -c 'trap \"echo FG_CONTINUED\" CONT; echo FG_READY; while :; do sleep 1; done'"
+    )
+    m.expect(re.compile(r"^FG_READY\r?$", re.MULTILINE), 30)
+    m.send("\x1a")
+    m.expect(r"Stopped", 30)
+    m.expect(prompt, 30)
+    command("jobs", r"Stopped.*ash -c")
+    m.send_line("fg")
+    m.expect(re.compile(r"^FG_CONTINUED\r?$", re.MULTILINE), 30)
+    m.send("\x03")
+    m.expect(prompt, 30)
+    command("printf 'SHELL_ALIVE\\n'", r"^SHELL_ALIVE\r?$")
+
+    m.send_line(
+        "stty -echo; printf 'READ_READY\\n'; read -r value < /dev/tty; stty echo; printf 'TTY_READ:%s\\n' \"$value\""
+    )
+    m.expect(re.compile(r"^READ_READY\r?$", re.MULTILINE), 30)
+    noecho = len(m.output)
+    m.send("console-abx\x7fc\n")
+    m.expect(re.compile(r"^TTY_READ:console-abc\r?$", re.MULTILINE), 30)
+    m.expect(prompt, 30)
+    assert "console-abx" not in m.output[noecho:]
+
+    m.send_line(
+        "stty -icanon -echo min 1 time 0; printf 'RAW_READY\\n'; dd bs=1 count=1 2>/dev/null | od -An -tu1; stty sane; printf 'RAW_DONE\\n'"
+    )
+    m.expect(re.compile(r"^RAW_READY\r?$", re.MULTILINE), 30)
+    m.send("Q")
+    m.expect(re.compile(r"^\s*81\r?$", re.MULTILINE), 30)
+    m.expect(re.compile(r"^RAW_DONE\r?$", re.MULTILINE), 30)
+    m.expect(prompt, 30)
+    m.send_line("exit 0")
+    m.expect(r"linux: /bin/busybox exit=0 leaked_frames=-?\d+\n", 30)
+    m.expect(r"lumen> ", 10)
+    assert run(m, "echo console-returned") == "console-returned\n"
+    assert "can't access tty" not in m.output[start:]
+    assert "job control turned off" not in m.output[start:]
+    assert CRASH_BEGIN not in m.output[start:]
+
+    # Serial is back at its kernel prompt, so each PS/2 key is confirmed by kbd.
+    type_confirmed(
+        m,
+        'linux /bin/busybox ash -c \'echo VT_READY; read x < /dev/tty; printf "VT_READ:%s\\n" "$x"\'\n',
+    )
+    expect_screen(m, r"^VT_READY$")
+    type_confirmed(m, "console-vt\n")
+    expect_screen(m, r"^VT_READ:console-vt$")
+    expect_screen(m, r"linux: /bin/busybox exit=0")
+    type_confirmed(m, "echo vt-returned\n")
+    expect_screen(m, r"^vt-returned$")
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS

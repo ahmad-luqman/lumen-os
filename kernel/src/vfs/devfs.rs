@@ -188,12 +188,14 @@ impl DevfsInode {
 pub(crate) enum TerminalOpen {
     Ptmx,
     Alias,
+    Console,
 }
 
 pub(crate) fn terminal_open(inode: &dyn VfsInode) -> Option<TerminalOpen> {
     match inode.as_any()?.downcast_ref::<DevfsInode>()?.kind {
         DevKind::Ptmx => Some(TerminalOpen::Ptmx),
         DevKind::Tty => Some(TerminalOpen::Alias),
+        DevKind::Console => Some(TerminalOpen::Console),
         _ => None,
     }
 }

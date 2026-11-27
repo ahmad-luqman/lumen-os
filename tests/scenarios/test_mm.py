@@ -180,12 +180,14 @@ def test_heap_command_reports_usage(boot):
     # devfs nodes (ptmx, pts), the devpts filesystem and root inode, its
     # mount-path string, and six dentry-cache allocations from resolving
     # /dev/pts (two names, each kept in the map and eviction queue, plus
-    # those containers' initial buffers). Allow five blocks of margin
-    # above the measured 129; the rest of what the heap mapped is free.
+    # those containers' initial buffers). C10 adds 15 persistent allocations:
+    # five consoles, each with its Tty Arc, input ring and PollHead Arc.
+    # The settled count is 144. Keep the same five-block margin; the rest
+    # of what the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert 0 < heap["live"] <= 134, (
+    assert 0 < heap["live"] <= 149, (
         f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     )
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap

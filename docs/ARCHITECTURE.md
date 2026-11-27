@@ -8671,9 +8671,10 @@ holding only locks above it.
        under it in ascending index order; nothing allocates or frees
        under it: lumen-futex's rule)
     e. a PollHead's subscriber list (section 10; M9's epoll ready list
-       nests inside it); and B3's interim `serial_in::POLL_HEAD` holder
-       (cloned and released before calling `notify`, never nested with
-       another lock; gone once C10 moves the console to `Tty`)
+       nests inside it); and `serial_in::POLL_HEAD`'s holder for the legacy
+       console bridge (cloned and released before calling `notify`, never
+       nested with another lock). C10's tty subscribers are separate; IRQ 4
+       still takes the legacy holder and notifies its subscribers
     f. VirtioHal::TABLE; WaitQueue locks; the scheduler's run queues
        (two in ascending CPU order for stealing, affinity relocation from
        set_affinity/wake/kick/route_ready, or finish_switch, section 6).
@@ -8813,9 +8814,11 @@ and `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_threa
 - Never wait for a TLB shootdown's acknowledgements with interrupts off or
   any `SpinLock` held (section 5).
 - No interrupt handler sends a signal or takes a level-10 lock above `f`
-  (section 8), except B3's interim serial console wake on IRQ 4
-  (`serial_in::POLL_HEAD` and its `PollHead` subscriber list, level `e`,
-  until C10 moves the notify to the tty's input thread).
+  (section 8), except the legacy serial bridge's wake on IRQ 4
+  (`serial_in::POLL_HEAD` and its `PollHead` subscriber list, level `e`).
+  This exception remains after C10: IRQ 4 still notifies legacy subscribers
+  on received input. C10's tty input thread feeds the discipline and notifies
+  its separate subscribers outside interrupt context.
 - **Snapshot-and-release for level-9 tables:** `sync()` snapshots
   `Vec<Arc<dyn FileSystem>>` from `MountTable` and `Vec<Arc<VfsInode>>` from
   `InodeCache`, releases the table lock, and only then locks `VfsInode` →
@@ -9169,13 +9172,22 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lo
   terminal and its group in the foreground, and starts the console's input
   thread (`tty-serial`, `tty-vt1` ... `tty-vt4`), which feeds the
   console's input (`serial_in`'s queue, the VT's key ring) through
-  `LineDiscipline::receive` (leaving refused bytes in the queue until a
-  reader wakes it), echoing to the console and sending Ctrl-C's `SIGINT`,
+  `LineDiscipline::receive`, echoing to the console and sending Ctrl-C's `SIGINT`,
   Ctrl-\'s `SIGQUIT` and Ctrl-Z's `SIGTSTP` to the foreground group. The
   `linux` command, which waits for its root's `ExitAction::Released`,
   stops the thread once the root (the session's leader) has exited (a
-  stop flag and a wake of the thread's input wait), and the kernel shell
-  has the console back.
+  stop flag and wakes of its input and capacity waits), joins it, and gives
+  the console back to the kernel shell. Before checking capacity, the input
+  thread takes one serial byte or one VT key's encoded bytes into `pending`.
+  A refused byte stays in that staging buffer until a reader wakes the thread;
+  later input stays upstream. Shutdown discards both cooked input and this
+  staging buffer, including any refused byte, while input still in the UART,
+  serial queue or VT key ring stays for the kernel shell. Input-flushing
+  ioctls and signal characters without `NOFLSH` discard staging and upstream
+  input too. Physical VT Enter (main or keypad) is CR and Backspace is DEL
+  before termios processing; their key identities survive decoding and the
+  VT queue, so Ctrl-J stays LF and Ctrl-H stays BS. Serial and VT output
+  preserve the discipline's processed bytes.
 - `/dev/tty` is the caller's controlling terminal (`-ENXIO` without one,
   as Linux); `/dev/console` is the console the `linux` command ran on.
   M7's `ConsoleIo` routing (`VfsInode::is_tty`) becomes the `Tty`'s;
@@ -11429,8 +11441,12 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 - `scenario:test_linux_io::test_poll_and_select_on_console` (B3): `poll`,
   `ppoll`, `select` and `pselect6` on the console's stdin with and without
   typed input; timeouts at least their time; the time left written back;
-  `POLLNVAL`; and `serial poll` confirming blocked waits woke via IRQ 4
-  (`woken >= 1`), `safety-step hits: 0`, and `subscribers: 0` on exit.
+  `POLLNVAL`; and `serial poll` confirming a notification reached a tty
+  subscription (`woken >= 1`), `safety-step hits: 0`, and `subscribers: 0`
+  on exit. `woken` counts tty notifications (and legacy bridge wait wakes),
+  not necessarily IRQ-driven wakes: the input thread's deadline recheck can
+  find input and notify the tty too. The blocked-poller ktest checks wakeup
+  delivery separately; neither check imposes a latency ceiling.
 - `scenario:test_linux_io::test_pty_termios_and_job_control` (C9): a
   `tools/linux-m8` program opening `/dev/ptmx`, a child on the slave as a
   session leader: canonical and raw reads, echo, `VMIN`/`VTIME`, Ctrl-C as

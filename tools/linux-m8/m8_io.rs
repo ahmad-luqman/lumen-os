@@ -1084,17 +1084,40 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     // `argv`, kept for the program's life.
     let (args, n) = unsafe { common::args(argc, argv) };
     match &args[..n] {
-        [_, b"console-poll"] => run_checks(&[
-            ("poll_nval", &check_poll_nval),
-            ("poll_timeout_no_input", &check_poll_timeout_no_input),
-            ("ppoll_timeout_no_input", &check_ppoll_timeout_no_input),
-            ("select_timeout_no_input", &check_select_timeout_no_input),
-            ("pselect6_timeout_no_input", &check_pselect6_timeout_no_input),
-            ("poll_with_input", &check_poll_with_input),
-            ("ppoll_with_input", &check_ppoll_with_input),
-            ("select_with_input", &check_select_with_input),
-            ("pselect6_with_input", &check_pselect6_with_input),
-        ]),
+        [_, b"console-poll"] => {
+            // C10: byte-readiness probes explicitly select noncanonical input.
+            // Restore the terminal even when a check returns a failure.
+            let mut saved = [0u8; 36];
+            if sys(SYS_IOCTL, [0, 0x5401, saved.as_mut_ptr() as u64, 0, 0, 0]) != 0 {
+                say!("FAIL console termios: TCGETS");
+                return 1;
+            }
+            let mut raw = saved;
+            let flags = u32::from_ne_bytes(raw[12..16].try_into().unwrap()) & !(2 | 8);
+            raw[12..16].copy_from_slice(&flags.to_ne_bytes());
+            raw[17 + 5] = 0; // VTIME
+            raw[17 + 6] = 1; // VMIN
+            if sys(SYS_IOCTL, [0, 0x5402, raw.as_ptr() as u64, 0, 0, 0]) != 0 {
+                say!("FAIL console termios: TCSETS");
+                return 1;
+            }
+            let result = run_checks(&[
+                ("poll_nval", &check_poll_nval),
+                ("poll_timeout_no_input", &check_poll_timeout_no_input),
+                ("ppoll_timeout_no_input", &check_ppoll_timeout_no_input),
+                ("select_timeout_no_input", &check_select_timeout_no_input),
+                ("pselect6_timeout_no_input", &check_pselect6_timeout_no_input),
+                ("poll_with_input", &check_poll_with_input),
+                ("ppoll_with_input", &check_ppoll_with_input),
+                ("select_with_input", &check_select_with_input),
+                ("pselect6_with_input", &check_pselect6_with_input),
+            ]);
+            if sys(SYS_IOCTL, [0, 0x5402, saved.as_ptr() as u64, 0, 0, 0]) != 0 {
+                say!("FAIL console termios: restore");
+                return 1;
+            }
+            result
+        }
         [_, b"pipes"] => run_checks(&[
             ("busybox_pipeline", &check_busybox_pipeline),
             ("pipe_buf_atomicity", &check_pipe_buf_atomicity),

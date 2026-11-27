@@ -9,6 +9,7 @@ use crate::linux::process;
 /// and the ktests.
 pub fn init() {
     process::start_init();
+    crate::tty::init();
     crate::linux::timer::init();
     log::debug!(target: "linux", "pid 1 started");
 }

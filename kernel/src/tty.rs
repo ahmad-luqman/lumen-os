@@ -1,4 +1,4 @@
-//! PTY line disciplines, readiness and controlling-terminal operations.
+//! Terminal line disciplines, readiness and controlling-terminal operations.
 //!
 //! The sleep lock is Lock 9a: never held across user copies or other VFS
 //! locks. Process-tree and signal locks may nest beneath it. Sequence changes
@@ -6,7 +6,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lumen_proc::{Controlling, PidRef, Sigttou, Tcsetpgrp};
 use lumen_signal::Signal;
@@ -15,7 +15,7 @@ use lumen_tty::{
 };
 use lumen_vfs::{AccessMode, PollGuard, PollMask, PollWaker};
 
-use crate::linux::process::{self, Process};
+use crate::linux::process::{self, ConsoleIo, Process};
 use crate::linux::signal::ERESTARTSYS;
 use crate::linux::{errno, general, ioctl};
 use crate::sched::{WaitQueue, Wake};
@@ -25,10 +25,18 @@ use crate::vfs::KernelPollHead;
 
 const BUFFER: usize = 4096;
 
-struct Ring(VecDeque<u8>);
+struct Ring(VecDeque<u8>, Option<ConsoleOutput>);
 
 impl Output for Ring {
     fn push(&mut self, bytes: &[u8]) -> bool {
+        if let Some(console) = &mut self.1 {
+            if console.io == ConsoleIo::Serial {
+                crate::klog::with_line_lock(|| console.write(bytes));
+            } else {
+                console.write(bytes);
+            }
+            return true;
+        }
         if bytes.len() > BUFFER - self.0.len() {
             return false;
         }
@@ -51,6 +59,9 @@ struct TtyInner {
     slave_seen: bool,
     hung_up: bool,
     flush: u64,
+    pending: [u8; 4],
+    pending_len: usize,
+    pending_pos: usize,
 }
 
 impl TtyInner {
@@ -81,24 +92,35 @@ pub struct Tty {
     writers: WaitQueue,
     poll: KernelPollHead,
     pub(crate) number: u32,
+    console: Option<ConsoleIo>,
+    active: AtomicBool,
 }
 
 impl Tty {
     pub(crate) fn new(number: u32) -> Result<Arc<Self>, u32> {
+        Self::create(number, None)
+    }
+
+    fn create(number: u32, console: Option<ConsoleIo>) -> Result<Arc<Self>, u32> {
         let ld = LineDiscipline::try_new(Termios::console_default()).map_err(|_| errno::ENOMEM)?;
         let mut output = VecDeque::new();
-        output.try_reserve_exact(BUFFER).map_err(|_| errno::ENOMEM)?;
+        if console.is_none() {
+            output.try_reserve_exact(BUFFER).map_err(|_| errno::ENOMEM)?;
+        }
         Ok(Arc::new(Self {
             lock: SleepMutex::new(TtyInner {
                 ld,
-                to_master: Ring(output),
+                to_master: Ring(output, console.map(ConsoleOutput::new)),
                 session: None,
                 foreground: None,
-                locked: true,
+                locked: console.is_none(),
                 slave_opens: 0,
                 slave_seen: false,
                 hung_up: false,
                 flush: 0,
+                pending: [0; 4],
+                pending_len: 0,
+                pending_pos: 0,
             }),
             seq: AtomicU64::new(0),
             #[cfg(feature = "ktest")]
@@ -107,7 +129,25 @@ impl Tty {
             writers: WaitQueue::new(),
             poll: KernelPollHead::new(),
             number,
+            console,
+            active: AtomicBool::new(false),
         }))
+    }
+
+    pub(crate) fn is_console(&self) -> bool {
+        self.console.is_some()
+    }
+
+    // Lock 9a serializes the input thread's staging buffer with all flushes.
+    fn flush_driver(&self, state: &mut TtyInner) {
+        state.flush = state.flush.wrapping_add(1);
+        state.pending_len = 0;
+        state.pending_pos = 0;
+        match self.console {
+            Some(ConsoleIo::Serial) => crate::serial_in::discard_input(),
+            Some(ConsoleIo::Vt(vt)) => crate::vt::discard_input(vt.index()),
+            _ => {}
+        }
     }
 
     // Called with lock held. Over-waking is permitted by the discipline;
@@ -250,7 +290,14 @@ impl Tty {
         mode: AccessMode,
         waker: Option<&Arc<dyn PollWaker>>,
     ) -> (PollMask, Option<PollGuard>) {
-        let guard = waker.map(|waker| self.poll.subscribe(Arc::clone(waker)));
+        let guard = waker.map(|waker| {
+            let waker: Arc<dyn PollWaker> = if self.console == Some(ConsoleIo::Serial) {
+                Arc::new(ConsolePoll(Arc::clone(waker)))
+            } else {
+                Arc::clone(waker)
+            };
+            self.poll.subscribe(waker)
+        });
         let state = self.lock.lock();
         let mut mask = PollMask::EMPTY;
         let readable = if master { !state.to_master.0.is_empty() } else { state.ld.poll_readable() };
@@ -374,7 +421,7 @@ impl Tty {
                                 );
                             }
                             if signal.flush {
-                                state.flush = state.flush.wrapping_add(1);
+                                self.flush_driver(&mut state);
                                 self.changed();
                                 return Ok(limit as u64);
                             }
@@ -509,7 +556,7 @@ impl Tty {
                 let flush = if cmd == ioctl::TCSETSF { Flush::Input } else { Flush::Keep };
                 let _ = state.ld.set_termios(termios.unwrap(), flush);
                 if flush == Flush::Input {
-                    state.flush = state.flush.wrapping_add(1);
+                    self.flush_driver(&mut state);
                 }
                 self.changed();
             }
@@ -520,7 +567,7 @@ impl Tty {
                 }
                 if arg != 1 {
                     let _ = state.ld.flush_input();
-                    state.flush = state.flush.wrapping_add(1);
+                    self.flush_driver(&mut state);
                 }
                 if arg != 0 {
                     state.to_master.discard();
@@ -634,6 +681,235 @@ impl Tty {
             copy_to_user(arg, &out[..length]).map_err(|_| errno::EFAULT)?;
         }
         Ok(0)
+    }
+}
+
+/// Console output is synchronous and already processed by the line discipline.
+/// The VT parser retains split UTF-8 codepoints and escape sequences.
+struct ConsoleOutput {
+    io: ConsoleIo,
+}
+
+impl ConsoleOutput {
+    fn new(io: ConsoleIo) -> Self {
+        Self { io }
+    }
+
+    /// The serial caller holds the log line lock across this dispatch.
+    fn write(&mut self, bytes: &[u8]) {
+        match self.io {
+            ConsoleIo::Serial => crate::arch::serial::tty_bytes(bytes),
+            ConsoleIo::Vt(vt) => {
+                let _ = crate::term::write_bytes_to(vt.index(), bytes);
+            }
+            ConsoleIo::Capture => unreachable!("capture has no Tty"),
+        }
+    }
+}
+
+/// Exercise the production console writer under the loopback test's line lock.
+#[cfg(feature = "ktest")]
+pub(crate) fn serial_output_held_for_test(bytes: &[u8]) {
+    ConsoleOutput::new(ConsoleIo::Serial).write(bytes);
+}
+
+static CONSOLES: SleepMutex<[Option<Arc<Tty>>; 5]> = SleepMutex::new([const { None }; 5]);
+
+/// Create the consoles before process frame accounting and before any shell starts.
+pub(crate) fn init() {
+    let mut consoles = CONSOLES.lock();
+    for (index, slot) in consoles.iter_mut().enumerate() {
+        let io = if index == 0 {
+            ConsoleIo::Serial
+        } else {
+            ConsoleIo::Vt(process::VtId::new(index - 1).expect("console index"))
+        };
+        let tty = Tty::create(index as u32, Some(io)).expect("console tty allocation");
+        if index != 0
+            && let Some(status) = crate::term::status()
+        {
+            let _ = tty.lock.lock().ld.set_winsize(lumen_tty::Winsize {
+                ws_row: status.rows as u16,
+                ws_col: status.cols as u16,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            });
+        }
+        *slot = Some(tty);
+    }
+}
+
+/// The physical console selected by the root runner, independent of its controlling terminal.
+pub(crate) fn console(io: ConsoleIo) -> Option<Arc<Tty>> {
+    let index = match io {
+        ConsoleIo::Capture => return None,
+        ConsoleIo::Serial => 0,
+        ConsoleIo::Vt(vt) => vt.index() + 1,
+    };
+    CONSOLES.lock()[index].clone()
+}
+
+/// Serial diagnostics count notifications reaching terminal poll subscriptions.
+struct ConsolePoll(Arc<dyn PollWaker>);
+
+impl PollWaker for ConsolePoll {
+    fn wake(&self, ready: PollMask) {
+        crate::serial_in::note_poll_woken();
+        self.0.wake(ready);
+    }
+}
+
+pub(crate) fn serial_subscribers() -> usize {
+    console(ConsoleIo::Serial).map_or(0, |tty| tty.poll.subscriber_count())
+}
+
+struct InputOwner {
+    tty: Arc<Tty>,
+    ready: AtomicBool,
+    stop: AtomicBool,
+    started: WaitQueue,
+}
+
+/// Exclusive input ownership until the root runner has received its exit result.
+/// Dropping it wakes and joins the input thread before the kernel shell resumes.
+pub(crate) struct ConsoleSession {
+    owner: Arc<InputOwner>,
+    thread: Option<crate::sched::JoinHandle>,
+}
+
+impl ConsoleSession {
+    pub(crate) fn prepare(io: ConsoleIo) -> Result<Option<Self>, &'static str> {
+        let Some(tty) = console(io) else { return Ok(None) };
+        if tty.active.swap(true, Ordering::AcqRel) {
+            return Err("console already has an input owner");
+        }
+        let owner = Arc::new(InputOwner {
+            tty,
+            ready: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            started: WaitQueue::new(),
+        });
+        let input = owner.clone();
+        let name = match io {
+            ConsoleIo::Serial => "tty-serial",
+            ConsoleIo::Vt(vt) => ["tty-vt1", "tty-vt2", "tty-vt3", "tty-vt4"][vt.index()],
+            _ => unreachable!("console number"),
+        };
+        let thread = match crate::sched::spawn(name, move || input.run()) {
+            Ok(thread) => thread,
+            Err(_) => {
+                owner.tty.active.store(false, Ordering::Release);
+                return Err("cannot start console input thread");
+            }
+        };
+        Ok(Some(Self { owner, thread: Some(thread) }))
+    }
+
+    /// Bind the newly registered session leader before accepting signal characters.
+    pub(crate) fn activate(&self) {
+        let tty = &self.owner.tty;
+        tty.acquire(&mut tty.lock.lock(), true).expect("new root is a session leader without a tty");
+        self.owner.ready.store(true, Ordering::Release);
+        self.owner.started.wake_all();
+    }
+}
+
+impl Drop for ConsoleSession {
+    fn drop(&mut self) {
+        self.owner.stop.store(true, Ordering::Release);
+        self.owner.started.wake_all();
+        self.owner.tty.writers.wake_all();
+        crate::serial_in::wake_reader();
+        crate::keyboard::wake_readers();
+        if let Some(thread) = self.thread.take() {
+            thread.join();
+        }
+        // Cooked input belongs to the departing run. Leave bytes still in
+        // the hardware/router queue for the kernel shell taking ownership.
+        let mut state = self.owner.tty.lock.lock();
+        let _ = state.ld.flush_input();
+        state.pending_len = 0;
+        state.pending_pos = 0;
+        self.owner.tty.changed();
+        self.owner.tty.active.store(false, Ordering::Release);
+    }
+}
+
+impl InputOwner {
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    fn run(&self) {
+        self.started.wait_until(|| self.ready.load(Ordering::Acquire) || self.stopped());
+        let io = self.tty.console.expect("console input");
+        while !self.stopped() {
+            let mut state = self.tty.lock.lock();
+            if self.stopped() {
+                break;
+            }
+            if state.pending_pos == state.pending_len {
+                state.pending_pos = 0;
+                state.pending_len = match io {
+                    ConsoleIo::Serial => match crate::serial_in::read_byte() {
+                        Some(byte) => {
+                            state.pending[0] = byte;
+                            1
+                        }
+                        None => 0,
+                    },
+                    ConsoleIo::Vt(vt) => {
+                        crate::vt::read_key(vt.index()).map_or(0, |key| vt_key_to_bytes(key, &mut state.pending))
+                    }
+                    ConsoleIo::Capture => unreachable!(),
+                };
+                if state.pending_len == 0 {
+                    drop(state);
+                    match io {
+                        ConsoleIo::Serial => crate::serial_in::wait_or(|| self.stopped()),
+                        ConsoleIo::Vt(vt) => crate::vt::wait_input_or(vt.index(), || self.stopped()),
+                        ConsoleIo::Capture => unreachable!(),
+                    }
+                    continue;
+                }
+            }
+            let byte = state.pending[state.pending_pos];
+            if !state.ld.accepts(byte) {
+                let seen = self.tty.seq.load(Ordering::Acquire);
+                drop(state);
+                self.tty.writers.wait_until(|| self.stopped() || self.tty.seq.load(Ordering::Acquire) != seen);
+                continue;
+            }
+            state.pending_pos += 1;
+            let TtyInner { ld, to_master, .. } = &mut *state;
+            let effects = ld.receive(byte, to_master);
+            if let Input::Signal(signal) = effects.input {
+                if let Some(group) = &state.foreground {
+                    process::tty_signal(-(group.number() as i32), Signal::new(signal.number()).expect("job signal"));
+                }
+                if signal.flush {
+                    self.tty.flush_driver(&mut state);
+                }
+            }
+            self.tty.changed();
+        }
+    }
+}
+
+/// Linux VT input encoding, before termios applies ICRNL/IGNCR/VERASE.
+/// Kernel shells and the capture bridge retain their own key conventions.
+fn vt_key_to_bytes(key: crate::keyboard::Key, out: &mut [u8; 4]) -> usize {
+    match key {
+        crate::keyboard::Key::Enter => {
+            out[0] = b'\r';
+            1
+        }
+        crate::keyboard::Key::Backspace => {
+            out[0] = 0x7f;
+            1
+        }
+        crate::keyboard::Key::Char(ch) => ch.encode_utf8(out).len(),
+        _ => process::vt_key_to_bytes(key, out),
     }
 }
 
@@ -892,6 +1168,315 @@ crate::ktest!(
             child_result?;
             kassert!(released);
             kassert!(parent_unchanged);
+            Ok(())
+        })?
+    }
+);
+
+#[cfg(feature = "ktest")]
+struct RestoreConsole(Arc<Tty>, Termios);
+
+#[cfg(feature = "ktest")]
+impl RestoreConsole {
+    fn raw(tty: &Arc<Tty>) -> Self {
+        let mut state = tty.lock.lock();
+        let saved = state.ld.termios();
+        let mut raw = saved;
+        raw.c_lflag = 0;
+        raw.c_iflag = 0;
+        raw.c_cc[general::VMIN as usize] = 1;
+        raw.c_cc[general::VTIME as usize] = 0;
+        let _ = state.ld.set_termios(raw, Flush::Input);
+        Self(tty.clone(), saved)
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for RestoreConsole {
+    fn drop(&mut self) {
+        let mut state = self.0.lock.lock();
+        let _ = state.ld.set_termios(self.1, Flush::Input);
+        self.0.flush_driver(&mut state);
+        self.0.changed();
+    }
+}
+
+crate::ktest!(
+    fn console_input_backpressure_flush_and_stop() {
+        use crate::{kassert, kassert_eq};
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            let tty = console(ConsoleIo::Serial).ok_or("serial tty")?;
+            let _restore = RestoreConsole::raw(&tty);
+            let session = ConsoleSession::prepare(ConsoleIo::Serial)?.ok_or("serial owner")?;
+            session.activate();
+            let base = process::KTEST_USER_VA;
+            let fill = || {
+                let mut state = tty.lock.lock();
+                let TtyInner { ld, to_master, .. } = &mut *state;
+                while ld.accepts(b'x') {
+                    let _ = ld.receive(b'x', to_master);
+                }
+            };
+            let staged = || {
+                let state = tty.lock.lock();
+                state.pending_pos != state.pending_len
+            };
+            fill();
+            crate::serial_in::inject_for_test(b'a');
+            crate::serial_in::inject_for_test(b'b');
+            while !staged() {
+                crate::time::sleep(1_000_000);
+            }
+            kassert!(crate::serial_in::available());
+            kassert_eq!(tty.read(false, base, BUFFER as u64, true), Ok((BUFFER - 1) as u64));
+            while tty.lock.lock().ld.readable_bytes() != 2 {
+                crate::time::sleep(1_000_000);
+            }
+            kassert_eq!(tty.read(false, base, 2, true), Ok(2));
+            let mut bytes = [0; 2];
+            copy_from_user(&mut bytes, base).map_err(|_| "received bytes")?;
+            kassert_eq!(bytes, *b"ab");
+
+            // Both input-flushing ioctls discard the refused staging byte
+            // and the byte still upstream, even while the input thread waits.
+            for cmd in [ioctl::TCFLSH, ioctl::TCSETSF] {
+                kassert_eq!(tty.ioctl(false, ioctl::TCGETS, base), Ok(0));
+                fill();
+                crate::serial_in::inject_for_test(b'c');
+                crate::serial_in::inject_for_test(b'd');
+                while !staged() {
+                    crate::time::sleep(1_000_000);
+                }
+                kassert_eq!(tty.ioctl(false, cmd, if cmd == ioctl::TCFLSH { 0 } else { base }), Ok(0));
+                kassert!(!staged());
+                kassert!(!crate::serial_in::available());
+                kassert_eq!(tty.read(false, base + 128, 2, true), Err(errno::EAGAIN));
+            }
+            crate::serial_in::inject_for_test(b'z');
+            kassert_eq!(tty.read(false, base, 1, false), Ok(1));
+            copy_from_user(&mut bytes[..1], base).map_err(|_| "fresh input")?;
+            kassert_eq!(bytes[0], b'z');
+
+            // Cancellation also wakes the capacity wait, not just the input wait.
+            fill();
+            crate::serial_in::inject_for_test(b'e');
+            while !staged() {
+                crate::time::sleep(1_000_000);
+            }
+            drop(session);
+            kassert!(!tty.active.load(Ordering::Acquire));
+            kassert_eq!(tty.lock.lock().ld.readable_bytes(), 0);
+            kassert!(!staged());
+            // A cancelled start gate must be joinable as well.
+            drop(ConsoleSession::prepare(ConsoleIo::Serial)?);
+            kassert!(!tty.active.load(Ordering::Acquire));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn console_descriptors_poll_and_interruptible_read() {
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        use lumen_vfs::OpenFlags;
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            let tty = console(ConsoleIo::Serial).ok_or("serial tty")?;
+            let _restore = RestoreConsole::raw(&tty);
+            let session = ConsoleSession::prepare(ConsoleIo::Serial)?.ok_or("serial owner")?;
+            session.activate();
+            let flags = OpenFlags::from_bits(general::O_RDWR);
+            let alias = process::open_kernel_file(b"/dev/tty", flags.bits(), 0).map_err(|_| "alias inode")?;
+            let alias = crate::vfs::devpts::open(alias, flags).map_err(|_| "alias open")?;
+            kassert!(Arc::ptr_eq(&alias.tty().ok_or("alias tty")?.tty, &tty));
+            let fd = process::install_current_fd(alias, false).map_err(|_| "install alias")?;
+            let base = process::KTEST_USER_VA;
+            let poll = move || {
+                let mut row = [0u8; 8];
+                row[..4].copy_from_slice(&fd.to_ne_bytes());
+                row[4..6].copy_from_slice(&(PollMask::IN | PollMask::RDNORM).bits().to_ne_bytes());
+                copy_to_user(base, &row).map_err(|_| "poll input")?;
+                let mut frame = crate::arch::syscall::SyscallFrame {
+                    rax: u64::from(general::__NR_poll),
+                    rdi: base,
+                    rsi: 1,
+                    rdx: u64::MAX,
+                    ..Default::default()
+                };
+                crate::linux::syscall::dispatch(&mut frame);
+                copy_from_user(&mut row, base).map_err(|_| "poll output")?;
+                Ok::<_, &'static str>((frame.rax, u16::from_ne_bytes(row[6..8].try_into().unwrap())))
+            };
+            kassert!(!tty.poll(false, AccessMode::ReadWrite, None).0.intersects(PollMask::IN));
+            kassert!(tty.poll(false, AccessMode::ReadWrite, None).0.intersects(PollMask::OUT | PollMask::WRNORM));
+            let poller = process::spawn_test_thread(move |_| poll())?;
+            while !poller.blocked() {
+                crate::time::sleep(1_000_000);
+            }
+            kassert_eq!(tty.poll.subscriber_count(), 1);
+            crate::serial_in::inject_for_test(b'q');
+            kassert_eq!(poller.join()??, (1, (PollMask::IN | PollMask::RDNORM).bits()));
+            kassert_eq!(tty.poll.subscriber_count(), 0);
+            kassert_eq!(tty.read(false, base + 128, 1, false), Ok(1));
+
+            process::set_current_action(
+                Signal::USR1,
+                process::KernelSigaction { handler: 0x400100, ..Default::default() },
+            );
+            let tid = Arc::new(AtomicU64::new(0));
+            let id = tid.clone();
+            let reading = tty.clone();
+            let reader = process::spawn_test_thread(move |thread| {
+                id.store(u64::from(thread), Ordering::Release);
+                reading.read(false, base + 128, 1, false)
+            })?;
+            while !reader.blocked() {
+                crate::time::sleep(1_000_000);
+            }
+            process::send_thread(
+                None,
+                tid.load(Ordering::Acquire) as u32,
+                Some(SigInfo::new(Signal::USR1, 0)),
+                SenderClass::SiUser,
+            )
+            .map_err(|_| "interrupt reader")?;
+            kassert_eq!(reader.join()?, Err(ERESTARTSYS));
+            // An idle input thread is also woken and joined before returning ownership.
+            drop(session);
+            kassert!(!tty.active.load(Ordering::Acquire));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn console_vt_key_encoding_and_processed_output() {
+        use crate::{kassert, kassert_eq};
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            kassert!(process::VtId::new(crate::term::VTS).is_none());
+            kassert!(process::VtId::new(usize::MAX).is_none());
+            let vt = process::VtId::new(1).ok_or("VT id")?;
+            let io = ConsoleIo::Vt(vt);
+            let _first = crate::term::ShowFirstAfter;
+            crate::term::show(vt.index()).map_err(|_| "show VT")?;
+            let _attached = crate::vt::Attached::all();
+            let tty = console(io).ok_or("VT tty")?;
+            let _restore = RestoreConsole::raw(&tty);
+            let session = ConsoleSession::prepare(io)?.ok_or("VT owner")?;
+            {
+                let mut state = tty.lock.lock();
+                let mut canonical = Termios::console_default();
+                canonical.c_lflag &= !(general::ECHO | general::ECHONL);
+                let _ = state.ld.set_termios(canonical, Flush::Input);
+            }
+            session.activate();
+            let base = process::KTEST_USER_VA;
+            let keys = |scancodes: &[u8]| -> crate::ktest::TestResult {
+                kassert!(crate::keyboard::queue_for_test(scancodes));
+                crate::keyboard::wake_readers();
+                Ok(())
+            };
+            // Actual set-1 bytes go through the decoder, VT queue and input thread:
+            // a, b, physical Backspace, c, physical Enter (presses and releases).
+            keys(&[0x1e, 0x9e, 0x30, 0xb0, 0x0e, 0x8e, 0x2e, 0xae, 0x1c, 0x9c])?;
+            kassert_eq!(tty.read(false, base, 16, false), Ok(3));
+            let mut input = [0; 3];
+            copy_from_user(&mut input, base).map_err(|_| "VT canonical read")?;
+            kassert_eq!(&input, b"ac\n");
+
+            {
+                let mut state = tty.lock.lock();
+                let mut raw = state.ld.termios();
+                raw.c_iflag = 0;
+                raw.c_lflag = 0;
+                raw.c_oflag = general::ONLCR; // OPOST is clear; LF must remain LF.
+                let _ = state.ld.set_termios(raw, Flush::Input);
+            }
+            for (scancodes, expected) in [
+                (&[0x1c, 0x9c][..], b'\r'),             // Enter
+                (&[0x1d, 0x24, 0xa4, 0x9d][..], b'\n'), // Ctrl-J
+                (&[0x0e, 0x8e][..], 0x7f),              // Backspace
+                (&[0x1d, 0x23, 0xa3, 0x9d][..], 0x08),  // Ctrl-H
+                (&[0xe0, 0x1c, 0xe0, 0x9c][..], b'\r'), // keypad Enter
+                (&[0x1d, 0x32, 0xb2, 0x9d][..], b'\r'), // Ctrl-M
+            ] {
+                keys(scancodes)?;
+                kassert_eq!(tty.read(false, base, 1, false), Ok(1));
+                copy_from_user(&mut input[..1], base).map_err(|_| "VT raw scancode read")?;
+                kassert_eq!(input[0], expected);
+            }
+            {
+                let mut state = tty.lock.lock();
+                let mut raw = state.ld.termios();
+                raw.c_iflag = general::IGNCR;
+                raw.c_cc[general::VMIN as usize] = 2;
+                let _ = state.ld.set_termios(raw, Flush::Input);
+            }
+            // IGNCR drops physical Enter, but Ctrl-J must survive before q.
+            keys(&[0x1c, 0x9c, 0x1d, 0x24, 0xa4, 0x9d, 0x10, 0x90])?;
+            kassert_eq!(tty.read(false, base, 2, false), Ok(2));
+            copy_from_user(&mut input[..2], base).map_err(|_| "VT IGNCR read")?;
+            kassert_eq!(&input[..2], b"\nq");
+
+            crate::term::reset_view(vt.index());
+            const TEXT: &[u8] = b"\x1b[2J\x1b[Hab\nX";
+            copy_to_user(base, TEXT).map_err(|_| "VT output")?;
+            kassert_eq!(tty.write(false, base, TEXT.len() as u64, false), Ok(TEXT.len() as u64));
+            let view = crate::term::view_text().ok_or("VT grid")?;
+            kassert_eq!(view.rows[0].as_str(), "ab");
+            kassert_eq!(view.rows[1].as_str(), "  X");
+            // Both UTF-8 and the cursor-position escape sequence span writes.
+            for bytes in [&b"\x1b[3;"[..], &b"1H\xc3"[..], &b"\xa9"[..]] {
+                copy_to_user(base, bytes).map_err(|_| "VT split output")?;
+                kassert_eq!(tty.write(false, base, bytes.len() as u64, false), Ok(bytes.len() as u64));
+            }
+            kassert_eq!(crate::term::view_text().ok_or("VT grid")?.rows[2].as_str(), "é");
+            drop(session);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn console_ctrl_c_flushes_queued_suffix() {
+        use crate::{kassert, kassert_eq};
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            let tty = console(ConsoleIo::Serial).ok_or("serial tty")?;
+            let _restore = RestoreConsole::raw(&tty);
+            // Ignore delivery to this test process; ISIG must still flush input.
+            process::set_current_action(Signal::INT, process::KernelSigaction { handler: 1, ..Default::default() });
+            let session = ConsoleSession::prepare(ConsoleIo::Serial)?.ok_or("serial owner")?;
+            let (sequence, flush) = {
+                let mut state = tty.lock.lock();
+                let mut termios = state.ld.termios();
+                termios.c_lflag = general::ISIG;
+                let _ = state.ld.set_termios(termios, Flush::Input);
+                (tty.seq.load(Ordering::Acquire), state.flush)
+            };
+            // The start gate is closed: prefix, Ctrl-C and suffix are all queued
+            // before the input thread can consume any of them, on any host.
+            for &byte in b"a\x03suffix" {
+                crate::serial_in::inject_for_test(byte);
+            }
+            session.activate();
+            while tty.seq.load(Ordering::Acquire).wrapping_sub(sequence) < 2 {
+                crate::time::sleep(1_000_000);
+            }
+            {
+                let state = tty.lock.lock();
+                kassert_eq!(state.flush, flush.wrapping_add(1));
+                kassert_eq!(state.pending_len, 0);
+                kassert_eq!(state.ld.readable_bytes(), 0);
+                kassert!(!crate::serial_in::available());
+            }
+            let base = process::KTEST_USER_VA;
+            kassert_eq!(tty.read(false, base, 16, true), Err(errno::EAGAIN));
+            crate::serial_in::inject_for_test(b'z');
+            kassert_eq!(tty.read(false, base, 1, false), Ok(1));
+            let mut byte = [0];
+            copy_from_user(&mut byte, base).map_err(|_| "fresh input after Ctrl-C")?;
+            kassert_eq!(byte, *b"z");
+            drop(session);
             Ok(())
         })?
     }

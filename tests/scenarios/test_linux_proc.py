@@ -73,7 +73,7 @@ def test_signals_and_sigaltstack(boot, tmp_path, cpu):
     type_confirmed(m, f"linux {PROC} signal-hold\n")
     pid = int(expect_screen(m, r"^signal-hold: pid=(\d+) ready$", 30)[1])
     checks(f"signal-probe {pid}", ["sigqueue_permission"])
-    confirmed_keys(m, "n")
+    confirmed_keys(m, "\n")
     expect_screen(m, rf"^signal-hold: done\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
 
     def blocked(pid):
@@ -103,7 +103,7 @@ def test_signals_and_sigaltstack(boot, tmp_path, cpu):
         else:
             blocked(waiter)  # SA_RESTART re-entered the contended lock wait.
         confirmed_keys(m, ["alt", "f2"])
-        confirmed_keys(m, "n")
+        confirmed_keys(m, "\n")
         expect_screen(m, rf"^signal-hold: done\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
         confirmed_keys(m, ["alt", "f3"])
         if mode == "restart":
@@ -309,23 +309,22 @@ def test_sigchld_and_sigint_interrupt_wait(boot, tmp_path):
             if restarts:
                 blocked(pid)
                 if kind == "read":
-                    confirmed_keys(m, "z")
+                    type_confirmed(m, "z\n")
                 else:
                     sent = run(m, f"linux {PROC} c6-kill {child} 9", 30)
                     assert "ok c6-send" in sent, sent
             expect_screen(m, rf"^ok c6-blocking\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
 
-    # A background child polls serial with events=0, so these serial-shell
-    # queries cannot satisfy its wait. Confirm each effect before proceeding.
+    # A background child ignores the departing console leader's SIGHUP and
+    # polls its inherited tty with events=0. Confirm each effect before proceeding.
     serial_start = len(m.output)
     out = run(m, f"linux {PROC} c6-wait poll eintr")
     child = re.search(r"^c6: poll-child=(\d+)$", out, re.MULTILINE)
     assert child, out
     pid = int(child[1])
     for _ in range(attempts):
-        # A serial ps command itself wakes this subscriber. Sample on VT2,
-        # confirming all keys, then read the snapshot. Retry if a keyboard
-        # confirmation's serial traffic caught the poller before it reblocked.
+        # Sample on VT2, confirming all keys before reading the snapshot.
+        # The tty subscription must survive the console input owner's shutdown.
         type_confirmed(m, "ps\n")
         screen = read_screen(m).text
         if re.search(rf"^\s*{pid}\s+\d+\s+{pid}\s+blocked\s", screen, re.MULTILINE):
@@ -379,7 +378,7 @@ def test_pthread_create_and_join(boot, tmp_path):
         type_confirmed(m, f"linux {PROC} thread-exhaust\n")
         expect_screen(m, r"^threads: exhausted count=\d+ errno=11 ready$", 180)
         assert run(m, "rhai -e '382'", 60) == "382\n"
-        confirmed_keys(m, "x")
+        confirmed_keys(m, "\n")
         done = expect_screen(
             m,
             rf"^ok thread-stack-exhaustion\nlinux: {PROC} exit=0 leaked_frames=(-?\d+)$",
@@ -475,11 +474,11 @@ def test_futex_and_pthread_mutex_stress(boot, tmp_path):
     type_confirmed(m, f"linux {PROC} futex-block\n")
     pid = int(expect_screen(m, r"^futex-block: mutex pid=(\d+) ready$", 30)[1])
     all_four_blocked(pid)
-    confirmed_keys(m, "m")
+    confirmed_keys(m, "\n")
     pid2 = int(expect_screen(m, r"^futex-block: cond pid=(\d+) ready$", 30)[1])
     assert pid2 == pid
     all_four_blocked(pid)
-    confirmed_keys(m, "c")
+    confirmed_keys(m, "\n")
     expect_screen(m, rf"^ok futex-kernel-blocking\nlinux: {PROC} exit=0 leaked_frames=0$", 30)
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS

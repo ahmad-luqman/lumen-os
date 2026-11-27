@@ -204,6 +204,14 @@ pub fn send(pid: &[u8], sig: &[u8]) -> c_int {
 }
 pub fn blocking(kind: &[u8], restart: bool) -> c_int {
     if kind == b"poll" {
+        // C10 gives the runner a controlling terminal: its exit sends HUP to
+        // the foreground group. This intentionally surviving poll witness
+        // must ignore HUP before fork, so parent exit cannot race child setup.
+        let ignore = [1u64, 0, 0, 0];
+        if sys(SYS_RT_SIGACTION, [1, ignore.as_ptr() as u64, 0, 8, 0, 0]) != 0 {
+            say!("FAIL poll witness: ignore SIGHUP");
+            return 99;
+        }
         match fork() {
             Ok(0) => {}
             Ok(pid) => {

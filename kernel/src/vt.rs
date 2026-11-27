@@ -512,6 +512,23 @@ pub fn wait_key(vt: usize) -> Key {
     }
 }
 
+/// Wait for routed input or cancellation without consuming a key.
+pub(crate) fn wait_input_or(vt: usize, stop: impl Fn() -> bool) {
+    keyboard::wait_for_bytes_or(|| stop() || HAS_KEYS.load(Ordering::Acquire) & (1 << vt) != 0);
+}
+
+/// Flush this terminal's routed and currently undecoded input, preserving other VTs.
+pub(crate) fn discard_input(vt: usize) {
+    let pass = {
+        let mut router = ROUTER.lock();
+        let pass = decode_locked(&mut router, Some(vt));
+        while router.take(vt).is_some() {}
+        publish(&router);
+        pass
+    };
+    after_pass(pass);
+}
+
 /// Show virtual terminal `vt` (0 is the first): keys routed from now on go
 /// to it. Refused (and counted) while a command has the screen
 /// (`term::Canvas`), unless `vt` is shown already.
@@ -640,11 +657,11 @@ crate::ktest!(
 /// none), which drains the keyboard's queue and detaches them, discarding
 /// their keys.
 #[cfg(feature = "ktest")]
-struct Attached;
+pub(crate) struct Attached;
 
 #[cfg(feature = "ktest")]
 impl Attached {
-    fn all() -> Attached {
+    pub(crate) fn all() -> Attached {
         (0..VTS).for_each(attach);
         Attached
     }
