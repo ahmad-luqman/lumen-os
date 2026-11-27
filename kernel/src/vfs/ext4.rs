@@ -45,6 +45,7 @@ use super::page_cache::{self, CachePage, DetachedQuotaGuard, PAGE_SIZE, PageCach
 /// A volume's block cache as the filesystem reads and writes it: over
 /// `virtio-blk` devices and the ktests' in-memory ones.
 pub trait BlockCacheBackend: Send + Sync {
+    fn total_bytes(&self) -> u64;
     fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError>;
     fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError>;
     fn sync(&self) -> Result<(), BlockError>;
@@ -71,6 +72,10 @@ pub trait LatchableCache: BlockCacheBackend {
 }
 
 impl<B: BlockDevice + Send + Sync + 'static> BlockCacheBackend for SleepMutex<BlockCache<B>> {
+    fn total_bytes(&self) -> u64 {
+        self.lock().total_bytes()
+    }
+
     fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError> {
         self.lock().read_at(byte_off, dst)
     }
@@ -265,6 +270,10 @@ impl LatchedCache {
 }
 
 impl BlockCacheBackend for LatchedCache {
+    fn total_bytes(&self) -> u64 {
+        self.inner.total_bytes()
+    }
+
     fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError> {
         // A read whose eviction meets the failure is served all the same
         // (the cache below looks again for a clean slot, or reads past
@@ -925,24 +934,35 @@ fn map_file_type(ft: FileType) -> InodeType {
     }
 }
 
-fn is_inline_symlink(inode: &Inode) -> bool {
-    inode.file_type().is_symlink()
-        && !inode.flags().contains(InodeFlags::EXTENTS)
-        && inode.blocks() == 0
-        && inode.size_in_bytes() <= 60
+/// Classify i_block with the same rule used before allowing a writable mount.
+fn inode_block_kind(inner: &Ext4FsInner, inode: &Inode) -> Result<lumen_vfs::ext4::IBlockKind, VfsError> {
+    let mut acl_sectors = 0;
+    if inode.file_type().is_symlink() && !inode.flags().contains(InodeFlags::EXTENTS) {
+        let off = inner.layout.inode_disk_offset(&inner.bcache, inode.index.get())?;
+        let mut acl = [0; 16];
+        inner.bcache.read_at(off + 0x68, &mut acl).map_err(|e| map_block_error(&e))?;
+        let lo = u32::from_le_bytes(acl[..4].try_into().unwrap());
+        let hi = if inner.layout.geometry.is_64bit() { u16::from_le_bytes(acl[14..16].try_into().unwrap()) } else { 0 };
+        if lo != 0 || hi != 0 {
+            acl_sectors = inner.layout.block_size() / 512;
+        }
+    }
+    match lumen_vfs::ext4::i_block_kind(inode.mode().bits(), inode.flags().bits(), inode.blocks(), acl_sectors) {
+        lumen_vfs::ext4::IBlockKind::InvalidInlineData => Err(VfsError::Io),
+        kind => Ok(kind),
+    }
 }
 
-/// Whether i_block contains inline data or no data, never block numbers:
-/// blockless symlinks (including partial creates), and non-EXTENTS devices,
-/// FIFOs and sockets. Special inodes may count an external xattr block in
-/// i_blocks, but Linux never
-/// truncates their i_block. ext4plus otherwise mistakes a device's rdev for
-/// block numbers (old-style 1:3 is 0x0103, i.e. someone else's block 259).
-fn i_block_holds_no_block_numbers(inode: &Inode) -> bool {
-    is_inline_symlink(inode)
-        || (!matches!(inode.file_type(), FileType::Regular | FileType::Directory)
-            && !inode.flags().contains(InodeFlags::EXTENTS)
-            && (!inode.file_type().is_symlink() || inode.blocks() == 0))
+fn is_inline_symlink(inner: &Ext4FsInner, inode: &Inode) -> Result<bool, VfsError> {
+    Ok(inode_block_kind(inner, inode)? == lumen_vfs::ext4::IBlockKind::FastSymlink)
+}
+
+/// Fast symlinks and non-extent special inodes hold text or rdev, not blocks.
+fn i_block_holds_no_block_numbers(inner: &Ext4FsInner, inode: &Inode) -> Result<bool, VfsError> {
+    Ok(matches!(
+        inode_block_kind(inner, inode)?,
+        lumen_vfs::ext4::IBlockKind::FastSymlink | lumen_vfs::ext4::IBlockKind::Special
+    ))
 }
 
 fn entry_name(name: &[u8]) -> Result<DirEntryName<'_>, VfsError> {
@@ -1579,13 +1599,18 @@ impl Ext4FileSystem {
         let mut read_only = hw_read_only || forced.is_some();
         if !read_only {
             let started = time::now_ns();
-            match lumen_vfs::ext4::check_allocation(&raw_sb, |off, buf| bcache.read_at(off, buf)) {
+            match lumen_vfs::ext4::check_allocation(&raw_sb, bcache.total_bytes(), |off, buf| bcache.read_at(off, buf))
+            {
                 Ok(report) => {
                     debug!(target: "vfs", "ext4 on {dev:?}: allocation check: {} us, {} leaked blocks",
                         time::now_ns().saturating_sub(started) / 1000, report.leaked_blocks);
                 }
                 Err(why) => {
-                    warn!(target: "vfs", "ext4 on {dev:?}: mounting read-only: {why}; run e2fsck -f");
+                    if matches!(why, lumen_vfs::ext4::AllocationError::Inconsistent(_)) {
+                        warn!(target: "vfs", "ext4 on {dev:?}: mounting read-only: {why}; run e2fsck -f");
+                    } else {
+                        warn!(target: "vfs", "ext4 on {dev:?}: cannot check allocation: {why}; mounting read-only");
+                    }
                     read_only = true;
                 }
             }
@@ -2301,7 +2326,7 @@ impl Ext4Inode {
         child_nlink: u32,
     ) -> Result<(Inode, Option<SavedInlineSymlink>), VfsError> {
         let idx = NonZeroU32::new(disk_ino).ok_or(VfsError::Inval)?;
-        if child_nlink <= 1 && disk.links_count() <= 1 && i_block_holds_no_block_numbers(&disk) {
+        if child_nlink <= 1 && disk.links_count() <= 1 && i_block_holds_no_block_numbers(inner, &disk)? {
             let off = inner.layout.inode_disk_offset(&inner.bcache, disk_ino)?;
             // Read the contiguous inode span `[0x04..0x70)` covering `size_lo` (0x04..0x08),
             // `inline_60` (0x28..0x64), and `size_hi` (0x6c..0x70) so we can zero all three
@@ -2438,7 +2463,7 @@ impl Ext4Inode {
             InodeType::Symlink => {
                 let inner = target.shared.state.lock();
                 let disk = Inode::read(&inner.ext4, target.disk_inode_index()).map_err(map_ext4_err)?;
-                let target_bytes = if is_inline_symlink(&disk) {
+                let target_bytes = if is_inline_symlink(&inner, &disk)? {
                     Self::read_inline_symlink_unlocked(&inner, &disk)?
                 } else {
                     inner.ext4.read_inode_file(&disk).map_err(map_ext4_err)?
@@ -3914,6 +3939,7 @@ impl core::fmt::Display for Undecided {
             Self::Map(BlockMapError::Read(MapBlock::Read(b, e))) => {
                 write!(f, "its map block {b} doesn't read back: {e:?}")
             }
+            Self::Map(BlockMapError::NoMemory) => write!(f, "not enough memory to read its map"),
             Self::Map(BlockMapError::Corrupt) => write!(f, "its map doesn't parse"),
             Self::Map(BlockMapError::TooManyReads) => {
                 write!(f, "its map has more than {} blocks before its first data block", lumen_vfs::ext4::MAP_READS_MAX)
@@ -3961,8 +3987,10 @@ fn child_after_failed_unlink(inner: &Ext4FsInner, ino: NonZeroU32, last_link: bo
     if cur.mode().bits() == 0 {
         return ChildReadBack::Zeroed;
     }
-    if i_block_holds_no_block_numbers(&cur) {
-        return ChildReadBack::Allocated;
+    match i_block_holds_no_block_numbers(inner, &cur) {
+        Ok(true) => return ChildReadBack::Allocated,
+        Ok(false) => {}
+        Err(e) => return ChildReadBack::Unreadable(Undecided::IBlock(e)),
     }
     let mut i_block = [0u8; 60];
     if let Err(e) = inner.layout.read_i_block(&inner.bcache, ino.get(), &mut i_block) {
@@ -4215,7 +4243,7 @@ fn try_discard_orphan(
         let parent_links = Inode::read(ext4, parent_ino).map_err(map_ext4_err)?.links_count();
         let mut orphan = Inode::read(ext4, orphan_ino).map_err(map_ext4_err)?;
         let is_dir = orphan.file_type().is_dir();
-        if i_block_holds_no_block_numbers(&orphan) {
+        if i_block_holds_no_block_numbers(inner, &orphan)? {
             orphan.set_links_count(0);
             orphan.write(ext4).map_err(map_ext4_err)?;
             orphan = Ext4Inode::zero_inline_symlink_before_unlink(inner, orphan_ino.get(), orphan, 0)?.0;
@@ -4919,7 +4947,7 @@ impl VfsInode for Ext4Inode {
         }
         let inner = self.shared.state.lock();
         let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-        if is_inline_symlink(&disk) {
+        if is_inline_symlink(&inner, &disk)? {
             Self::read_inline_symlink_unlocked(&inner, &disk)
         } else {
             inner.ext4.read_inode_file(&disk).map_err(map_ext4_err)
@@ -5698,6 +5726,10 @@ pub(crate) mod ktest_util {
     }
 
     impl BlockCacheBackend for FaultCache {
+        fn total_bytes(&self) -> u64 {
+            self.inner.lock().total_bytes()
+        }
+
         fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError> {
             self.reads.fetch_add(1, Ordering::AcqRel);
             if self.fail_reads.load(Ordering::Acquire) {
@@ -10250,12 +10282,12 @@ fn allocation_test_image(two_groups: bool, extents: bool) -> Vec<u8> {
 fn check_block_bitmap_mismatch(img: Vec<u8>, padding: Option<usize>) -> Result<(), &'static str> {
     use self::ktest_util::*;
     use crate::{kassert, kassert_eq};
-    let setup = mount(img, 350)?;
-    let bs = setup.fs.shared.state.lock().layout.block_size() as usize;
-    let bitmap = block_bitmap_offset(&setup.fs)?;
-    setup.root.create(b"f", 0o644).map_err(|_| "create before corruption")?;
-    setup.fs.sync().map_err(|_| "sync before corruption")?;
-    let mut img = image(&setup)?;
+    let m = mount(img, 350)?;
+    let bs = m.fs.shared.state.lock().layout.block_size() as usize;
+    let bitmap = block_bitmap_offset(&m.fs)?;
+    m.root.create(b"f", 0o644).map_err(|_| "create before corruption")?;
+    m.fs.sync().map_err(|_| "sync before corruption")?;
+    let mut img = image(&m)?;
     let bits = &mut img[bitmap as usize..bitmap as usize + bs];
     bits.fill(0xff); // counts still promise room
     if let Some(end) = padding {
@@ -10263,7 +10295,6 @@ fn check_block_bitmap_mismatch(img: Vec<u8>, padding: Option<usize>) -> Result<(
             set_block_bit(bits, bit, false);
         }
     }
-    let m = setup;
     inject_bitmap_after_mount(&m, bitmap, &img[bitmap as usize..bitmap as usize + bs])?;
     let f = m.root.lookup(b"f").map_err(|_| "lookup")?;
     kassert!(!m.fs.read_only());
@@ -10450,11 +10481,10 @@ crate::ktest!(
     fn ext4_allocation_corruption_allows_mkdir_undo_before_freezing() {
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
-        let setup = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 358)?;
-        let bitmap = block_bitmap_offset(&setup.fs)?;
-        let mut img = image(&setup)?;
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 358)?;
+        let bitmap = block_bitmap_offset(&m.fs)?;
+        let mut img = image(&m)?;
         img[bitmap as usize..bitmap as usize + 4096].fill(0xff);
-        let m = setup;
         inject_bitmap_after_mount(&m, bitmap, &img[bitmap as usize..bitmap as usize + 4096])?;
         let before = free_inodes(&m.fs);
         let nlink = m.root.stat().map_err(|_| "stat before")?.nlink;
@@ -10485,13 +10515,12 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         for device_first in [true, false] {
-            let setup = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 359)?;
-            let f = setup.root.create(b"f", 0o644).map_err(|_| "create")?;
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 359)?;
+            let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
             let ino = NonZeroU32::new(f.ino() as u32).ok_or("ino")?;
-            let bitmap = block_bitmap_offset(&setup.fs)?;
-            let mut img = image(&setup)?;
+            let bitmap = block_bitmap_offset(&m.fs)?;
+            let mut img = image(&m)?;
             img[bitmap as usize..bitmap as usize + 4096].fill(0xff);
-            let m = setup;
             inject_bitmap_after_mount(&m, bitmap, &img[bitmap as usize..bitmap as usize + 4096])?;
             let op = m.fs.shared.op("writeback");
             let dev_before = m.dev_bytes();
@@ -10616,7 +10645,7 @@ fn inject_bitmap_after_mount(m: &ktest_util::Mnt, offset: u64, bytes: &[u8]) -> 
 
 #[cfg(feature = "ktest")]
 fn mount_check_report(img: &[u8]) -> Result<lumen_vfs::ext4::AllocationReport, lumen_vfs::ext4::AllocationError<()>> {
-    lumen_vfs::ext4::check_allocation(img[1024..2048].try_into().unwrap(), |off, dst| {
+    lumen_vfs::ext4::check_allocation(img[1024..2048].try_into().unwrap(), img.len() as u64, |off, dst| {
         let bytes = img.get(off as usize..off as usize + dst.len()).ok_or(())?;
         dst.copy_from_slice(bytes);
         Ok(())
@@ -10707,9 +10736,12 @@ crate::ktest!(
             w16(&mut img, gd + 0xc, free);
             w32(&mut img, 1024 + 0xc, u32::from(free));
             // Counts agree: it must be the stale mapping that refuses writes.
-            kassert!(
-                matches!(mount_check_report(&img), Err(lumen_vfs::ext4::AllocationError::Block { block: b, problem: "is mapped but free" }) if b == u64::from(block))
-            );
+            use lumen_vfs::ext4::{AllocationError, AllocationInconsistency, BlockProblem};
+            let report = mount_check_report(&img);
+            kassert!(matches!(
+                report,
+                Err(AllocationError::Inconsistent(AllocationInconsistency::Block { problem: BlockProblem::Free, .. }))
+            ));
             assert_mount_forced_ro(
                 img,
                 if extents { 406 } else { 405 },
@@ -10752,14 +10784,185 @@ crate::ktest!(
     fn ext4_mount_read_only_skips_allocation_check() {
         use crate::{kassert, kassert_eq};
         let m = ktest_util::mount(crate::vfs::build_minimal_ext4_image_blocks(256), 410)?;
-        // A read of either bitmap would fail. A forced hardware-RO mount
-        // must never attempt either read, even if it would ignore the error.
+        // The first read overlapping either bitmap would fail. A hardware-RO
+        // mount must leave that fault armed: it skips the allocation check.
         m.cache.fail_reads_in(2 * 4096, 4 * 4096, 1);
         let backend: Arc<dyn LatchableCache> = m.cache.clone();
         let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, 411), true).map_err(|_| "ro mount")?;
         kassert!(fs.read_only());
         kassert_eq!(m.cache.range_reads_left(), 1);
         kassert_eq!(m.cache.writes.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_unlink_inode_table_device_failure_is_read_only() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::ext4::{AllocationError, AllocationInconsistency};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 412)?;
+        let f = m.root.create(b"victim", 0o644).map_err(|_| "create")?;
+        f.write_at(0, b"allocated data").map_err(|_| "write")?;
+        m.fs.sync().map_err(|_| "sync setup")?;
+        let ino = f.ino() as u32;
+        let off = inode_offset(&m.fs, ino)? as usize;
+        let before = m.dev_bytes();
+        drop(f);
+        m.root.unlink(b"victim").map_err(|_| "unlink into cache")?;
+        let writes = m.cache.dev.writes();
+        // The actual device accepts SB, GDT, block bitmap and inode bitmap
+        // in ascending block order, then refuses the inode-table block.
+        m.cache.dev.fail_nth_device_write(5);
+        kassert_eq!(m.fs.sync(), Err(VfsError::Io));
+        let (landed, disk) = m.cache.dev.at_failure().ok_or("no device failure")?;
+        kassert_eq!(landed, writes + 4);
+        kassert_eq!(&disk[off..off + 256], &before[off..off + 256]);
+        kassert_eq!(disk[3 * 4096 + (ino as usize - 1) / 8] & (1 << ((ino - 1) % 8)), 0);
+        kassert!(disk[2 * 4096..3 * 4096] != before[2 * 4096..3 * 4096]);
+        // The still-old directory or the still-live slot proves corruption;
+        // neither test depends on reading the stopped cache's newer bytes.
+        let report = mount_check_report(&disk);
+        kassert!(matches!(report, Err(AllocationError::Inconsistent(
+            AllocationInconsistency::DirectoryEntry { inode, .. } | AllocationInconsistency::LiveFreeInode(inode)
+        )) if inode == ino));
+        assert_mount_forced_ro(disk, 413, "inode")?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_directory_entry_to_free_inode_is_read_only() {
+        use crate::kassert_eq;
+        use crate::vfs::write_u32le;
+        use lumen_vfs::ext4::{AllocationError, AllocationInconsistency};
+        let mut img = crate::vfs::build_minimal_ext4_image_blocks(256);
+        // Only the dirent is stale: inode 11's slot and bitmap bit are clear.
+        write_u32le(&mut img, 6 * 4096, 11);
+        kassert_eq!(
+            mount_check_report(&img),
+            Err(AllocationError::Inconsistent(AllocationInconsistency::DirectoryEntry { directory: 2, inode: 11 }))
+        );
+        assert_mount_forced_ro(img, 414, "directory inode 2 references free or out-of-range inode 11")?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_cannot_check_warns_without_fsck_advice() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 415)?;
+        m.cache.fail_reads_in(2 * 4096, 3 * 4096, 1);
+        let backend: Arc<dyn LatchableCache> = m.cache.clone();
+        let dev = DevId::makedev(0, 416);
+        let fs = Ext4FileSystem::mount(backend, dev, false).map_err(|_| "read failure mount")?;
+        kassert!(fs.read_only());
+        kassert!(!fs.errored());
+        kassert_eq!(m.cache.range_reads_left(), 0);
+        let mut log = vec![0; crate::klog::RING_BYTES];
+        let (n, _) = crate::klog::copy_recent(&mut log);
+        let log = core::str::from_utf8(&log[..n]).map_err(|_| "log utf8")?;
+        let prefix = alloc::format!("WARN  vfs: ext4 on {dev:?}:");
+        let lines: Vec<_> = log.lines().filter(|line| line.contains(&prefix)).collect();
+        kassert_eq!(lines.len(), 1);
+        kassert!(lines[0].contains("cannot check allocation:"));
+        kassert!(lines[0].ends_with("; mounting read-only"));
+        kassert!(!lines[0].contains("e2fsck"));
+        Ok(())
+    }
+);
+
+#[cfg(feature = "ktest")]
+fn remount_ro_checked(m: &ktest_util::Mnt) -> Result<Arc<Ext4FileSystem>, &'static str> {
+    use crate::kassert_eq;
+    use lumen_vfs::ext4::AllocationReport;
+    let img = ktest_util::image(m)?;
+    kassert_eq!(mount_check_report(&img), Ok(AllocationReport { leaked_blocks: 0 }));
+    ktest_util::mount_ro_image(img, 418)
+}
+
+crate::ktest!(
+    fn ext4_mount_check_accepts_fault_free_workloads_without_leaks() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        for img in [crate::vfs::build_minimal_ext4_image_blocks(256), build_1k_blockmap_image(256)] {
+            let m = mount(img, 417)?;
+            let f = m.root.create(b"file", 0o644).map_err(|_| "create")?;
+            f.write_at(0, &vec![42; 20 * 1024]).map_err(|_| "write")?;
+            m.fs.sync().map_err(|_| "sync")?;
+            remount_ro_checked(&m)?;
+            f.truncate(4096).map_err(|_| "truncate")?;
+            remount_ro_checked(&m)?;
+            drop(f);
+            m.root.unlink(b"file").map_err(|_| "unlink")?;
+            remount_ro_checked(&m)?;
+            m.root.mkdir(b"dir", 0o755).map_err(|_| "mkdir")?;
+            remount_ro_checked(&m)?;
+            m.root.rmdir(b"dir").map_err(|_| "rmdir")?;
+            remount_ro_checked(&m)?;
+            for (name, target) in [(&b"short"[..], &b"target"[..]), (&b"long"[..], &vec![b'x'; 100][..])] {
+                let sym = m.root.symlink(name, target).map_err(|_| "symlink")?;
+                kassert_eq!(sym.readlink().map_err(|_| "readlink")?, target);
+                remount_ro_checked(&m)?;
+                m.root.unlink(name).map_err(|_| "unlink symlink")?;
+                remount_ro_checked(&m)?;
+            }
+            m.root.create(b"a", 0o644).map_err(|_| "create a")?;
+            m.root.create(b"b", 0o644).map_err(|_| "create b")?;
+            m.root.rename(b"a", &m.root, b"c", RenameFlags::default()).map_err(|_| "rename")?;
+            remount_ro_checked(&m)?;
+            m.root.rename(b"b", &m.root, b"c", RenameFlags(RenameFlags::EXCHANGE)).map_err(|_| "exchange")?;
+            remount_ro_checked(&m)?;
+            for (name, kind) in [(b"regular".as_slice(), InodeType::File), (b"fifo", InodeType::Fifo)] {
+                m.root.mknod(name, kind, 0o600, DevId::makedev(1, 3)).map_err(|_| "mknod")?;
+                remount_ro_checked(&m)?;
+                m.root.unlink(name).map_err(|_| "unlink node")?;
+                remount_ro_checked(&m)?;
+            }
+            let held = m.root.create(b"held", 0o644).map_err(|_| "create held")?;
+            held.write_at(0, b"still readable").map_err(|_| "write held")?;
+            m.fs.sync().map_err(|_| "sync held")?;
+            let open = lumen_vfs::OpenGuard::try_new(Arc::clone(&held)).map_err(|_| "open")?;
+            m.root.unlink(b"held").map_err(|_| "detach")?;
+            kassert!(held.is_detached());
+            kassert_eq!(read_all(&held)?, b"still readable");
+            remount_ro_checked(&m)?;
+            drop(open);
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_fast_symlink_with_xattr_reads_inline_and_unlinks_safely() {
+        use self::ktest_util::*;
+        use crate::vfs::{write_u16le as w16, write_u32le as w32};
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::ext4::AllocationReport;
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 419)?;
+        let sym = m.root.symlink(b"sym", b"target").map_err(|_| "symlink")?;
+        let off = inode_offset(&m.fs, sym.ino() as u32)? as usize;
+        let mut img = image(&m)?;
+        // No data block: i_blocks accounts for the external xattr alone.
+        w32(&mut img, off + 0x1c, 8);
+        w32(&mut img, off + 0x68, 255);
+        w32(&mut img, 255 * 4096, 0xea020000);
+        w32(&mut img, 255 * 4096 + 4, 1);
+        w32(&mut img, 255 * 4096 + 8, 1);
+        set_block_bit(&mut img[2 * 4096..3 * 4096], 255, true);
+        w16(&mut img, 4096 + 0xc, 248);
+        w32(&mut img, 1024 + 0xc, 248);
+        kassert_eq!(mount_check_report(&img), Ok(AllocationReport { leaked_blocks: 0 }));
+        let m = mount(img, 420)?;
+        kassert!(!m.fs.read_only());
+        let sym = m.root.lookup(b"sym").map_err(|_| "lookup")?;
+        kassert_eq!(sym.readlink().map_err(|_| "readlink")?, b"target");
+        m.root.unlink(b"sym").map_err(|_| "unlink")?;
+        kassert!(!m.fs.read_only());
+        // ext4plus does not reclaim external xattrs. Its harmless leak must
+        // not turn the inline target into a bitmap free or a mount refusal.
+        kassert_eq!(mount_check_report(&image(&m)?), Ok(AllocationReport { leaked_blocks: 1 }));
         Ok(())
     }
 );

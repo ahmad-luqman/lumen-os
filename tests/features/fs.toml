@@ -490,7 +490,7 @@ milestone = "M8"
 tests = ["cargo:lumen-vfs"]
 
 [[feature]]
-name = "Writable ext4 mounts check allocation counts and every inode's block ownership; inconsistent volumes mount read-only with one e2fsck warning, leaks remain writable, and read-only mounts skip the check (#355)"
+name = "Writable ext4 mounts check allocation counts and every in-use inode's block ownership; inconsistent volumes mount read-only with one e2fsck warning, leaks remain writable, and read-only mounts skip the check (#355)"
 milestone = "M8"
 tests = [
     "cargo:lumen-vfs",
@@ -501,3 +501,20 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_mount_leaked_blocks_remains_writable",
     "ktest:lumen_kernel::vfs::ext4::ext4_mount_read_only_skips_allocation_check",
 ]
+
+[[feature]]
+name = "Ext4 allocation checking catches live free inode slots and dangling directory entries after a device failure, validates shared xattrs and real layouts, distinguishes cannot-check errors, and accepts fault-free VFS workloads and both Alpine images without leaks (#355 round 1)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_unlink_inode_table_device_failure_is_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_directory_entry_to_free_inode_is_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_cannot_check_warns_without_fsck_advice",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_check_accepts_fault_free_workloads_without_leaks",
+    "scenario:test_alpine::test_alpine_allocation_check_has_no_leaks",
+]
+
+[[feature]]
+name = "Fast symlinks with an external xattr use Linux's i_blocks == acl_sectors rule for readlink and unlink; ext4plus's unreclaimed xattr is a counted harmless leak (#355 round 1)"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::vfs::ext4::ext4_fast_symlink_with_xattr_reads_inline_and_unlinks_safely"]
