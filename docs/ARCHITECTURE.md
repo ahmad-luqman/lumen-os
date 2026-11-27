@@ -7407,8 +7407,9 @@ through `Ext4Write::on_allocation_corruption`, and `Extent::allocate`
 retrying only `NoSpace`. The crate's own unit tests don't build from the
 crate file (their `test_data/` isn't in it), so Lumen tests its changes
 from outside. Its other known bug (#355, a truncate's frees reaching the
-device before its inode) needs ordering at the device, not in the crate's
-call order (#355's comments).
+device before its inode) stays: fixing it needs ordering at the device, not
+in the crate's call order. The state it can leave on the device is caught
+instead at the next writable mount (the allocation check, below).
 
 `ext4plus` `=0.1.0-rc.2` is vetted against all six hard gates:
 1. Compiles on pinned stable `rustc 1.99.1` for `x86_64-unknown-none` with
@@ -7739,7 +7740,8 @@ call order (#355's comments).
       bitmap byte or bitmap-checksum write doubles nothing
       (`ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio`,
       by the `FaultCache`). `e2fsck` recomputes the counts (read, not
-      tested).
+      tested), and the next writable mount's allocation check refuses a
+      doubled count (#355).
     - `ext4plus`'s `Extent::allocate` (`extent.rs`) retries an
       `alloc_contiguous_blocks(n)` that found no room (`NoSpace`) with one
       block fewer and gives `NoSpace` at 0; since #350 any other error (a
@@ -7759,7 +7761,8 @@ call order (#355's comments).
       the next one. Since #349 those later writes land only in a block cache
       that never writes back (the volume read-only), so on the device the
       state the failure left stays
-      (`ext4_a_failed_write_in_a_block_allocation_preserves_eio`). On a
+      (`ext4_a_failed_write_in_a_block_allocation_preserves_eio`), and the
+      next writable mount's allocation check refuses it (#355). On a
       1 KiB-block extent volume, where a page needs 4 blocks, a failed write
       is no longer retried shorter either (#351's host probe saw that retry
       succeed before #350, with up to 4 bits leaked); the bits set before
@@ -7934,12 +7937,47 @@ call order (#355's comments).
       block holding the superblock also holds the free counts the failed
       operation changed in memory: writing it would land part of that
       operation, on a device that has just failed a write. So nothing on
-      disk says the volume errored, and no mount refuses it for that. Nor
+      disk says the volume errored, and no mount refuses it for that mark
+      (the allocation check below catches the state it left, #355). Nor
       does Lumen clear `EXT2_VALID_FS` in `s_state` at a writable mount and
       set it again at a clean unmount, as Linux does: it never unmounts
       cleanly, so a mount that refused a volume without the bit would mount
       every boot read-only. `e2fsck -p` therefore skips the volume: run
       `e2fsck -f`.
+    - *Checked at mount instead (#355):* since nothing on disk marks an
+      errored volume, every writable mount checks the allocation state
+      before allowing writes (`lumen_vfs::ext4`'s checker, reading through
+      the volume's block cache): each group's bitmap free counts against
+      its descriptor's, their sums against the superblock's, then every
+      block the in-use inodes map (extent nodes, indirect blocks at every
+      level, xattr blocks; whether an inode's `i_block` holds block numbers
+      is one rule, Linux's, decoded from the raw inode and shared with the
+      adapter) and the fixed metadata (superblock and backups, group
+      descriptors, the resize inode's reserved descriptors, bitmaps, inode
+      tables, the MMP block) against the block bitmap; then each
+      inode-table slot against the inode bitmap and each directory entry
+      against it. It mounts the volume read-only with one warning
+      (`run e2fsck -f`) when it finds an inconsistency, for example: a
+      count that differs from its bitmap (above it: #350's crash case), a
+      mapped block that's free (#355's failed truncate after a reboot) or
+      mapped twice (a shared external xattr block is fine unless its
+      `h_refcount` is below its references; above them, as `ext4plus`'s
+      unlink leaves it, is a leak), an inode slot that looks live (mode
+      set, links, no `dtime`) while its bitmap bit is clear, a directory
+      entry naming a free inode (an unlink whose writes reached the device
+      only in part), a volume larger than its device, or a corrupt map.
+      When it can't check (a layout it doesn't support, such as meta_bg or
+      an external journal, a volume too large for its memory limits, or a
+      read failing), it also mounts read-only, saying "cannot check
+      allocation" rather than suggesting e2fsck. Allocated blocks no inode
+      maps (leaks) are harmless and counted at `debug`. Read-only mounts
+      skip the check. It reads every bitmap and inode table and walks each
+      in-use inode's map and each directory: measured at about 70 ms per
+      mount on both Alpine images under TCG (#446), with no leaks. Tested
+      by `cargo:lumen-vfs` (`ext4::tests::allocation_*`), the
+      `ktest:lumen_kernel::vfs::ext4::ext4_mount_*` ktests,
+      `ext4_fast_symlink_with_xattr_reads_inline_and_unlinks_safely` and
+      `scenario:test_alpine::test_alpine_allocation_check_has_no_leaks`.
     - Tested by `ktest:lumen_kernel::vfs::ext4::ext4_a_write_error_makes_the_volume_read_only`
       (a fault in `unlink`, `rename` and `rmdir`, then every write-type
       operation `EROFS`, reads working, the device's bytes unchanged

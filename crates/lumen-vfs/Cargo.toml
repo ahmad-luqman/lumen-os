@@ -13,3 +13,4 @@ workspace = true
 # this crate.
 [dev-dependencies]
 ext4plus.workspace = true
+miniz_oxide.workspace = true

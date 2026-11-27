@@ -983,3 +983,24 @@ esac
 
     assert debugfs_names(disk, "/d3-vim") == {"note.txt"}
     assert debugfs(disk, "cat /d3-vim/note.txt") == "first line\nsecond line\nthird line from vim\n"
+
+
+@pytest.mark.parametrize("dev_image", [False, True], ids=["rootfs", "dev"])
+def test_alpine_allocation_check_has_no_leaks(boot, tmp_path, dev_image, record_property):
+    """Both shipped roots pass the writable mount check with no leaked blocks."""
+    disk = copy_dev_rootfs(tmp_path) if dev_image else copy_rootfs(tmp_path)
+    m = boot(
+        "qemutest",
+        cmdline="lumen.log=debug",
+        memory="512M",
+        devices=Devices(blk_image=disk, rng=True),
+    )
+    report = m.expect(
+        r"DEBUG vfs: ext4 on DevId\(1\): allocation check: (\d+) us, 0 leaked blocks", BOOT_TIMEOUT
+    )
+    record_property("allocation_check_us", int(report[1]))
+    m.expect(PROMPT, BOOT_TIMEOUT)
+    mounts = run(m, "mount")
+    assert re.search(r"^\s*/\s+ext4\s+\S+\s+rw\s+", mounts, re.MULTILINE), mounts
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
