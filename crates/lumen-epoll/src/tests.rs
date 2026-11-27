@@ -45,16 +45,17 @@ impl<T> Pair<T> {
 
     fn add(&mut self, k: Key, events: u32, data: u64, payload: T) -> Result<Handle, Errno> {
         let added = self.set.add(k, events, data, payload)?;
-        let old = added.growth.map(|s| self.rq.install(s));
-        self.rq.set_mask(added.handle, added.watch_mask, true);
+        let h = added.handle();
+        let old = self.rq.activate(&mut self.set, added);
         drop(old);
-        Ok(added.handle)
+        Ok(h)
     }
 
     fn modify(&mut self, k: Key, events: u32, data: u64) -> Result<Handle, Errno> {
         let modified = self.set.modify(k, events, data)?;
-        self.rq.set_mask(modified.handle, modified.watch_mask, true);
-        Ok(modified.handle)
+        let h = modified.handle();
+        self.rq.apply(modified);
+        Ok(h)
     }
 
     fn remove(&mut self, k: Key) -> Result<(Handle, T), Errno> {
@@ -63,16 +64,15 @@ impl<T> Pair<T> {
         Ok((h, payload))
     }
 
-    /// Run a complete two-phase scan with an optional hook executed between
-    /// `begin_scan` and `finish_scan` (after polling, simulating concurrent
-    /// wakes while the spinlock is dropped).
+    /// Run a complete two-phase scan sizing the buffer from `set.len()`, with
+    /// an optional hook between `begin_scan` and `finish_scan`.
     fn scan_with(
         &mut self,
         max: usize,
         mut poll: impl FnMut(Key, &T) -> u32,
         mid_scan: impl FnOnce(&mut ReadyQueue),
-    ) -> Vec<Event> {
-        let mut hbuf = vec![Handle::new(0, 0); self.rq.ready_len().max(1)];
+    ) -> (Vec<Event>, ScanDone) {
+        let mut hbuf = vec![Handle::INVALID; self.set.len()];
         let scan = self.rq.begin_scan(&mut hbuf);
         let mut polled = Vec::with_capacity(scan.len());
         for &h in scan.handles() {
@@ -81,13 +81,14 @@ impl<T> Pair<T> {
         }
         mid_scan(&mut self.rq);
         let mut out = Vec::new();
-        let n = self.rq.finish_scan(&self.set, scan, &polled, max, &mut out);
-        assert_eq!(n, out.len());
-        out
+        let done = self.rq.finish_scan(&self.set, scan, &polled, max, &mut out);
+        assert_eq!(done.reported, out.len());
+        assert_eq!(done.has_ready, self.rq.has_ready());
+        (out, done)
     }
 
     fn scan(&mut self, max: usize, poll: impl FnMut(Key, &T) -> u32) -> Vec<Event> {
-        self.scan_with(max, poll, |_| {})
+        self.scan_with(max, poll, |_| {}).0
     }
 
     fn assert_invariants(&self) {
@@ -179,8 +180,7 @@ fn eexist_enoent_and_einval_cases() {
     assert_eq!(p.modify(key(99, 99), EPOLLIN | EPOLLEXCLUSIVE, 1), Err(Errno::Inval));
     assert_eq!(p.modify(k1, EPOLLIN | EPOLLEXCLUSIVE, 1), Err(Errno::Inval));
 
-    // Modifying an existing EPOLLEXCLUSIVE interest returns EINVAL
-    // (Linux `fs/eventpoll.c` `do_epoll_ctl`: `if (epi->event.events & EPOLLEXCLUSIVE) error = -EINVAL`).
+    // Modifying an existing EPOLLEXCLUSIVE interest returns EINVAL.
     assert_eq!(p.modify(k2, EPOLLIN, 43), Err(Errno::Inval));
     assert_eq!(p.modify(k3, EPOLLOUT | EPOLLET, 44), Err(Errno::Inval));
 
@@ -199,8 +199,7 @@ fn err_and_hup_always_reported_and_wakeup_ignored() {
     let k_empty = key(1, 0);
     let k_wakeup = key(2, 1);
 
-    // Interest with events == 0 still monitors EPOLLERR and EPOLLHUP
-    // (Linux `fs/eventpoll.c` `do_epoll_ctl`: `epds->events |= EPOLLERR | EPOLLHUP`).
+    // Interest with events == 0 still monitors EPOLLERR and EPOLLHUP.
     let h_empty = p.add(k_empty, 0, 100, 1).unwrap();
     assert_eq!(p.rq.wake(h_empty, EPOLLIN | EPOLLOUT), Wake::Filtered);
     assert!(!p.rq.has_ready());
@@ -233,84 +232,76 @@ fn lt_requeue_fairness_round_robin() {
     }
 
     // max == 0: reports nothing, preserves exact ready-list order.
-    let out = p.scan(0, |_, _| EPOLLIN);
+    let (out, done) = p.scan_with(0, |_, _| EPOLLIN, |_| {});
     assert!(out.is_empty());
+    assert!(done.has_ready);
     assert_eq!(p.rq.ready_len(), 5);
 
     // Round-robin with max = 2 across 6 calls:
     // [0,1], [2,3], [4,0], [1,2], [3,4], [0,1].
     let expected_batches: &[&[u64]] = &[&[0, 1], &[2, 3], &[4, 0], &[1, 2], &[3, 4], &[0, 1]];
     for &expected in expected_batches {
-        let out = p.scan(2, |_, _| EPOLLIN);
+        let (out, done) = p.scan_with(2, |_, _| EPOLLIN, |_| {});
+        assert!(done.has_ready);
         let got: Vec<u64> = out.iter().map(|e| e.data).collect();
         assert_eq!(got, expected);
         p.assert_invariants();
     }
 
-    // Large max reports each ready LT item exactly once per scan.
+    // Large max reports each ready LT item exactly once per scan (no LT duplicates).
     let out = p.scan(100, |_, _| EPOLLIN);
     let got: Vec<u64> = out.iter().map(|e| e.data).collect();
     assert_eq!(got, vec![2, 3, 4, 0, 1]);
 
-    // When an LT item becomes unready (poll returns 0), it is dropped from the
-    // ready list without starving remaining items.
-    let out = p.scan(2, |k, _| if k.1 == 2 || k.1 == 3 { 0 } else { EPOLLIN });
-    let got: Vec<u64> = out.iter().map(|e| e.data).collect();
-    assert_eq!(got, vec![4, 0]);
-    assert_eq!(p.rq.ready_len(), 3); // [1, 4, 0]
+    // Stale entry ahead of ready entry in a full-list scan with max = 1 still
+    // skips the stale entry and reports the ready entry (no missed fd).
+    let out = p.scan(1, |k, _| if k.1 == 2 { 0 } else { EPOLLIN });
+    assert_eq!(out.iter().map(|e| e.data).collect::<Vec<_>>(), vec![3]);
+    assert_eq!(p.rq.ready_len(), 4); // [4, 0, 1, 3]
 
-    let out = p.scan(1, |_, _| EPOLLIN);
-    assert_eq!(out.iter().map(|e| e.data).collect::<Vec<_>>(), vec![1]);
+    // When multiple LT items become unready, remaining items stay fair.
+    let out = p.scan(2, |k, _| if k.1 == 4 { 0 } else { EPOLLIN });
+    assert_eq!(out.iter().map(|e| e.data).collect::<Vec<_>>(), vec![0, 1]);
+    assert_eq!(p.rq.ready_len(), 3); // [3, 0, 1]
     p.assert_invariants();
 }
 
 #[test]
 fn et_reported_once_per_wake() {
-    // Linux `fs/eventpoll.c` `ep_send_events`: items with EPOLLET are not
-    // re-added to `rdllist` after reporting; only a subsequent wake queues
-    // them again.
     let mut p = Pair::<u32>::new();
     let h = p.add(key(10, 3), EPOLLIN | EPOLLET, 77, 1).unwrap();
 
-    // Not woken yet: scan reports nothing even if poll would return EPOLLIN.
     assert!(p.scan(4, |_, _| EPOLLIN).is_empty());
-
-    // Non-matching wake does not queue.
     assert_eq!(p.rq.wake(h, EPOLLOUT), Wake::Filtered);
     assert!(!p.rq.has_ready());
 
-    // Duplicate wakes before scan collapse to one entry.
     assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Queued);
+    assert!(Wake::Queued.should_notify());
     assert_eq!(p.rq.wake(h, EPOLLIN), Wake::AlreadyQueued);
+    assert!(!Wake::AlreadyQueued.should_notify());
     assert_eq!(p.rq.ready_len(), 1);
 
-    // Reported once, then dropped from ready list.
-    let out = p.scan(4, |_, _| EPOLLIN);
+    let (out, done) = p.scan_with(4, |_, _| EPOLLIN, |_| {});
     assert_eq!(out, vec![Event { handle: h, events: EPOLLIN, data: 77 }]);
+    assert!(!done.has_ready);
     assert!(!p.rq.has_ready());
 
-    // Next scan reports nothing even though the underlying resource is still ready.
     assert!(p.scan(4, |_, _| EPOLLIN).is_empty());
 
-    // Another matching wake triggers exactly one more report.
     assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Queued);
     let out = p.scan(4, |_, _| EPOLLIN);
     assert_eq!(out, vec![Event { handle: h, events: EPOLLIN, data: 77 }]);
     assert!(!p.rq.has_ready());
 
-    // Spurious wake where poll returns 0 reports nothing and drops from ready list.
     assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Queued);
-    assert!(p.scan(4, |_, _| 0).is_empty());
-    assert!(!p.rq.has_ready());
+    let (out, done) = p.scan_with(4, |_, _| 0, |_| {});
+    assert!(out.is_empty());
+    assert!(!done.has_ready);
     p.assert_invariants();
 }
 
 #[test]
 fn oneshot_disarm_and_rearm_by_modify() {
-    // Linux `fs/eventpoll.c` `ep_send_events` and `ep_poll_callback`:
-    // reporting an EPOLLONESHOT item disarms it (suppressing even EPOLLERR and
-    // EPOLLHUP) until `EPOLL_CTL_MOD` re-arms it, and B5 must poll + `wake`
-    // after `modify` for an already-ready descriptor to be queued.
     let mut p = Pair::<u32>::new();
     let k = key(20, 5);
     let k_other = key(21, 6);
@@ -325,8 +316,9 @@ fn oneshot_disarm_and_rearm_by_modify() {
     // reports only `k_other` and leaves `k` armed and queued at the front.
     assert_eq!(p.rq.wake(h_other, EPOLLIN), Wake::Queued);
     assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Queued);
-    let out = p.scan(1, |_, _| EPOLLIN);
+    let (out, done) = p.scan_with(1, |_, _| EPOLLIN, |_| {});
     assert_eq!(out, vec![Event { handle: h_other, events: EPOLLIN, data: 222 }]);
+    assert!(done.has_ready);
     assert_eq!(p.rq.ready_len(), 2); // [k, k_other]
 
     // Next scan visits `k`, reports it, and disarms it.
@@ -361,58 +353,189 @@ fn oneshot_disarm_and_rearm_by_modify() {
 }
 
 #[test]
-fn wakes_between_begin_scan_and_finish_scan() {
+fn post_scan_order_matches_linux_ep_done_scan() {
+    // Pins Linux `fs/eventpoll.c` `ep_done_scan` ordering:
+    // 1. unvisited remainder spliced at the very front,
+    // 2. entries woken mid-scan placed at the head (ahead of LT requeues),
+    // 3. LT requeues at the tail.
     let mut p = Pair::<u32>::new();
-    let h_et = p.add(key(1, 1), EPOLLIN | EPOLLET, 1, 1).unwrap();
+    let h_lt = p.add(key(1, 1), EPOLLIN, 1, 1).unwrap();
     let h_zero = p.add(key(2, 2), EPOLLIN | EPOLLET, 2, 2).unwrap();
-    let h_os = p.add(key(3, 3), EPOLLIN | EPOLLONESHOT, 3, 3).unwrap();
-    let h_unvisited = p.add(key(4, 4), EPOLLIN, 4, 4).unwrap();
-    let h_outside = p.add(key(5, 5), EPOLLIN | EPOLLET, 5, 5).unwrap();
+    let h_et = p.add(key(3, 3), EPOLLIN | EPOLLET, 3, 3).unwrap();
+    let h_os = p.add(key(4, 4), EPOLLIN | EPOLLONESHOT, 4, 4).unwrap();
+    let h_unvisited = p.add(key(5, 5), EPOLLIN, 5, 5).unwrap();
+    let h_outside = p.add(key(6, 6), EPOLLIN | EPOLLET, 6, 6).unwrap();
 
-    // Queue [h_et, h_zero, h_os, h_unvisited].
-    for h in [h_et, h_zero, h_os, h_unvisited] {
+    // Initial ready list: [h_lt, h_zero, h_et, h_os, h_unvisited].
+    for h in [h_lt, h_zero, h_et, h_os, h_unvisited] {
         assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Queued);
     }
 
-    // Run a scan with max = 2:
-    // - h_et reports EPOLLIN, AND gets woken mid-scan -> must be requeued!
-    // - h_zero polls as 0, AND gets woken mid-scan -> must be requeued!
-    // - h_os reports EPOLLIN (hitting max = 2), AND gets woken mid-scan -> STILL disarmed!
-    // - h_unvisited is not visited (max = 2 reached), AND gets woken mid-scan -> spliced once to front!
-    // - h_outside was not in the scan, gets woken mid-scan -> Wake::Queued onto ready list!
-    let out = p.scan_with(
-        2,
+    // Scan with max = 3:
+    // - h_lt: reported (#1), LT -> tail requeue;
+    // - h_zero: polled 0, woken mid-scan -> head (woken_requeue);
+    // - h_et: reported (#2), ET, woken mid-scan -> head (woken_requeue);
+    // - h_os: reported (#3 == max), ONESHOT, woken mid-scan -> STILL disarmed;
+    // - h_unvisited: unvisited -> spliced in front of mid-scan wakes;
+    // - h_outside: not in scan, woken mid-scan -> Wake::Queued, ahead of LT tail.
+    let (out, done) = p.scan_with(
+        3,
         |k, _| if k.1 == 2 { 0 } else { EPOLLIN },
         |rq| {
-            // Entries inside the scan stay logically queued -> Wake::AlreadyQueued.
-            assert_eq!(rq.wake(h_et, EPOLLIN), Wake::AlreadyQueued);
-            assert_eq!(rq.wake(h_zero, EPOLLIN), Wake::AlreadyQueued);
-            assert_eq!(rq.wake(h_os, EPOLLIN), Wake::AlreadyQueued);
-            assert_eq!(rq.wake(h_unvisited, EPOLLIN), Wake::AlreadyQueued);
+            // Mid-scan wake on entries in the scan returns Wake::DuringScan (notify like Queued).
+            assert_eq!(rq.wake(h_zero, EPOLLIN), Wake::DuringScan);
+            assert!(Wake::DuringScan.should_notify());
+            assert_eq!(rq.wake(h_et, EPOLLIN), Wake::DuringScan);
+            assert_eq!(rq.wake(h_os, EPOLLIN), Wake::DuringScan);
+            assert_eq!(rq.wake(h_unvisited, EPOLLIN), Wake::DuringScan);
             // Non-matching mask mid-scan is still filtered.
             assert_eq!(rq.wake(h_et, EPOLLOUT), Wake::Filtered);
-            // Entry outside the scan enters `ready` immediately -> Wake::Queued.
+            // Entry outside scan enters `ready` immediately -> Wake::Queued.
             assert_eq!(rq.wake(h_outside, EPOLLIN), Wake::Queued);
             assert_eq!(rq.wake(h_outside, EPOLLIN), Wake::AlreadyQueued);
         },
     );
-    assert_eq!(
-        out,
-        vec![Event { handle: h_et, events: EPOLLIN, data: 1 }, Event { handle: h_os, events: EPOLLIN, data: 3 }]
-    );
-
-    // Expected ready queue order after finish_scan:
-    // - unvisited remainder [h_unvisited] spliced to FRONT,
-    // - then [h_outside] (woken into ready during scan),
-    // - then [h_et, h_zero] (requeued at tail due to woke_during_scan),
-    // - h_os is DISARMED and NOT queued.
+    assert!(done.has_ready);
+    assert_eq!(out.iter().map(|e| e.data).collect::<Vec<_>>(), vec![1, 3, 4]);
     assert_eq!(p.rq.wake(h_os, EPOLLIN), Wake::Filtered);
+
+    // Exact resulting order:
+    // [h_unvisited (5), h_zero (2), h_et (3), h_outside (6), h_lt (1)].
     let next = p.scan(10, |_, _| EPOLLIN);
-    let ids: Vec<u64> = next.iter().map(|e| e.data).collect();
-    assert_eq!(ids, vec![4, 5, 1, 2]);
-    // After that scan: h_unvisited (LT) stays queued; ET entries [5, 1, 2] were dropped.
-    assert_eq!(p.rq.ready_len(), 1);
+    assert_eq!(next.iter().map(|e| e.data).collect::<Vec<_>>(), vec![5, 2, 3, 6, 1]);
     p.assert_invariants();
+}
+
+#[test]
+fn two_waiters_events_available_and_scan_done_wakeup() {
+    // Reproduces the two-waiter lost-wakeup scenario:
+    // 1. Waiter 1 starts a scan, detaching [h1, h2]. `has_ready()` becomes false,
+    //    but `events_available()` stays true so Waiter 2 will not sleep while
+    //    events are in transit.
+    // 2. Waiter 1 finishes with max = 1: `ScanDone.has_ready` is true, telling
+    //    Waiter 1 to wake `ep->wq` so Waiter 2 wakes and collects h2.
+    let mut p = Pair::<u32>::new();
+    let h1 = p.add(key(1, 1), EPOLLIN | EPOLLET, 10, 1).unwrap();
+    let h2 = p.add(key(2, 2), EPOLLIN | EPOLLET, 20, 2).unwrap();
+    assert!(!p.rq.events_available());
+
+    assert_eq!(p.rq.wake(h1, EPOLLIN), Wake::Queued);
+    assert_eq!(p.rq.wake(h2, EPOLLIN), Wake::Queued);
+    assert!(p.rq.events_available());
+
+    let mut hbuf = vec![Handle::INVALID; p.set.len()];
+    let scan = p.rq.begin_scan(&mut hbuf);
+    assert!(!p.rq.has_ready());
+    assert!(p.rq.events_available(), "waiter 2 must see active scan as events_available()");
+
+    // Waiter 1 finishes with max = 1 (taking only h1), leaving h2 queued.
+    let mut out1 = Vec::new();
+    let done1 = p.rq.finish_scan(&p.set, scan, &[EPOLLIN, EPOLLIN], 1, &mut out1);
+    assert_eq!(done1, ScanDone { reported: 1, has_ready: true });
+    assert_eq!(out1, vec![Event { handle: h1, events: EPOLLIN, data: 10 }]);
+    assert!(p.rq.events_available());
+
+    // Woken by `done1.has_ready`, Waiter 2 scans and receives h2.
+    let (out2, done2) = p.scan_with(1, |_, _| EPOLLIN, |_| {});
+    assert_eq!(done2, ScanDone { reported: 1, has_ready: false });
+    assert_eq!(out2, vec![Event { handle: h2, events: EPOLLIN, data: 20 }]);
+    assert!(!p.rq.events_available());
+    p.assert_invariants();
+}
+
+#[test]
+#[should_panic(expected = "shorter than ready_len")]
+fn begin_scan_refuses_short_buffer() {
+    let mut p = Pair::<u32>::new();
+    let h1 = p.add(key(1, 1), EPOLLIN, 1, 1).unwrap();
+    let h2 = p.add(key(2, 2), EPOLLIN, 2, 2).unwrap();
+    assert_eq!(p.rq.wake(h1, EPOLLIN), Wake::Queued);
+    assert_eq!(p.rq.wake(h2, EPOLLIN), Wake::Queued);
+    let mut too_short = [Handle::INVALID; 1];
+    let _scan = p.rq.begin_scan(&mut too_short);
+}
+
+#[test]
+#[should_panic(expected = "Scan dropped")]
+fn dropping_unfinished_scan_panics() {
+    let mut p = Pair::<u32>::new();
+    let h1 = p.add(key(1, 1), EPOLLIN, 1, 1).unwrap();
+    assert_eq!(p.rq.wake(h1, EPOLLIN), Wake::Queued);
+    let mut buf = [Handle::INVALID; 1];
+    let _scan = p.rq.begin_scan(&mut buf);
+}
+
+#[test]
+fn abort_scan_restores_batch_to_front_and_signals_ready() {
+    let mut p = Pair::<u32>::new();
+    let h1 = p.add(key(1, 1), EPOLLIN | EPOLLONESHOT, 10, 1).unwrap();
+    let h2 = p.add(key(2, 2), EPOLLIN | EPOLLET, 20, 2).unwrap();
+    let h3 = p.add(key(3, 3), EPOLLIN, 30, 3).unwrap();
+    assert_eq!(p.rq.wake(h1, EPOLLIN), Wake::Queued);
+    assert_eq!(p.rq.wake(h2, EPOLLIN), Wake::Queued);
+
+    let mut buf = [Handle::INVALID; 3];
+    let scan = p.rq.begin_scan(&mut buf);
+    assert_eq!(p.rq.wake(h3, EPOLLIN), Wake::Queued);
+    assert!(p.rq.abort_scan(scan));
+    assert_eq!(p.rq.ready_len(), 3);
+
+    // Order is [h1, h2, h3]; h1 still armed and h2 still queued.
+    let out = p.scan(10, |_, _| EPOLLIN);
+    assert_eq!(out.iter().map(|e| e.data).collect::<Vec<_>>(), vec![10, 20, 30]);
+    p.assert_invariants();
+}
+
+#[test]
+fn set_is_authority_on_forgotten_unlink_and_dropped_added() {
+    // Reproduces scratch_r2's `partial_remove_range_drop_leaks_rq_slot_and_kills_next_interest`
+    // for both unqueued and queued un-unlinked entries, plus a dropped `Added`.
+    let mut set = EpollSet::<Key, u32>::new();
+    let mut rq = ReadyQueue::new();
+
+    // 1. Dropped `Added` before any `activate` must NOT desync confirmed ready_capacity!
+    let dropped_first = set.add(key(0, 0), EPOLLIN, 0, 0).unwrap();
+    drop(dropped_first);
+    assert_eq!(rq.capacity(), 0);
+    // Remove slot 0 so the next `add` reuses slot 0 via free_head: must still request growth!
+    let _ = set.remove(key(0, 0)).unwrap();
+    let added = set.add(key(9, 1), EPOLLIN, 1, 1).unwrap();
+    let h1 = added.handle();
+    let old = rq.activate(&mut set, added);
+    drop(old);
+    assert!(rq.capacity() >= 16);
+
+    let added2 = set.add(key(9, 2), EPOLLIN, 2, 2).unwrap();
+    let h2 = added2.handle();
+    drop(rq.activate(&mut set, added2));
+    // Queue h2 so we also exercise taking over a slot with `in_ready == true`!
+    assert_eq!(rq.wake(h2, EPOLLIN), Wake::Queued);
+
+    // Partially consume RemoveRange and drop it without unlinking (9, 2).
+    {
+        let mut it = set.remove_range((9, 0)..=(9, u32::MAX));
+        let first = it.next().unwrap();
+        assert_eq!(first.1, h1);
+        rq.unlink(first.1);
+    }
+    // (9, 2) was removed from `set` but never unlinked from `rq` (still in_ready!).
+    assert_eq!(rq.ready_len(), 1);
+
+    // Next add reuses (9, 2)'s slot: `activate` takes over and unlinks the stale occupant!
+    let added3 = set.add(key(5, 5), EPOLLIN, 55, 5).unwrap();
+    let h3 = added3.handle();
+    assert_eq!(h3.index(), h2.index());
+    drop(rq.activate(&mut set, added3));
+    assert_eq!(rq.ready_len(), 0);
+    assert_eq!(rq.wake(h2, EPOLLIN), Wake::Stale);
+    assert_eq!(rq.wake(h3, EPOLLIN), Wake::Queued);
+
+    // `apply` also takes over if `activate` had been skipped on an older slot.
+    let m = set.modify(key(5, 5), EPOLLOUT, 56).unwrap();
+    rq.apply(m);
+    assert_eq!(rq.wake(h3, EPOLLOUT), Wake::AlreadyQueued);
+    set.assert_invariants();
+    rq.assert_invariants();
 }
 
 #[test]
@@ -427,38 +550,29 @@ fn stale_handles_rejected_after_remove_and_slot_reuse() {
     assert_eq!(removed_h, h_old);
     assert_eq!(payload, 101);
 
-    // After remove, old handle is stale everywhere.
-    assert_eq!(p.rq.wake(h_old, EPOLLIN | EPOLLERR), Wake::Stale);
-    assert!(p.set.get(h_old).is_none());
-    assert!(p.set.payload_mut(h_old).is_none());
-    p.rq.unlink(h_old); // no-op
-    p.rq.unreport([h_old]); // no-op
-    assert!(!p.rq.has_ready());
+    // After remove, old handle and Handle::INVALID are stale everywhere.
+    for stale in [h_old, Handle::INVALID, Handle::new(9999, 1)] {
+        assert_eq!(p.rq.wake(stale, EPOLLIN | EPOLLERR), Wake::Stale);
+        assert!(p.set.get(stale).is_none());
+        assert!(p.set.payload_mut(stale).is_none());
+        p.rq.unlink(stale);
+        assert!(!p.rq.unreport([stale]));
+    }
 
     // Adding a new key reuses the same slot index with a bumped generation.
     let h_new = p.add(key(2, 2), EPOLLIN, 20, 200).unwrap();
     assert_eq!(h_new.index(), h_old.index());
     assert_ne!(h_new.generation(), h_old.generation());
 
-    // Old handle is STILL rejected and cannot perturb the new occupant!
+    // Old handle is still rejected and cannot perturb the new occupant.
     assert_eq!(p.rq.wake(h_old, EPOLLIN), Wake::Stale);
     assert!(p.set.get(h_old).is_none());
-    assert!(p.set.payload_mut(h_old).is_none());
     p.rq.unlink(h_old);
-    p.rq.unreport([h_old]);
-    assert!(!p.rq.has_ready());
+    assert!(!p.rq.unreport([h_old]));
 
-    // New handle works normally.
     assert_eq!(p.rq.wake(h_new, EPOLLIN), Wake::Queued);
     let out = p.scan(4, |_, _| EPOLLIN);
     assert_eq!(out, vec![Event { handle: h_new, events: EPOLLIN, data: 20 }]);
-
-    // Out-of-bounds handle is also rejected.
-    let oob = Handle::new(9999, 1);
-    assert_eq!(p.rq.wake(oob, EPOLLIN), Wake::Stale);
-    assert!(p.set.get(oob).is_none());
-    p.rq.unlink(oob);
-    p.rq.unreport([oob]);
     p.assert_invariants();
 }
 
@@ -468,29 +582,25 @@ fn growth_via_prepare_grow_and_install_preserves_state_and_handles_nomem() {
     let mut rq = ReadyQueue::new();
     assert_eq!(rq.capacity(), 0);
 
-    // prepare_grow rejects impossible sizes cleanly with Errno::NoMem.
     assert_eq!(ReadyQueue::prepare_grow(usize::MAX).unwrap_err(), Errno::NoMem);
     assert_eq!(ReadyQueue::prepare_grow((u32::MAX as usize) + 1).unwrap_err(), Errno::NoMem);
 
-    // Add 40 interests (crossing initial 16 -> 32 -> 64 capacity boundaries),
-    // queueing half of them BEFORE each growth to verify links and flags survive.
-    let mut handles = Vec::new();
+    // Add 40 interests (crossing 0 -> 16 -> 32 -> 64 capacity boundaries),
+    // queueing half before each growth to verify links and flags survive.
     let mut growth_count = 0usize;
     for i in 0..40u32 {
         let added = set.add(key(u64::from(i), i), EPOLLIN, u64::from(i), i).unwrap();
-        if let Some(storage) = added.growth {
+        let h = added.handle();
+        let old_cap = rq.capacity();
+        if let Some(old) = rq.activate(&mut set, added) {
             growth_count += 1;
-            let old_cap = rq.capacity();
-            let old = rq.install(storage);
             assert_eq!(old.capacity(), old_cap);
             assert!(rq.capacity() > old_cap);
             drop(old);
         }
-        rq.set_mask(added.handle, added.watch_mask, true);
         if i % 2 == 0 {
-            assert_eq!(rq.wake(added.handle, EPOLLIN), Wake::Queued);
+            assert_eq!(rq.wake(h, EPOLLIN), Wake::Queued);
         }
-        handles.push(added.handle);
     }
     assert!(growth_count >= 3, "expected multiple ReadyQueue growths, got {growth_count}");
     assert_eq!(rq.ready_len(), 20);
@@ -502,13 +612,12 @@ fn growth_via_prepare_grow_and_install_preserves_state_and_handles_nomem() {
     assert_eq!(returned.capacity(), 4);
     assert_eq!(rq.capacity(), cap_before);
 
-    // Every queued entry survived all growths in exact FIFO order.
-    let mut hbuf = vec![Handle::new(0, 0); 40];
+    let mut hbuf = vec![Handle::INVALID; set.len()];
     let scan = rq.begin_scan(&mut hbuf);
     let polled = vec![EPOLLIN; scan.len()];
     let mut out = Vec::new();
-    let n = rq.finish_scan(&set, scan, &polled, 40, &mut out);
-    assert_eq!(n, 20);
+    let done = rq.finish_scan(&set, scan, &polled, 40, &mut out);
+    assert_eq!(done, ScanDone { reported: 20, has_ready: true });
     let expected: Vec<u64> = (0..40u64).step_by(2).collect();
     assert_eq!(out.iter().map(|e| e.data).collect::<Vec<_>>(), expected);
     set.assert_invariants();
@@ -517,9 +626,6 @@ fn growth_via_prepare_grow_and_install_preserves_state_and_handles_nomem() {
 
 #[test]
 fn unreport_on_copy_out_failure_loses_no_oneshot_or_et() {
-    // Linux `fs/eventpoll.c` `ep_send_events` `-EFAULT` path: rolling back the
-    // uncopied tail re-arms EPOLLONESHOT and requeues ET/ONESHOT/LT at the front
-    // in their original order.
     let mut p = Pair::<u32>::new();
     let h_lt0 = p.add(key(1, 1), EPOLLIN, 10, 1).unwrap();
     let h_os = p.add(key(2, 2), EPOLLIN | EPOLLONESHOT, 20, 2).unwrap();
@@ -531,39 +637,45 @@ fn unreport_on_copy_out_failure_loses_no_oneshot_or_et() {
         assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Queued);
     }
 
-    // Collect 4 events: [h_lt0, h_os, h_et, h_lt1], leaving h_unvisited at front.
     let events = p.scan(4, |_, _| EPOLLIN);
     assert_eq!(events.iter().map(|e| e.data).collect::<Vec<_>>(), vec![10, 20, 30, 40]);
-    // At this point: h_os is disarmed, h_et is unqueued, ready = [h_unvisited, h_lt0, h_lt1].
     assert_eq!(p.rq.wake(h_os, EPOLLIN), Wake::Filtered);
 
-    // Simulate copy_to_user succeeding on events[0] (h_lt0) and faulting on events[1] (h_os).
-    // B5 rolls back the uncopied tail events[1..] = [h_os, h_et, h_lt1].
-    p.rq.unreport(events[1..].iter().map(|e| e.handle));
+    // Partial copy fault at index 1: roll back [h_os, h_et, h_lt1].
+    assert!(p.rq.unreport(events[1..].iter().map(|e| e.handle)));
 
-    // Next scan must deliver [h_os, h_et, h_lt1, h_unvisited, h_lt0] in that exact order!
     let retry = p.scan(10, |_, _| EPOLLIN);
     assert_eq!(retry.iter().map(|e| e.data).collect::<Vec<_>>(), vec![20, 30, 40, 50, 10]);
-
-    // And now h_os is disarmed again after actually being delivered.
     assert_eq!(p.rq.wake(h_os, EPOLLIN), Wake::Filtered);
 
-    // Full rollback at index 0 (EFAULT on very first event) also works for ONESHOT + ET.
+    // Full rollback at index 0 (-EFAULT).
     p.modify(key(2, 2), EPOLLIN | EPOLLONESHOT, 21).unwrap();
     assert_eq!(p.rq.wake(h_os, EPOLLIN), Wake::Queued);
     assert_eq!(p.rq.wake(h_et, EPOLLIN), Wake::Queued);
     let batch = p.scan(10, |k, _| if k.1 == 2 || k.1 == 3 { EPOLLIN } else { 0 });
     assert_eq!(batch.iter().map(|e| e.data).collect::<Vec<_>>(), vec![21, 30]);
-    p.rq.unreport(batch.iter().map(|e| e.handle));
+    assert!(p.rq.unreport(batch.iter().map(|e| e.handle)));
     let retry2 = p.scan(10, |_, _| EPOLLIN);
     assert_eq!(retry2.iter().map(|e| e.data).collect::<Vec<_>>(), vec![21, 30]);
     p.assert_invariants();
 }
 
 #[test]
+#[should_panic(expected = "unreport called while handle is in an active scan")]
+fn unreport_panics_if_handle_is_in_active_scan() {
+    let mut p = Pair::<u32>::new();
+    let h = p.add(key(1, 1), EPOLLIN, 10, 1).unwrap();
+    assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Queued);
+    let mut buf = [Handle::INVALID; 1];
+    let scan = p.rq.begin_scan(&mut buf);
+    // Abort on unwind not needed; we intentionally panic inside `unreport` before drop.
+    // Mark `scan` finished via abort only if unreport didn't panic (it must panic).
+    let _ = p.rq.unreport([h]);
+    let _ = p.rq.abort_scan(scan);
+}
+
+#[test]
 fn nested_epoll_peek_drained_and_ready_pipes() {
-    // Models Linux `fs/eventpoll.c` `__ep_eventpoll_poll` / `ep_read_events_proc`:
-    // `outer` watches `inner`; `inner` watches pipes.
     let mut inner = Pair::<u32>::new();
     let mut outer = Pair::<u32>::new();
 
@@ -571,45 +683,49 @@ fn nested_epoll_peek_drained_and_ready_pipes() {
     let h_pipe_os = inner.add(key(2, 11), EPOLLIN | EPOLLONESHOT, 101, 11).unwrap();
     let h_inner_in_outer = outer.add(key(99, 50), EPOLLIN, 999, 50).unwrap();
 
-    // Helper implementing inner epoll's `Pollable::poll` via `begin_scan` + `finish_peek`.
-    let poll_inner = |inner: &mut Pair<u32>, pipe_state: &[u32; 2], mid_peek: &mut dyn FnMut(&mut ReadyQueue)| -> u32 {
-        let mut hbuf = [Handle::new(0, 0); 8];
-        let scan = inner.rq.begin_scan(&mut hbuf);
-        let mut polled = Vec::with_capacity(scan.len());
-        for &h in scan.handles() {
-            let e = inner.set.get(h).unwrap();
-            let idx = (e.key.1 - 10) as usize;
-            let mask = pipe_state[idx];
-            polled.push(mask);
-            if (mask & e.watch_mask()) != 0 {
-                break;
+    // Inner epoll's `Pollable::poll`: sizes buffer from `set.len()`, runs
+    // `begin_scan` + `finish_peek`, and records whether `PeekDone.has_ready`
+    // requested a wake/PollHead notification.
+    let poll_inner =
+        |inner: &mut Pair<u32>, pipe_state: &[u32; 2], mid_peek: &mut dyn FnMut(&mut ReadyQueue)| -> (u32, PeekDone) {
+            let mut hbuf = vec![Handle::INVALID; inner.set.len()];
+            let scan = inner.rq.begin_scan(&mut hbuf);
+            let mut polled = Vec::with_capacity(scan.len());
+            for &h in scan.handles() {
+                let e = inner.set.get(h).unwrap();
+                let idx = (e.key.1 - 10) as usize;
+                let mask = pipe_state[idx];
+                polled.push(mask);
+                if (mask & e.watch_mask()) != 0 {
+                    break;
+                }
             }
-        }
-        mid_peek(&mut inner.rq);
-        if inner.rq.finish_peek(scan, &polled) { EPOLLIN | EPOLLRDNORM } else { 0 }
-    };
+            mid_peek(&mut inner.rq);
+            let done = inner.rq.finish_peek(scan, &polled);
+            (if done.ready { EPOLLIN | EPOLLRDNORM } else { 0 }, done)
+        };
 
-    // Scenario 1 (drained pipe): pipe_os was woken -> inner notified outer -> pipe_os drained before outer polls!
+    // Scenario 1 (drained pipe): outer sees 0, inner prunes drained entry without disarming ONESHOT.
     assert_eq!(inner.rq.wake(h_pipe_os, EPOLLIN), Wake::Queued);
     assert_eq!(outer.rq.wake(h_inner_in_outer, EPOLLIN), Wake::Queued);
     let drained = [0, 0];
-    let outer_events = outer.scan(4, |_, _| poll_inner(&mut inner, &drained, &mut |_| {}));
+    let outer_events = outer.scan(4, |_, _| poll_inner(&mut inner, &drained, &mut |_| {}).0);
     assert!(outer_events.is_empty(), "outer must not spuriously report drained inner pipe");
-    assert!(!inner.rq.has_ready(), "drained entry pruned from inner ready list");
-    // Pruning on revents == 0 must NOT disarm EPOLLONESHOT!
+    assert!(!inner.rq.has_ready());
     assert_eq!(inner.rq.wake(h_pipe_os, EPOLLIN), Wake::Queued);
 
-    // Scenario 2 (ready pipes: ET + ONESHOT): outer polls inner -> sees EPOLLIN;
-    // inner must NOT drop ET or disarm ONESHOT!
+    // Scenario 2 (ready pipes: ET + ONESHOT): outer sees EPOLLIN; inner drops/disarms nothing.
     assert_eq!(inner.rq.wake(h_pipe_et, EPOLLIN), Wake::Queued);
-    // inner ready list is [h_pipe_os, h_pipe_et].
     assert_eq!(outer.rq.wake(h_inner_in_outer, EPOLLIN), Wake::Queued);
     let both_ready = [EPOLLIN, EPOLLIN];
-    let outer_events = outer.scan(4, |_, _| poll_inner(&mut inner, &both_ready, &mut |_| {}));
+    let outer_events = outer.scan(4, |_, _| {
+        let (mask, done) = poll_inner(&mut inner, &both_ready, &mut |_| {});
+        assert_eq!(done, PeekDone { ready: true, has_ready: true });
+        mask
+    });
     assert_eq!(outer_events, vec![Event { handle: h_inner_in_outer, events: EPOLLIN, data: 999 }]);
     assert_eq!(inner.rq.ready_len(), 2);
 
-    // Actual `epoll_wait` on inner still delivers BOTH ONESHOT and ET in exact order!
     let inner_events = inner.scan(4, |_, _| EPOLLIN);
     assert_eq!(
         inner_events,
@@ -619,26 +735,36 @@ fn nested_epoll_peek_drained_and_ready_pipes() {
         ]
     );
 
-    // Scenario 3 (stale-then-ready): first entry is drained, second is ready -> prunes first, keeps second, returns ready.
+    // Scenario 3 (stale-then-ready): prunes stale, stops at ready, returns ready = true.
     inner.modify(key(2, 11), EPOLLIN | EPOLLONESHOT, 102).unwrap();
-    assert_eq!(inner.rq.wake(h_pipe_et, EPOLLIN), Wake::Queued); // idx 0 (drained)
-    assert_eq!(inner.rq.wake(h_pipe_os, EPOLLIN), Wake::Queued); // idx 1 (ready)
+    assert_eq!(inner.rq.wake(h_pipe_et, EPOLLIN), Wake::Queued);
+    assert_eq!(inner.rq.wake(h_pipe_os, EPOLLIN), Wake::Queued);
     let only_os_ready = [0, EPOLLIN];
-    assert_eq!(poll_inner(&mut inner, &only_os_ready, &mut |_| {}), EPOLLIN | EPOLLRDNORM);
+    let (mask, done) = poll_inner(&mut inner, &only_os_ready, &mut |_| {});
+    assert_eq!(mask, EPOLLIN | EPOLLRDNORM);
+    assert_eq!(done, PeekDone { ready: true, has_ready: true });
     assert_eq!(inner.rq.ready_len(), 1);
     let inner_events = inner.scan(4, |_, _| EPOLLIN);
     assert_eq!(inner_events, vec![Event { handle: h_pipe_os, events: EPOLLIN, data: 102 }]);
 
-    // Scenario 4 (mid-peek wake on drained entry): pipe was 0 when polled, then woken before finish_peek -> requeued!
+    // Scenario 4 (mid-peek wake on drained entry): wake returns Wake::DuringScan
+    // (should_notify), and finish_peek returns PeekDone { ready: false, has_ready: true }
+    // so B5 notifies the inner epoll's PollHead and outer epoll does not lose the wakeup!
     assert_eq!(inner.rq.wake(h_pipe_et, EPOLLIN), Wake::Queued);
-    let mut mid_woke = false;
-    let res = poll_inner(&mut inner, &drained, &mut |rq| {
-        assert_eq!(rq.wake(h_pipe_et, EPOLLIN), Wake::AlreadyQueued);
-        mid_woke = true;
+    let mut mid_wake_notified = false;
+    let (mask, done) = poll_inner(&mut inner, &drained, &mut |rq| {
+        let w = rq.wake(h_pipe_et, EPOLLIN);
+        assert_eq!(w, Wake::DuringScan);
+        mid_wake_notified = w.should_notify();
     });
-    assert!(mid_woke);
-    assert_eq!(res, 0);
-    assert!(inner.rq.has_ready(), "mid-peek wake must prevent losing wakeup");
+    assert!(mid_wake_notified, "mid-peek wake must signal notification (Wake::DuringScan)");
+    assert_eq!(mask, 0);
+    assert_eq!(
+        done,
+        PeekDone { ready: false, has_ready: true },
+        "finish_peek must signal has_ready so B5 wakes ep->wq and notifies outer PollHead"
+    );
+    assert!(inner.rq.has_ready());
     inner.assert_invariants();
     outer.assert_invariants();
 }
@@ -646,7 +772,6 @@ fn nested_epoll_peek_drained_and_ready_pipes() {
 #[test]
 fn remove_range_and_drain_return_payloads_and_bump_generations() {
     let mut p = Pair::<u32>::new();
-    // Description 7 registered under fds 3, 5, 9; description 8 under fd 4.
     let h7_3 = p.add(key(7, 3), EPOLLIN, 73, 703).unwrap();
     let h7_5 = p.add(key(7, 5), EPOLLIN, 75, 705).unwrap();
     let h7_9 = p.add(key(7, 9), EPOLLIN, 79, 709).unwrap();
@@ -655,7 +780,6 @@ fn remove_range_and_drain_return_payloads_and_bump_generations() {
         assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Queued);
     }
 
-    // Remove all keys belonging to description 7.
     let removed: Vec<_> = p.set.remove_range((7, 0)..=(7, u32::MAX)).collect();
     assert_eq!(removed.len(), 3);
     assert_eq!(
@@ -672,27 +796,12 @@ fn remove_range_and_drain_return_payloads_and_bump_generations() {
         assert_eq!(p.rq.wake(h, EPOLLIN), Wake::Stale);
     }
 
-    // Dropping a partial RemoveRange still removes the rest of the range.
-    let _ = p.add(key(9, 1), EPOLLIN, 91, 901).unwrap();
-    let _ = p.add(key(9, 2), EPOLLIN, 92, 902).unwrap();
-    {
-        let mut it = p.set.remove_range((9, 0)..=(9, u32::MAX));
-        let first = it.next().unwrap();
-        assert_eq!(first.0, key(9, 1));
-        p.rq.unlink(first.1);
-        // drop `it` without consuming (9, 2)
-    }
-    assert!(!p.set.contains(key(9, 2)));
-    assert_eq!(p.set.len(), 1);
-
-    // `drain()` yields remaining entries, empties set, and bumps generations.
     let drained: Vec<_> = p.set.drain().collect();
     assert_eq!(drained, vec![(key(8, 4), h8_4, 804)]);
     p.rq.unlink(h8_4);
     assert!(p.set.is_empty());
     assert_eq!(p.rq.wake(h8_4, EPOLLIN), Wake::Stale);
 
-    // Re-adding reuses a slot with a bumped generation.
     let h_fresh = p.add(key(8, 4), EPOLLIN, 85, 805).unwrap();
     assert_ne!(h_fresh, h8_4);
     p.assert_invariants();
@@ -703,9 +812,10 @@ fn remove_range_and_drain_return_payloads_and_bump_generations() {
 //
 // NOTE: This reference model uses its own literal bit constants and checks the
 // data-structure implementation (slab reuse, generational handles, intrusive
-// ready list, two-phase scan with interleaved wakes, unreport, peek, growth,
-// remove_range, and drain). The hand-written unit tests above pin the Linux
-// UAPI constants and `fs/eventpoll.c` semantics directly.
+// ready list, full-list two-phase scan with interleaved wakes, ep_done_scan
+// ordering, unreport, peek, abort_scan, growth, remove_range, and drain). The
+// hand-written unit tests above pin the Linux UAPI constants and `fs/eventpoll.c`
+// semantics directly.
 // =============================================================================
 
 const M_IN: u32 = 0x0000_0001;
@@ -799,7 +909,7 @@ impl NaiveEpoll {
         }
         if self.in_scan.contains(&h) {
             self.woke_during_scan.insert(h);
-            return Wake::AlreadyQueued;
+            return Wake::DuringScan;
         }
         if self.ready.contains(&h) {
             return Wake::AlreadyQueued;
@@ -808,22 +918,21 @@ impl NaiveEpoll {
         Wake::Queued
     }
 
-    fn begin_scan(&mut self, cap: usize) -> Vec<Handle> {
-        let mut batch = Vec::new();
-        while batch.len() < cap {
-            let Some(h) = self.ready.pop_front() else {
-                break;
-            };
+    fn begin_scan(&mut self) -> Vec<Handle> {
+        let mut batch = Vec::with_capacity(self.ready.len());
+        while let Some(h) = self.ready.pop_front() {
             self.in_scan.insert(h);
             batch.push(h);
         }
         batch
     }
 
-    fn finish_scan(&mut self, batch: &[Handle], polled: &[u32], max: usize) -> Vec<Event> {
+    fn finish_scan(&mut self, batch: &[Handle], polled: &[u32], max: usize) -> (Vec<Event>, ScanDone) {
         let visit_limit = batch.len().min(polled.len());
         let mut visited = 0usize;
         let mut out = Vec::new();
+        let mut woken_requeue = Vec::new();
+        let mut lt_requeue = Vec::new();
         while visited < visit_limit && out.len() < max {
             let h = batch[visited];
             let ready_bits = polled[visited];
@@ -837,31 +946,41 @@ impl NaiveEpoll {
             let revents = ready_bits & (e.events & !M_PRIVATE);
             if revents == 0 {
                 if woke {
-                    self.ready.push_back(h);
+                    woken_requeue.push(h);
                 }
                 continue;
             }
             out.push(Event { handle: h, events: revents, data: e.data });
             if (e.events & M_ONESHOT) != 0 {
                 e.armed = false;
-            } else if (e.events & M_ET) == 0 || woke {
-                self.ready.push_back(h);
+            } else if (e.events & M_ET) == 0 {
+                lt_requeue.push(h);
+            } else if woke {
+                woken_requeue.push(h);
             }
+        }
+        for h in woken_requeue.into_iter().rev() {
+            self.ready.push_front(h);
+        }
+        for h in lt_requeue {
+            self.ready.push_back(h);
         }
         for &h in batch[visited..].iter().rev() {
             self.in_scan.remove(&h);
             self.woke_during_scan.remove(&h);
-            if self.by_handle.contains_key(&h) && !self.ready.contains(&h) {
+            if self.by_handle.contains_key(&h) {
                 self.ready.push_front(h);
             }
         }
-        out
+        let done = ScanDone { reported: out.len(), has_ready: !self.ready.is_empty() };
+        (out, done)
     }
 
-    fn finish_peek(&mut self, batch: &[Handle], polled: &[u32]) -> bool {
+    fn finish_peek(&mut self, batch: &[Handle], polled: &[u32]) -> PeekDone {
         let visit_limit = batch.len().min(polled.len());
         let mut visited = 0usize;
         let mut found = false;
+        let mut woken_requeue = Vec::new();
         while visited < visit_limit {
             let h = batch[visited];
             let ready_bits = polled[visited];
@@ -877,34 +996,45 @@ impl NaiveEpoll {
             visited += 1;
             self.in_scan.remove(&h);
             let woke = self.woke_during_scan.remove(&h);
-            if woke && !self.ready.contains(&h) {
-                self.ready.push_back(h);
+            if woke {
+                woken_requeue.push(h);
             }
+        }
+        for h in woken_requeue.into_iter().rev() {
+            self.ready.push_front(h);
         }
         for &h in batch[visited..].iter().rev() {
             self.in_scan.remove(&h);
             self.woke_during_scan.remove(&h);
-            if self.by_handle.contains_key(&h) && !self.ready.contains(&h) {
+            if self.by_handle.contains_key(&h) {
                 self.ready.push_front(h);
             }
         }
-        found
+        PeekDone { ready: found, has_ready: !self.ready.is_empty() }
     }
 
-    fn unreport(&mut self, handles: &[Handle]) {
+    fn abort_scan(&mut self, batch: &[Handle]) -> bool {
+        for &h in batch.iter().rev() {
+            self.in_scan.remove(&h);
+            self.woke_during_scan.remove(&h);
+            if self.by_handle.contains_key(&h) {
+                self.ready.push_front(h);
+            }
+        }
+        !self.ready.is_empty()
+    }
+
+    fn unreport(&mut self, handles: &[Handle]) -> bool {
         for &h in handles.iter().rev() {
             let Some(&key) = self.by_handle.get(&h) else {
                 continue;
             };
             let e = self.by_key.get_mut(&key).unwrap();
             e.armed = true;
-            if self.in_scan.contains(&h) {
-                self.woke_during_scan.insert(h);
-                continue;
-            }
             self.ready.retain(|&x| x != h);
             self.ready.push_front(h);
         }
+        !self.ready.is_empty()
     }
 }
 
@@ -948,7 +1078,7 @@ fn randomized_model_matches_naive_epoll() {
         for step in 0..1200usize {
             let idx = rng.below(live_state.len());
             let k = key((idx / 3) as u64, idx as u32);
-            match rng.below(14) {
+            match rng.below(15) {
                 0..=2 => {
                     let ev = random_events(&mut rng);
                     let data = rng.next_u64();
@@ -974,7 +1104,6 @@ fn randomized_model_matches_naive_epoll() {
                     assert_eq!(res_p, res_m, "seed={seed} step={step} remove");
                 }
                 6..=8 => {
-                    // Wake either a live key's handle or a possibly-stale historical handle.
                     let ready = random_ready(&mut rng);
                     live_state[idx] = ready;
                     let h = if rng.below(4) == 0 && !known_handles.is_empty() {
@@ -982,21 +1111,20 @@ fn randomized_model_matches_naive_epoll() {
                     } else if let Some(h) = p.set.lookup(k) {
                         h
                     } else {
-                        Handle::new(idx as u32, 999)
+                        Handle::INVALID
                     };
                     assert_eq!(p.rq.wake(h, ready), model.wake(h, ready), "seed={seed} step={step} wake");
                 }
                 9..=11 => {
-                    // Two-phase scan with interleaved mid-scan wakes and optional copy-out unreport!
                     if rng.below(3) == 0 {
                         let flip = rng.below(live_state.len());
                         live_state[flip] = random_ready(&mut rng);
                     }
-                    let buf_cap = [0, 1, 2, 4, 8, 32][rng.below(6)];
-                    let mut hbuf = vec![Handle::new(0, 0); buf_cap];
+                    let mut hbuf = vec![Handle::INVALID; p.set.len()];
                     let scan = p.rq.begin_scan(&mut hbuf);
-                    let mbatch = model.begin_scan(buf_cap);
+                    let mbatch = model.begin_scan();
                     assert_eq!(scan.handles(), mbatch.as_slice(), "seed={seed} step={step} begin_scan");
+                    assert_eq!(p.rq.events_available(), !model.ready.is_empty() || !model.in_scan.is_empty());
 
                     let polled_len = if scan.is_empty() { 0 } else { rng.below(scan.len()) + 1 };
                     let mut polled = Vec::with_capacity(polled_len);
@@ -1022,25 +1150,26 @@ fn randomized_model_matches_naive_epoll() {
 
                     let max = [0, 1, 2, 3, 5, 32][rng.below(6)];
                     let mut out_p = Vec::new();
-                    let n_p = p.rq.finish_scan(&p.set, scan, &polled, max, &mut out_p);
-                    let out_m = model.finish_scan(&mbatch, &polled, max);
-                    assert_eq!(n_p, out_p.len());
-                    assert_eq!(out_p, out_m, "seed={seed} step={step} finish_scan");
+                    let done_p = p.rq.finish_scan(&p.set, scan, &polled, max, &mut out_p);
+                    let (out_m, done_m) = model.finish_scan(&mbatch, &polled, max);
+                    assert_eq!(done_p, done_m, "seed={seed} step={step} finish_scan done");
+                    assert_eq!(out_p, out_m, "seed={seed} step={step} finish_scan events");
 
-                    // Occasionally simulate a copy-out fault on a suffix of reported events.
                     if !out_p.is_empty() && rng.below(4) == 0 {
                         let fail_at = rng.below(out_p.len());
                         let tail: Vec<Handle> = out_p[fail_at..].iter().map(|e| e.handle).collect();
-                        p.rq.unreport(tail.iter().copied());
-                        model.unreport(&tail);
+                        assert_eq!(
+                            p.rq.unreport(tail.iter().copied()),
+                            model.unreport(&tail),
+                            "seed={seed} step={step} unreport"
+                        );
                     }
                 }
                 12 => {
                     // Two-phase nested-epoll peek with interleaved mid-peek wakes!
-                    let buf_cap = [0, 1, 3, 8, 32][rng.below(5)];
-                    let mut hbuf = vec![Handle::new(0, 0); buf_cap];
+                    let mut hbuf = vec![Handle::INVALID; p.set.len()];
                     let scan = p.rq.begin_scan(&mut hbuf);
-                    let mbatch = model.begin_scan(buf_cap);
+                    let mbatch = model.begin_scan();
                     assert_eq!(scan.handles(), mbatch.as_slice());
 
                     let polled_len = if scan.is_empty() { 0 } else { rng.below(scan.len()) + 1 };
@@ -1063,8 +1192,23 @@ fn randomized_model_matches_naive_epoll() {
                         "seed={seed} step={step} finish_peek"
                     );
                 }
+                13 => {
+                    // abort_scan with mid-scan wakes!
+                    let mut hbuf = vec![Handle::INVALID; p.set.len()];
+                    let scan = p.rq.begin_scan(&mut hbuf);
+                    let mbatch = model.begin_scan();
+                    assert_eq!(scan.handles(), mbatch.as_slice());
+                    for _ in 0..rng.below(3) {
+                        let widx = rng.below(live_state.len());
+                        let wk = key((widx / 3) as u64, widx as u32);
+                        let wready = random_ready(&mut rng);
+                        if let Some(wh) = p.set.lookup(wk) {
+                            assert_eq!(p.rq.wake(wh, wready), model.wake(wh, wready));
+                        }
+                    }
+                    assert_eq!(p.rq.abort_scan(scan), model.abort_scan(&mbatch), "seed={seed} step={step} abort_scan");
+                }
                 _ => {
-                    // remove_range on one description id.
                     let desc = (idx / 3) as u64;
                     let removed: Vec<_> = p.set.remove_range((desc, 0)..=(desc, u32::MAX)).collect();
                     for &(rk, rh, _) in &removed {
@@ -1076,6 +1220,7 @@ fn randomized_model_matches_naive_epoll() {
             assert_eq!(p.set.len(), model.by_key.len());
             assert_eq!(p.rq.ready_len(), model.ready.len());
             assert_eq!(p.rq.has_ready(), !model.ready.is_empty());
+            assert_eq!(p.rq.events_available(), !model.ready.is_empty());
             p.assert_invariants();
         }
     }
@@ -1088,25 +1233,20 @@ fn randomized_model_matches_naive_epoll() {
 
 #[test]
 fn loop_check_refuses_cycles_and_five_deep_chains() {
-    // Self-loop: E0 -> E0.
     let mut lc = LoopCheck::<u64>::new();
     assert_eq!(lc.add(0, 0), Err(Errno::Loop));
     assert!(lc.is_empty());
 
-    // 2-cycle: 0 -> 1 -> 0.
     assert_eq!(lc.add(0, 1), Ok(()));
     assert_eq!(lc.add(1, 0), Err(Errno::Loop));
     assert!(lc.contains(0, 1));
     assert!(!lc.contains(1, 0));
 
-    // 3-cycle: 0 -> 1 -> 2 -> 0.
     assert_eq!(lc.add(1, 2), Ok(()));
     assert_eq!(lc.add(2, 0), Err(Errno::Loop));
 
-    // 4-deep chain (4 edges = EP_MAX_NESTS, 5 sets): 0 -> 1 -> 2 -> 3 -> 4 succeeds.
     assert_eq!(lc.add(2, 3), Ok(()));
     assert_eq!(lc.add(3, 4), Ok(()));
-    // Closing the 5-node cycle 4 -> 0 fails with ELOOP.
     assert_eq!(lc.add(4, 0), Err(Errno::Loop));
     // Extending at the leaf (top-down construction: 0->1->2->3->4, then 4->5) -> ELOOP.
     assert_eq!(lc.add(4, 5), Err(Errno::Loop));
@@ -1114,21 +1254,18 @@ fn loop_check_refuses_cycles_and_five_deep_chains() {
     assert_eq!(lc.add(99, 0), Err(Errno::Loop));
     lc.assert_invariants();
 
-    // Removing an edge drops depth to 3 so extending succeeds.
     assert!(lc.remove(0, 1));
-    assert!(!lc.remove(0, 1)); // already gone
-    assert_eq!(lc.add(4, 5), Ok(())); // 1 -> 2 -> 3 -> 4 -> 5 (4 edges)
-    assert_eq!(lc.add(0, 1), Err(Errno::Loop)); // prepending 0->1 would make 5 edges again
+    assert!(!lc.remove(0, 1));
+    assert_eq!(lc.add(4, 5), Ok(()));
+    assert_eq!(lc.add(0, 1), Err(Errno::Loop));
     lc.assert_invariants();
 
-    // Middle-join of two 2-edge chains (0->1->2 and 3->4->5): joining 2->3 makes 5 edges -> ELOOP.
     let mut mid = LoopCheck::<u64>::new();
     mid.add(0, 1).unwrap();
     mid.add(1, 2).unwrap();
     mid.add(3, 4).unwrap();
     mid.add(4, 5).unwrap();
     assert_eq!(mid.add(2, 3), Err(Errno::Loop));
-    // Dropping 4->5 makes 0->1->2->3->4 (4 edges) legal.
     assert!(mid.remove(4, 5));
     assert_eq!(mid.add(2, 3), Ok(()));
     mid.assert_invariants();
@@ -1138,11 +1275,6 @@ fn loop_check_refuses_cycles_and_five_deep_chains() {
 fn loop_check_diamonds_refcounts_and_remove_set() {
     let mut lc = LoopCheck::<u64>::new();
 
-    // Diamond DAG with asymmetric branch lengths:
-    //   0 -> 1 -> 2 -> 3 (length 3)
-    //   0 -> 3           (length 1)
-    // Must allow 3 -> 4 (longest path 0->1->2->3->4 has length 4),
-    // and refuse 4 -> 5 (longest path has length 5, even though 0->3->4->5 is only 3).
     lc.add(0, 3).unwrap();
     lc.add(0, 1).unwrap();
     lc.add(1, 2).unwrap();
@@ -1150,25 +1282,21 @@ fn loop_check_diamonds_refcounts_and_remove_set() {
     assert_eq!(lc.add(3, 4), Ok(()));
     assert_eq!(lc.add(4, 5), Err(Errno::Loop));
 
-    // Duplicate edges (e.g. dup'd epoll fd added twice) are reference-counted.
     assert_eq!(lc.add(1, 2), Ok(()));
     assert_eq!(lc.edge_count(1, 2), 2);
-    // Removing once keeps 1 -> 2 active, so 4 -> 5 is still depth 5 -> ELOOP.
     assert!(lc.remove(1, 2));
     assert_eq!(lc.edge_count(1, 2), 1);
     assert_eq!(lc.add(4, 5), Err(Errno::Loop));
-    // Removing the second registration drops 1 -> 2; longest path through 4 is now 0->3->4 (depth 2).
     assert!(lc.remove(1, 2));
     assert_eq!(lc.edge_count(1, 2), 0);
-    assert_eq!(lc.add(4, 5), Ok(())); // 0 -> 3 -> 4 -> 5 (depth 3)
-    assert_eq!(lc.add(5, 6), Ok(())); // 0 -> 3 -> 4 -> 5 -> 6 (depth 4)
-    assert_eq!(lc.add(6, 7), Err(Errno::Loop)); // depth 5
+    assert_eq!(lc.add(4, 5), Ok(()));
+    assert_eq!(lc.add(5, 6), Ok(()));
+    assert_eq!(lc.add(6, 7), Err(Errno::Loop));
 
-    // remove_set clears both incoming and outgoing edges incident to the closed set.
     lc.remove_set(4);
     assert!(!lc.contains(3, 4));
     assert!(!lc.contains(4, 5));
-    assert_eq!(lc.add(6, 7), Ok(())); // 5 -> 6 -> 7 (depth 2)
+    assert_eq!(lc.add(6, 7), Ok(()));
     lc.assert_invariants();
 }
 

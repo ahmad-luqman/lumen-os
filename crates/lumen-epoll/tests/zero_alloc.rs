@@ -1,7 +1,7 @@
 //! Zero-allocation and zero-deallocation proof for every leaf-spinlock
 //! [`lumen_epoll::ReadyQueue`] operation (`wake`, `begin_scan`, `finish_scan`,
-//! `finish_peek`, `set_mask`, `unlink`, `unreport`, and `install`) as well as
-//! [`lumen_epoll::EpollSet::modify`].
+//! `finish_peek`, `abort_scan`, `activate`, `apply`, `unlink`, `unreport`, and
+//! `install`) as well as [`lumen_epoll::EpollSet::modify`].
 //!
 //! Runs in its own integration-test binary with a single `#[test]` so no other
 //! test thread can allocate concurrently while the counting `#[global_allocator]`
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lumen_epoll::{
     EPOLLERR, EPOLLET, EPOLLEXCLUSIVE, EPOLLHUP, EPOLLIN, EPOLLONESHOT, EPOLLOUT, EPOLLWAKEUP, EpollSet, Errno, Event,
-    ReadyQueue, Wake,
+    Handle, ReadyQueue, Wake,
 };
 
 struct Counting;
@@ -127,26 +127,18 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
             _ => EPOLLOUT | EPOLLWAKEUP,
         };
         let added = set.add((u64::from(i), i), events, u64::from(i), i).unwrap();
-        if let Some(storage) = added.growth {
-            // `install` itself must perform zero allocations and zero deallocations;
-            // old Storage is dropped outside the measurement window!
-            let old = assert_zero_heap_traffic("ReadyQueue::install", || rq.install(storage));
-            drop(old);
-        }
-        assert_zero_heap_traffic("ReadyQueue::set_mask (initial)", || {
-            rq.set_mask(added.handle, added.watch_mask, true);
-        });
-        handles.push(added.handle);
+        let h = added.handle();
+        // `activate` installs growth + activates slot with 0 allocs and 0 deallocs;
+        // any old Storage is dropped outside the measurement window.
+        let old = assert_zero_heap_traffic("ReadyQueue::activate", || rq.activate(&mut set, added));
+        drop(old);
+        handles.push(h);
     }
     // Add one EPOLLEXCLUSIVE interest for EINVAL modify coverage.
     let excl = set.add((100, 100), EPOLLIN | EPOLLEXCLUSIVE, 100, 100).unwrap();
-    if let Some(storage) = excl.growth {
-        let old = assert_zero_heap_traffic("ReadyQueue::install (excl)", || rq.install(storage));
-        drop(old);
-    }
-    assert_zero_heap_traffic("ReadyQueue::set_mask (excl)", || {
-        rq.set_mask(excl.handle, excl.watch_mask, true);
-    });
+    let excl_h = excl.handle();
+    let old = assert_zero_heap_traffic("ReadyQueue::activate (excl)", || rq.activate(&mut set, excl));
+    drop(old);
     assert!(ALLOC_COUNT.load(Ordering::SeqCst) > add_before, "expected EpollSet::add + prepare_grow to allocate");
 
     // Pre-allocate one extra growth Storage outside the lock to test explicit prepare_grow + install.
@@ -156,10 +148,10 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
     let old_storage = assert_zero_heap_traffic("ReadyQueue::install (explicit 128)", || rq.install(extra_storage));
     drop(old_storage);
 
-    let dummy_handle = handles[0];
-    let mut hbuf = [dummy_handle; 32];
-    let mut pbuf = [0u32; 32];
-    let mut sink = StackSink::<32>::new();
+    // Buffer sized >= set.len() (33) so begin_scan detaches the full ready list.
+    let mut hbuf = [Handle::INVALID; 40];
+    let mut pbuf = [0u32; 40];
+    let mut sink = StackSink::<40>::new();
 
     // 1. `wake` across matching, duplicate, filtered, and stale handles: 0 allocs, 0 deallocs.
     assert_zero_heap_traffic("wake(matching, duplicate, filtered, stale)", || {
@@ -168,42 +160,54 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
             assert_eq!(rq.wake(h, EPOLLIN | EPOLLOUT), Wake::AlreadyQueued);
             assert_eq!(rq.wake(h, 0), Wake::Filtered);
         }
-        assert_eq!(rq.wake(excl.handle, EPOLLIN), Wake::Queued);
-        assert_eq!(rq.wake(excl.handle, EPOLLOUT), Wake::Filtered);
+        assert_eq!(rq.wake(excl_h, EPOLLIN), Wake::Queued);
+        assert_eq!(rq.wake(excl_h, EPOLLOUT), Wake::Filtered);
+        assert_eq!(rq.wake(Handle::INVALID, EPOLLIN), Wake::Stale);
     });
     assert_eq!(rq.ready_len(), 33);
 
-    // 2. `begin_scan`, mid-scan `wake`, `finish_scan`, `unreport`, and `finish_peek`: 0 allocs, 0 deallocs.
-    assert_zero_heap_traffic("begin_scan + mid-scan wake + finish_scan + unreport + finish_peek", || {
-        // Two-phase scan with max = 7 and mid-scan wake.
-        let scan = rq.begin_scan(&mut hbuf);
-        let len = scan.len();
-        for (i, &h) in scan.handles().iter().enumerate() {
-            let e = set.get(h).unwrap();
-            pbuf[i] = if e.key.1.is_multiple_of(7) { 0 } else { EPOLLIN | EPOLLOUT };
-        }
-        assert_eq!(rq.wake(handles[1], EPOLLIN), Wake::AlreadyQueued);
-        sink.clear();
-        let n = rq.finish_scan(&set, scan, &pbuf[..len], 7, &mut sink);
-        assert_eq!(n, 7);
+    // 2. `begin_scan`, mid-scan `wake` (`DuringScan`), `finish_scan`, `unreport`,
+    //    `finish_peek`, and `abort_scan`: 0 allocs, 0 deallocs.
+    assert_zero_heap_traffic(
+        "begin_scan + DuringScan wake + finish_scan + unreport + finish_peek + abort_scan",
+        || {
+            let scan = rq.begin_scan(&mut hbuf);
+            let len = scan.len();
+            assert_eq!(len, 33);
+            assert!(rq.events_available());
+            for (i, &h) in scan.handles().iter().enumerate() {
+                let e = set.get(h).unwrap();
+                pbuf[i] = if e.key.1.is_multiple_of(7) { 0 } else { EPOLLIN | EPOLLOUT };
+            }
+            assert_eq!(rq.wake(handles[1], EPOLLIN), Wake::DuringScan);
+            sink.clear();
+            let done = rq.finish_scan(&set, scan, &pbuf[..len], 7, &mut sink);
+            assert_eq!(done.reported, 7);
+            assert!(done.has_ready);
 
-        // Roll back the tail via `unreport` (zero alloc).
-        rq.unreport(sink.slice()[3..n].iter().map(|e| e.unwrap().handle));
+            // Roll back the tail via `unreport` (zero alloc).
+            assert!(rq.unreport(sink.slice()[3..done.reported].iter().map(|e| e.unwrap().handle)));
 
-        // Nested-epoll non-consuming `begin_scan` + `finish_peek`.
-        let pscan = rq.begin_scan(&mut hbuf);
-        let plen = pscan.len();
-        for p in &mut pbuf[..plen] {
-            *p = EPOLLIN | EPOLLOUT;
-        }
-        assert!(rq.finish_peek(pscan, &pbuf[..plen]));
-    });
+            // Nested-epoll non-consuming `begin_scan` + `finish_peek`.
+            let pscan = rq.begin_scan(&mut hbuf);
+            let plen = pscan.len();
+            for p in &mut pbuf[..plen] {
+                *p = EPOLLIN | EPOLLOUT;
+            }
+            let pdone = rq.finish_peek(pscan, &pbuf[..plen]);
+            assert!(pdone.ready && pdone.has_ready);
 
-    // 3. `EpollSet::modify` + `ReadyQueue::set_mask` (updates, re-arms, ENOENT, and EINVAL): 0 allocs, 0 deallocs.
-    assert_zero_heap_traffic("modify + set_mask (update, re-arm, ENOENT, EINVAL)", || {
+            // Error-path `abort_scan`.
+            let ascan = rq.begin_scan(&mut hbuf);
+            assert!(rq.abort_scan(ascan));
+        },
+    );
+
+    // 3. `EpollSet::modify` + `ReadyQueue::apply` (updates, re-arms, ENOENT, and EINVAL): 0 allocs, 0 deallocs.
+    assert_zero_heap_traffic("modify + apply (update, re-arm, ENOENT, EINVAL)", || {
         for i in (2..32u32).step_by(4) {
             let m = set.modify((u64::from(i), i), EPOLLIN | EPOLLONESHOT, u64::from(i) + 1000).unwrap();
-            rq.set_mask(m.handle, m.watch_mask, true);
+            rq.apply(m);
         }
         assert_eq!(set.modify((999, 999), EPOLLIN, 0), Err(Errno::NoEnt));
         assert_eq!(set.modify((999, 999), EPOLLIN | EPOLLEXCLUSIVE, 0), Err(Errno::Inval));
@@ -212,9 +216,9 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
 
     // 4. `unlink` (active + stale handle): 0 allocs, 0 deallocs.
     assert_zero_heap_traffic("unlink (active + stale)", || {
-        rq.unlink(excl.handle);
-        rq.unlink(excl.handle); // stale repeat
-        assert_eq!(rq.wake(excl.handle, EPOLLIN | EPOLLERR | EPOLLHUP), Wake::Stale);
+        rq.unlink(excl_h);
+        rq.unlink(excl_h);
+        assert_eq!(rq.wake(excl_h, EPOLLIN | EPOLLERR | EPOLLHUP), Wake::Stale);
     });
 
     // 5. Sustained interleaved wake + begin_scan + finish_scan + unreport + modify churn: 0 allocs, 0 deallocs.
@@ -226,7 +230,7 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
             if round % 3 == 0 {
                 let target = ((round / 3) % 8) * 4 + 2;
                 let m = set.modify((u64::from(target), target), EPOLLIN | EPOLLONESHOT, u64::from(round)).unwrap();
-                rq.set_mask(m.handle, m.watch_mask, true);
+                rq.apply(m);
             }
             let scan = rq.begin_scan(&mut hbuf);
             let slen = scan.len();
@@ -237,10 +241,10 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
             let _ = rq.wake(handles[(idx + 1) % 32], EPOLLIN);
             sink.clear();
             let max = ((round % 5) + 1) as usize;
-            let n = rq.finish_scan(&set, scan, &pbuf[..slen], max, &mut sink);
-            assert!(n <= max);
-            if n > 1 && round % 7 == 0 {
-                rq.unreport(sink.slice()[1..n].iter().map(|e| e.unwrap().handle));
+            let done = rq.finish_scan(&set, scan, &pbuf[..slen], max, &mut sink);
+            assert!(done.reported <= max);
+            if done.reported > 1 && round % 7 == 0 {
+                let _ = rq.unreport(sink.slice()[1..done.reported].iter().map(|e| e.unwrap().handle));
             }
         }
     });

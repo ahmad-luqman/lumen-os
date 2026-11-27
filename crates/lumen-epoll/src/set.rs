@@ -7,8 +7,8 @@ use core::fmt;
 use core::ops::{Bound, RangeBounds};
 
 use crate::{
-    EP_ALWAYS_EVENTS, EP_PRIVATE_BITS, EPOLLEXCLUSIVE, EPOLLEXCLUSIVE_OK_BITS, EPOLLWAKEUP, Errno, Handle, ReadyQueue,
-    Storage,
+    EP_ALWAYS_EVENTS, EPOLLEXCLUSIVE, EPOLLEXCLUSIVE_OK_BITS, EPOLLWAKEUP, Errno, Handle, ReadyQueue, Storage,
+    watch_mask,
 };
 
 /// Initial [`ReadyQueue`] slot capacity prepared on the first [`EpollSet::add`].
@@ -27,29 +27,60 @@ const fn next_generation(generation: u32) -> u32 {
     if next == 0 { 1 } else { next }
 }
 
-/// Result of [`EpollSet::add`].
+/// Opaque activation ticket returned by [`EpollSet::add`].
+///
+/// Pass to [`ReadyQueue::activate`] under the level-10e spinlock, which
+/// installs any pre-allocated growth [`Storage`], confirms the capacity back to
+/// [`EpollSet`], and activates the slot in one step.
 #[derive(Debug)]
-#[must_use = "install any growth Storage and call ReadyQueue::set_mask under the spinlock"]
+#[must_use = "pass Added to ReadyQueue::activate under the spinlock"]
 pub struct Added {
-    /// Generational handle for the new interest.
-    pub handle: Handle,
-    /// Effective watch mask (`(events & !EP_PRIVATE_BITS) | EPOLLERR | EPOLLHUP`)
-    /// to register via [`ReadyQueue::set_mask`].
-    pub watch_mask: u32,
-    /// Pre-allocated backing buffer when the paired [`ReadyQueue`] needs to
-    /// grow. Pass to [`ReadyQueue::install`] under the spinlock and drop the
-    /// returned old [`Storage`] *after* unlocking.
-    pub growth: Option<Storage>,
+    handle: Handle,
+    watch_mask: u32,
+    growth: Option<Storage>,
 }
 
-/// Result of [`EpollSet::modify`].
+impl Added {
+    pub(crate) const fn new(handle: Handle, watch_mask: u32, growth: Option<Storage>) -> Self {
+        Self { handle, watch_mask, growth }
+    }
+
+    pub(crate) fn into_parts(self) -> (Handle, u32, Option<Storage>) {
+        (self.handle, self.watch_mask, self.growth)
+    }
+
+    /// Generational handle of the newly added interest.
+    pub const fn handle(&self) -> Handle {
+        self.handle
+    }
+
+    /// Effective watch mask (`(events & !EP_PRIVATE_BITS) | EPOLLERR | EPOLLHUP`).
+    pub const fn watch_mask(&self) -> u32 {
+        self.watch_mask
+    }
+}
+
+/// Opaque update ticket returned by [`EpollSet::modify`].
+///
+/// Pass to [`ReadyQueue::apply`] under the level-10e spinlock to update the
+/// watch mask and re-arm the interest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[must_use = "call ReadyQueue::set_mask under the spinlock"]
+#[must_use = "pass Modified to ReadyQueue::apply under the spinlock"]
 pub struct Modified {
+    handle: Handle,
+    watch_mask: u32,
+}
+
+impl Modified {
     /// Generational handle of the modified interest.
-    pub handle: Handle,
-    /// Updated effective watch mask to pass to [`ReadyQueue::set_mask`].
-    pub watch_mask: u32,
+    pub const fn handle(&self) -> Handle {
+        self.handle
+    }
+
+    /// Updated effective watch mask.
+    pub const fn watch_mask(&self) -> u32 {
+        self.watch_mask
+    }
 }
 
 /// Borrowed view of one live interest returned by [`EpollSet::get`].
@@ -64,14 +95,14 @@ pub struct EntryRef<'a, K, T> {
     pub events: u32,
     /// Opaque user `data`.
     pub data: u64,
-    /// Caller payload (in B5: target file description and `PollGuard`).
+    /// Caller payload (in B5: target file description and `Option<PollGuard>`).
     pub payload: &'a T,
 }
 
 impl<K, T> EntryRef<'_, K, T> {
-    /// Effective watch mask (excluding [`EP_PRIVATE_BITS`]).
+    /// Effective watch mask (excluding [`crate::EP_PRIVATE_BITS`]).
     pub const fn watch_mask(&self) -> u32 {
-        self.events & !EP_PRIVATE_BITS
+        watch_mask(self.events)
     }
 }
 
@@ -84,10 +115,6 @@ struct SetEntry<K, T> {
 }
 
 impl<K, T> SetEntry<K, T> {
-    const fn watch_mask(&self) -> u32 {
-        self.events & !EP_PRIVATE_BITS
-    }
-
     const fn is_exclusive(&self) -> bool {
         (self.events & EPOLLEXCLUSIVE) != 0
     }
@@ -100,7 +127,7 @@ enum SetSlot<K, T> {
 
 /// Interest table for a single `epoll` instance, keyed by `K` (in the kernel:
 /// `(open_description_id, fd)`) with per-interest payload `T` (in the kernel:
-/// target description + `PollGuard`).
+/// target description + `Option<PollGuard>`).
 ///
 /// Designed to sit behind B5's sleep mutex (`ep->mtx`), paired with a
 /// [`ReadyQueue`] behind the level-10e leaf spinlock (`ep->lock`).
@@ -108,6 +135,8 @@ pub struct EpollSet<K: Ord + Copy, T = ()> {
     by_key: BTreeMap<K, u32>,
     slots: Vec<SetSlot<K, T>>,
     free_head: Option<u32>,
+    /// Last confirmed slot capacity of the paired [`ReadyQueue`], raised only
+    /// when [`ReadyQueue::activate`] installs growth.
     ready_capacity: usize,
 }
 
@@ -151,27 +180,19 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
     /// Look up the live [`Handle`] for `key`, if registered.
     pub fn lookup(&self, key: K) -> Option<Handle> {
         let &idx = self.by_key.get(&key)?;
-        match &self.slots[idx as usize] {
-            SetSlot::Occupied(e) => Some(Handle::new(idx, e.generation)),
-            SetSlot::Vacant { .. } => unreachable!("by_key pointed to vacant slot"),
-        }
+        Some(Handle::new(idx, self.entry(idx).generation))
     }
 
     /// Look up a live interest by [`Handle`] in O(1), rejecting stale
-    /// generations.
+    /// generations. Takes no locks.
     pub fn get(&self, handle: Handle) -> Option<EntryRef<'_, K, T>> {
-        let slot = self.slots.get(handle.index() as usize)?;
-        match slot {
-            SetSlot::Occupied(e) if e.generation == handle.generation() => {
-                Some(EntryRef { key: e.key, handle, events: e.events, data: e.data, payload: &e.payload })
-            }
-            _ => None,
-        }
+        let e = self.occupied(handle)?;
+        Some(EntryRef { key: e.key, handle, events: e.events, data: e.data, payload: &e.payload })
     }
 
     /// Mutably borrow the payload `T` of a live interest by [`Handle`] in O(1)
-    /// (for example, to store a `PollGuard` after subscribing), rejecting stale
-    /// generations.
+    /// (for example, to store `Some(PollGuard)` after subscribing), rejecting
+    /// stale generations.
     pub fn payload_mut(&mut self, handle: Handle) -> Option<&mut T> {
         let slot = self.slots.get_mut(handle.index() as usize)?;
         match slot {
@@ -180,30 +201,29 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
         }
     }
 
-    /// Internal O(1) metadata lookup used by [`ReadyQueue::finish_scan`].
-    pub(crate) fn meta(&self, handle: Handle) -> Option<(u32, u64)> {
-        let slot = self.slots.get(handle.index() as usize)?;
-        match slot {
-            SetSlot::Occupied(e) if e.generation == handle.generation() => Some((e.events, e.data)),
-            _ => None,
-        }
+    /// Called by [`ReadyQueue::activate`] once storage is installed.
+    pub(crate) fn confirm_ready_capacity(&mut self, capacity: usize) {
+        self.ready_capacity = capacity;
     }
 
     /// Register `key` with event mask `events`, user `data`, and payload `T`
     /// (`EPOLL_CTL_ADD`, Linux `fs/eventpoll.c` `do_epoll_ctl` / `ep_insert`).
     ///
     /// - Refuses [`EPOLLEXCLUSIVE`] combined with any bit outside
-    ///   [`EPOLLEXCLUSIVE_OK_BITS`] (including [`EPOLLONESHOT`]) with
+    ///   [`EPOLLEXCLUSIVE_OK_BITS`] (including [`crate::EPOLLONESHOT`]) with
     ///   [`Errno::Inval`], checked before duplicate lookup as in Linux.
     /// - Refuses a duplicate `key` with [`Errno::Exist`].
-    /// - Uses fallible reservation (`try_reserve` + [`ReadyQueue::prepare_grow`])
-    ///   so out-of-memory returns [`Errno::NoMem`] with the set unchanged.
+    /// - Uses fallible `Vec::try_reserve` for the slot table and
+    ///   [`ReadyQueue::prepare_grow`] for ready-queue storage (`Errno::NoMem`,
+    ///   leaving the set unchanged on failure); `BTreeMap::insert` in stable
+    ///   Rust is not fallible.
     /// - Accepts and ignores [`EPOLLWAKEUP`]; implicitly includes
-    ///   [`EPOLLERR`] and [`EPOLLHUP`].
+    ///   [`crate::EPOLLERR`] and [`crate::EPOLLHUP`].
     ///
-    /// After `add`, the caller must install any returned [`Added::growth`] and
-    /// call [`ReadyQueue::set_mask`] under the spinlock, then subscribe, poll
-    /// the target, and call [`ReadyQueue::wake`] with the initial mask.
+    /// Pass the returned [`Added`] to [`ReadyQueue::activate`] under the
+    /// spinlock, drop any returned old [`Storage`] outside the spinlock, then
+    /// subscribe, poll the target, store the `PollGuard` via
+    /// [`Self::payload_mut`], and call [`ReadyQueue::wake`].
     pub fn add(&mut self, key: K, events: u32, data: u64, payload: T) -> Result<Added, Errno> {
         if (events & EPOLLEXCLUSIVE) != 0 && (events & !EPOLLEXCLUSIVE_OK_BITS) != 0 {
             return Err(Errno::Inval);
@@ -213,26 +233,25 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
         }
 
         let norm = normalize_events(events);
-        let watch_mask = norm & !EP_PRIVATE_BITS;
+        let mask = watch_mask(norm);
 
-        if let Some(idx) = self.free_head {
-            let (next_free, generation) = match self.slots[idx as usize] {
-                SetSlot::Vacant { next_free, next_gen } => (next_free, next_gen),
+        let (idx, generation, from_free) = match self.free_head {
+            Some(free_idx) => match self.slots[free_idx as usize] {
+                SetSlot::Vacant { next_gen, .. } => (free_idx, next_gen, true),
                 SetSlot::Occupied(_) => unreachable!("free list pointed to occupied slot"),
-            };
-            self.free_head = next_free;
-            self.slots[idx as usize] = SetSlot::Occupied(SetEntry { key, generation, events: norm, data, payload });
-            self.by_key.insert(key, idx);
-            return Ok(Added { handle: Handle::new(idx, generation), watch_mask, growth: None });
-        }
+            },
+            None => {
+                if self.slots.len() >= u32::MAX as usize {
+                    return Err(Errno::NoMem);
+                }
+                self.slots.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                (self.slots.len() as u32, 1u32, false)
+            }
+        };
 
-        if self.slots.len() >= u32::MAX as usize {
-            return Err(Errno::NoMem);
-        }
-
-        // Fallible reservations first so `self` is unchanged on `Errno::NoMem`.
-        self.slots.try_reserve(1).map_err(|_| Errno::NoMem)?;
-        let needed = self.slots.len() + 1;
+        // Re-request growth whenever `idx >= confirmed ready_capacity`, so even
+        // a dropped `Added` cannot leave `EpollSet` and `ReadyQueue` desynced.
+        let needed = (idx as usize) + 1;
         let growth = if needed > self.ready_capacity {
             let new_cap =
                 self.ready_capacity.saturating_mul(2).max(INITIAL_READY_CAPACITY).max(needed).min(u32::MAX as usize);
@@ -241,14 +260,18 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
             None
         };
 
-        if let Some(ref storage) = growth {
-            self.ready_capacity = storage.capacity();
+        let entry = SetEntry { key, generation, events: norm, data, payload };
+        if from_free {
+            let SetSlot::Vacant { next_free, .. } = self.slots[idx as usize] else {
+                unreachable!("free list pointed to occupied slot");
+            };
+            self.free_head = next_free;
+            self.slots[idx as usize] = SetSlot::Occupied(entry);
+        } else {
+            self.slots.push(SetSlot::Occupied(entry));
         }
-        let idx = self.slots.len() as u32;
-        let generation = 1u32;
-        self.slots.push(SetSlot::Occupied(SetEntry { key, generation, events: norm, data, payload }));
         self.by_key.insert(key, idx);
-        Ok(Added { handle: Handle::new(idx, generation), watch_mask, growth })
+        Ok(Added::new(Handle::new(idx, generation), mask, growth))
     }
 
     /// Update `key`'s event mask and user `data` (`EPOLL_CTL_MOD`, Linux
@@ -261,8 +284,7 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
     ///   [`Errno::Inval`].
     /// - Performs zero heap allocations and zero deallocations.
     ///
-    /// After `modify`, the caller must call
-    /// `rq.set_mask(modified.handle, modified.watch_mask, true)` under the
+    /// Pass the returned [`Modified`] to [`ReadyQueue::apply`] under the
     /// spinlock (re-arming any disarmed `EPOLLONESHOT`), then re-poll the
     /// target and call [`ReadyQueue::wake`] with the current readiness mask.
     pub fn modify(&mut self, key: K, events: u32, data: u64) -> Result<Modified, Errno> {
@@ -272,22 +294,19 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
         let Some(&idx) = self.by_key.get(&key) else {
             return Err(Errno::NoEnt);
         };
-        let entry = match &mut self.slots[idx as usize] {
-            SetSlot::Occupied(e) => e,
-            SetSlot::Vacant { .. } => unreachable!("by_key pointed to vacant slot"),
-        };
+        let entry = self.entry_mut(idx);
         if entry.is_exclusive() {
             return Err(Errno::Inval);
         }
         entry.events = normalize_events(events);
         entry.data = data;
-        Ok(Modified { handle: Handle::new(idx, entry.generation), watch_mask: entry.watch_mask() })
+        Ok(Modified { handle: Handle::new(idx, entry.generation), watch_mask: watch_mask(entry.events) })
     }
 
     /// Remove `key` from the interest set, returning its `(Handle, T)` so the
-    /// caller can call [`ReadyQueue::unlink`] under the spinlock and drop `T`
-    /// after releasing locks (`EPOLL_CTL_DEL`, Linux `fs/eventpoll.c`
-    /// `ep_remove`).
+    /// caller can call [`ReadyQueue::unlink`] under the spinlock (and
+    /// [`crate::LoopCheck::remove`] for an epoll target) and drop `T` after
+    /// releasing locks (`EPOLL_CTL_DEL`, Linux `fs/eventpoll.c` `ep_remove`).
     ///
     /// Returns [`Errno::NoEnt`] if `key` is not present.
     pub fn remove(&mut self, key: K) -> Result<(Handle, T), Errno> {
@@ -299,7 +318,8 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
 
     /// Remove every interest whose key falls within `range` (for example, all
     /// `(open_description_id, fd)` entries of one closing description),
-    /// yielding each `(K, Handle, T)` without allocating.
+    /// yielding each `(K, Handle, T)` without allocating so B5 can call
+    /// [`ReadyQueue::unlink`] promptly and drop payloads after unlocking.
     ///
     /// Dropping the returned iterator before exhaustion still removes the
     /// remaining keys in `range`.
@@ -309,26 +329,45 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
     }
 
     /// Remove every interest from the set (for tearing down a closing epoll
-    /// instance), yielding each `(K, Handle, T)` without allocating.
+    /// instance), yielding each `(K, Handle, T)` without allocating so B5 can
+    /// unlink handles, update [`crate::LoopCheck`], and drop payloads outside
+    /// locks.
     ///
     /// Dropping the returned iterator before exhaustion still empties the set.
     pub fn drain(&mut self) -> Drain<'_, K, T> {
         Drain { set: self }
     }
 
+    fn entry(&self, idx: u32) -> &SetEntry<K, T> {
+        match &self.slots[idx as usize] {
+            SetSlot::Occupied(e) => e,
+            SetSlot::Vacant { .. } => unreachable!("by_key pointed to vacant slot"),
+        }
+    }
+
+    fn entry_mut(&mut self, idx: u32) -> &mut SetEntry<K, T> {
+        match &mut self.slots[idx as usize] {
+            SetSlot::Occupied(e) => e,
+            SetSlot::Vacant { .. } => unreachable!("by_key pointed to vacant slot"),
+        }
+    }
+
+    fn occupied(&self, handle: Handle) -> Option<&SetEntry<K, T>> {
+        match self.slots.get(handle.index() as usize)? {
+            SetSlot::Occupied(e) if e.generation == handle.generation() => Some(e),
+            _ => None,
+        }
+    }
+
     fn free_slot(&mut self, idx: u32) -> (Handle, T) {
-        let old = core::mem::replace(
-            &mut self.slots[idx as usize],
-            SetSlot::Vacant { next_free: self.free_head, next_gen: 1 },
-        );
+        let next_gen = next_generation(self.entry(idx).generation);
+        let old =
+            core::mem::replace(&mut self.slots[idx as usize], SetSlot::Vacant { next_free: self.free_head, next_gen });
         let SetSlot::Occupied(entry) = old else {
             unreachable!("free_slot called on vacant slot");
         };
-        let handle = Handle::new(idx, entry.generation);
-        self.slots[idx as usize] =
-            SetSlot::Vacant { next_free: self.free_head, next_gen: next_generation(entry.generation) };
         self.free_head = Some(idx);
-        (handle, entry.payload)
+        (Handle::new(idx, entry.generation), entry.payload)
     }
 
     /// Structural invariant check for tests.
@@ -348,7 +387,6 @@ impl<K: Ord + Copy, T> EpollSet<K, T> {
             }
         }
         assert_eq!(occupied, self.by_key.len());
-        assert!(self.slots.len() <= self.ready_capacity || self.slots.is_empty());
 
         let mut vacant_seen = 0usize;
         let mut cur = self.free_head;

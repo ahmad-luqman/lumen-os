@@ -4,29 +4,35 @@
 //! # Two-lock split (ARCHITECTURE §9 & §10, Linux `fs/eventpoll.c`)
 //!
 //! Linux splits an epoll instance across two locks so readiness callbacks can
-//! run in atomic context without blocking or allocating while `vfs_poll` runs
-//! outside the spinlock:
+//! run in atomic context without blocking or allocating while `Pollable::poll`
+//! runs outside the spinlock:
 //!
 //! - **`ep->mtx` (sleep mutex) guards [`EpollSet<K, T>`]:** owns the interest
-//!   table (`key -> slot`), per-slot payload `T` (in B5: the target file
-//!   description and its `PollGuard`), event masks, user `data`, and slot
-//!   generations. Operations here may allocate (`add` uses fallible
-//!   `try_reserve` + [`ReadyQueue::prepare_grow`], returning [`Errno::NoMem`]
-//!   with the set unchanged on failure).
+//!   table (`key -> slot`), per-slot payload `T` (in B5: target description and
+//!   `Option<PollGuard>`, initialized with `None` until the guard exists),
+//!   event masks, user `data`, and slot generations. `EpollSet::add` uses
+//!   fallible reservation (`Vec::try_reserve` + [`ReadyQueue::prepare_grow`])
+//!   for its slot and ready-queue storage (`Errno::NoMem`, leaving the set
+//!   unchanged on failure); note that `BTreeMap::insert` in stable Rust has no
+//!   fallible API and can abort on OOM.
 //! - **Level-10e leaf spinlock (`ep->lock`, nested inside a `PollHead`'s
-//!   subscriber lock) guards [`ReadyQueue`]:** holds only the slab of
-//!   per-slot intrusive ready-list links, `queued` / `armed` /
+//!   subscriber lock) guards [`ReadyQueue`]:** holds only the slab of per-slot
+//!   intrusive ready-list links, `in_ready` / `in_scan` / `armed` /
 //!   `woke_during_scan` flags, slot generations, and a copy of each slot's
 //!   watch mask, indexed by generational [`Handle`]. Every method on
-//!   [`ReadyQueue`] except [`ReadyQueue::prepare_grow`] (which is called
-//!   *outside* the spinlock) performs **zero heap allocations and zero
-//!   deallocations**.
+//!   [`ReadyQueue`] except [`ReadyQueue::prepare_grow`] (called *outside* the
+//!   spinlock) performs **zero heap allocations and zero deallocations**.
+//!
+//! Each [`Handle`] and [`Scan`] belongs exclusively to the paired
+//! `(`[`EpollSet`]`, `[`ReadyQueue`]`)` instance that created it and must never
+//! be passed to a different epoll instance.
 //!
 //! ## Kernel syscall protocols (B5)
 //!
 //! ### `EPOLL_CTL_ADD` (`ep_insert`)
 //!
 //! 1. **Errno precedence (Linux `fs/eventpoll.c`, `do_epoll_ctl`):**
+//!    - `EPERM`: target file does not support polling (`!file_can_poll`).
 //!    - `EINVAL`: `epfd == fd` (`f.file == tf.file`), `EPOLLEXCLUSIVE` on an
 //!      epoll target (`is_file_epoll(tf.file)`), or `EPOLLEXCLUSIVE` combined
 //!      with bits outside [`EPOLLEXCLUSIVE_OK_BITS`] (checked by
@@ -38,68 +44,92 @@
 //!      [`LoopCheck::add`] (e.g. `EEXIST` or `ENOMEM`), immediately undo it
 //!      with [`LoopCheck::remove`].
 //!    - `EEXIST` / `ENOMEM`: checked by [`EpollSet::add`].
-//! 2. Holding `ep->mtx` (no spinlock), call [`EpollSet::add`] to obtain
-//!    [`Added`].
-//! 3. Briefly lock [`ReadyQueue`], call [`ReadyQueue::install`] if
-//!    `added.growth` is `Some` (binding the returned old [`Storage`]), call
-//!    `rq.set_mask(added.handle, added.watch_mask, true)`, unlock
-//!    [`ReadyQueue`], and drop any old [`Storage`] *after* unlocking.
+//! 2. Holding `ep->mtx` (no spinlock), call [`EpollSet::add`] with a payload
+//!    holding a placeholder `None` for the `PollGuard` to obtain [`Added`].
+//! 3. Record `let handle = added.handle();`, briefly lock [`ReadyQueue`], call
+//!    `let old = rq.activate(&mut set, added);` (installs any growth, confirms
+//!    capacity back to `set`, and activates the slot in one step), unlock
+//!    [`ReadyQueue`], and drop `old` *after* unlocking.
 //! 4. **Post-add subscribe, poll, and wake (mandatory):** while still holding
 //!    `ep->mtx` (no spinlock), construct the per-interest `PollWaker` carrying
-//!    `added.handle`, call `Pollable::poll(mode, Some(&waker))` to get
-//!    `(initial_mask, guard)`, store `guard` via [`EpollSet::payload_mut`],
-//!    and call `rq.wake(added.handle, initial_mask.bits() as u32)` under the
-//!    spinlock (matching Linux `ep_insert`, which calls `ep_item_poll` after
-//!    linking).
+//!    `handle`, call `Pollable::poll(mode, Some(&waker))` to obtain
+//!    `(initial_mask, guard)`, store `Some(guard)` via
+//!    [`EpollSet::payload_mut`], and call
+//!    `rq.wake(handle, initial_mask.bits() as u32)` under the spinlock
+//!    (matching Linux `ep_insert`, which calls `ep_item_poll` after linking).
+//!    If `wake` returns [`Wake::Queued`] or [`Wake::DuringScan`], wake `ep->wq`
+//!    and notify the epoll file's `PollHead`.
 //!
 //! ### `EPOLL_CTL_MOD` (`ep_modify`)
 //!
 //! 1. Holding `ep->mtx`, call [`EpollSet::modify`] (checks `EINVAL` for
 //!    `EPOLLEXCLUSIVE`, then `ENOENT`, then `EINVAL` on an existing
-//!    `EPOLLEXCLUSIVE` entry).
-//! 2. Briefly lock [`ReadyQueue`] and call
-//!    `rq.set_mask(modified.handle, modified.watch_mask, true)` (allocation-free,
-//!    re-arms a disarmed `EPOLLONESHOT`).
+//!    `EPOLLEXCLUSIVE` entry) to obtain [`Modified`].
+//! 2. Briefly lock [`ReadyQueue`] and call `rq.apply(modified)` (allocation-free,
+//!    updates watch mask and re-arms any disarmed `EPOLLONESHOT`).
 //! 3. **Post-modify poll and wake (mandatory):** holding only `ep->mtx`, call
-//!    `Pollable::poll(mode, None)` and pass the current mask to
+//!    `Pollable::poll(mode, None)` on the payload and pass the current mask to
 //!    [`ReadyQueue::wake`] under the spinlock (matching Linux `ep_modify`, so
 //!    an already-ready descriptor or freshly re-armed `EPOLLONESHOT` is queued).
+//!    If `wake` returns [`Wake::Queued`] or [`Wake::DuringScan`], wake `ep->wq`
+//!    and notify the epoll file's `PollHead`.
 //!
-//! ### `EPOLL_CTL_DEL` (`ep_remove`) and description/instance teardown
+//! ### `EPOLL_CTL_DEL` (`ep_remove`), description close, and instance close
 //!
-//! - Single key: under `ep->mtx`, `let (handle, payload) = set.remove(key)?;`,
-//!   then `rq.unlink(handle)` under the spinlock, then unlock `ep->mtx` and
-//!   drop `payload` (`PollGuard` + `Arc<File>`) outside both locks.
-//! - File-description close (`eventpoll_release_file`): under `ep->mtx`, remove
-//!   all keys for that description with [`EpollSet::remove_range`], unlink each
-//!   returned [`Handle`] under the spinlock, and drop the payloads outside both
-//!   locks.
-//! - Epoll instance close: [`EpollSet::drain`] yields every `(K, Handle, T)` so
-//!   payloads drop outside locks and [`LoopCheck::remove_set`] clears incident
-//!   nesting edges.
+//! - **Single key (`EPOLL_CTL_DEL`):** under `ep->mtx`, call
+//!   `let (handle, payload) = set.remove(key)?;`, then `rq.unlink(handle)`
+//!   under the spinlock; if the target was an epoll instance, call
+//!   [`LoopCheck::remove`]. Unlock `ep->mtx` and drop `payload` (`PollGuard` +
+//!   `Arc<File>`) outside both locks.
+//! - **File-description close (`eventpoll_release_file`):** under `ep->mtx`,
+//!   collect `set.remove_range(desc_range)` into a local `Vec` (yielding every
+//!   `(K, Handle, T)`), call `rq.unlink(handle)` for each under the spinlock
+//!   (and [`LoopCheck::remove`] for epoll targets), unlock `ep->mtx`, and drop
+//!   the collected payloads outside both locks.
+//! - **Epoll instance close:** under `ep->mtx`, collect `set.drain()`, call
+//!   `rq.unlink(handle)` for each under the spinlock and
+//!   [`LoopCheck::remove_set`] for the closing epoll id, unlock `ep->mtx`, and
+//!   drop all collected payloads outside both locks.
 //!
 //! ### Two-phase `epoll_wait` (`ep_start_scan` / `ep_send_events` / `ep_done_scan`)
 //!
-//! 1. Lock `ep->mtx`, then briefly lock [`ReadyQueue`] and call
-//!    [`ReadyQueue::begin_scan`] with a caller-owned handle buffer (zero alloc).
-//!    Unlock [`ReadyQueue`].
-//! 2. Holding only `ep->mtx`, poll each handle in [`Scan::handles`] via
-//!    [`EpollSet::get`] (which is safe to acquire pipe/tty `SleepMutex`es and
-//!    nested epoll `ep->mtx`es).
-//! 3. Re-acquire [`ReadyQueue`] and call [`ReadyQueue::finish_scan`], collecting
-//!    [`Event`]s into a kernel buffer. Unlock [`ReadyQueue`] and `ep->mtx`.
-//! 4. Copy events to user memory. If copying faults at index `i` (`-EFAULT`),
-//!    lock [`ReadyQueue`] and call [`ReadyQueue::unreport`] with the uncopied
-//!    tail's handles so no `EPOLLONESHOT` or `EPOLLET` event is lost.
+//! 1. Before sleeping, check [`ReadyQueue::events_available`] under the
+//!    spinlock (`in_ready` non-empty **or** a scan currently in flight,
+//!    matching Linux `ep_events_available`).
+//! 2. Lock `ep->mtx`, reserve/size a handle buffer to at least `set.len()`
+//!    (reusable buffer kept alongside `EpollSet` under `ep->mtx`), then briefly
+//!    lock [`ReadyQueue`] and call [`ReadyQueue::begin_scan`] (detaches the
+//!    entire ready list; panics if `buf.len() < ready_len()`). Unlock
+//!    [`ReadyQueue`].
+//! 3. Holding only `ep->mtx`, iterate [`Scan::handles`], look up each interest
+//!    via [`EpollSet::get`] (`get` takes no locks), and call
+//!    `Pollable::poll(mode, None)` on the payload (which may take pipe/tty or
+//!    nested-epoll sleep mutexes). If an error occurs between phases, call
+//!    [`ReadyQueue::abort_scan`] under the spinlock, then wake `ep->wq` and
+//!    notify the epoll file's `PollHead` if it returns `true`.
+//! 4. Briefly lock [`ReadyQueue`] and call [`ReadyQueue::finish_scan`],
+//!    collecting [`Event`]s into a kernel buffer. Unlock [`ReadyQueue`] (keep
+//!    `ep->mtx` held!).
+//! 5. **Copy-out under `ep->mtx` (Linux `ep_send_events`):** copy collected
+//!    events to user memory while still holding `ep->mtx` (a sleep mutex above
+//!    Lock 1). If copying faults at index `i`: briefly lock [`ReadyQueue`],
+//!    call `let more = rq.unreport(events[i..].iter().map(|e| e.handle));`,
+//!    unlock [`ReadyQueue`] and `ep->mtx`, wake `ep->wq` and notify the epoll
+//!    file's `PollHead` if `more`, and return `Ok(i)` if `i > 0` else `-EFAULT`.
+//! 6. Otherwise unlock `ep->mtx`; if [`ScanDone::has_ready`] is `true`, wake
+//!    `ep->wq` and notify the epoll file's `PollHead` (Linux `ep_done_scan`);
+//!    return `Ok(done.reported)`.
 //!
 //! ### Nested-epoll readiness (`__ep_eventpoll_poll` / `ep_read_events_proc`)
 //!
-//! When an outer epoll polls an inner epoll file, the inner epoll runs
-//! [`ReadyQueue::begin_scan`], polls queued handles under its `ep->mtx`, and
-//! calls [`ReadyQueue::finish_peek`]. It reports ready (`EPOLLIN | EPOLLRDNORM`)
-//! only if an entry is genuinely ready, without disarming `EPOLLONESHOT` or
-//! dropping ready `EPOLLET`/LT entries, while pruning stale (`revents == 0`)
-//! entries whose pipes/sockets were drained.
+//! When an outer epoll polls an inner epoll file, the inner epoll locks its
+//! `ep->mtx`, sizes its handle buffer to `set.len()`, calls
+//! [`ReadyQueue::begin_scan`] under its spinlock (detaching the entire ready
+//! list), polls handles under `ep->mtx` via `Pollable::poll(mode, None)` on
+//! each payload, and calls [`ReadyQueue::finish_peek`] under its spinlock.
+//! If [`PeekDone::has_ready`] is `true`, wake `ep->wq` and notify the epoll
+//! file's `PollHead`. Return `EPOLLIN | EPOLLRDNORM` iff [`PeekDone::ready`]
+//! is `true`.
 //!
 //! # Event bits and documented boundaries
 //!
@@ -116,11 +146,12 @@
 //!   `PollHead::notify` wakes all subscribers).
 //! - Linux's `reverse_path_check` (wakeup-path fan-out limits returning
 //!   `EINVAL`) is **not** modelled here (left to B5 or omitted).
-//! - `epfd == fd` (`EINVAL`) and `EPOLLEXCLUSIVE` on an epoll target
-//!   (`is_file_epoll`, `EINVAL`) are B5's checks.
+//! - `!file_can_poll` (`EPERM`), `epfd == fd` (`EINVAL`), and `EPOLLEXCLUSIVE`
+//!   on an epoll target (`is_file_epoll`, `EINVAL`) are B5's checks.
 //! - [`Wake`] is **not** Linux `ep_poll_callback`'s integer return value
-//!   (`1`/`0` for waitqueue traversal); it tells B5 whether an entry newly
-//!   entered the ready list so B5 knows when to wake sleepers.
+//!   (`1`/`0` for waitqueue traversal); it tells B5 when to wake `ep->wq` and
+//!   notify the epoll file's `PollHead` ([`Wake::Queued`] and
+//!   [`Wake::DuringScan`]).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -141,7 +172,7 @@ use core::fmt;
 use linux_raw_sys::{errno, general};
 
 pub use loop_check::{EP_MAX_NESTS, LoopCheck};
-pub use ready::{ReadyQueue, Scan, Storage, Wake};
+pub use ready::{PeekDone, ReadyQueue, Scan, ScanDone, Storage, Wake};
 pub use set::{Added, Drain, EntryRef, EpollSet, Modified, RemoveRange};
 
 /// Data other than high-priority data may be read without blocking.
@@ -202,11 +233,19 @@ pub const EP_ALWAYS_EVENTS: u32 = EPOLLERR | EPOLLHUP;
 pub const EPOLLEXCLUSIVE_OK_BITS: u32 =
     EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLWAKEUP | EPOLLET | EPOLLEXCLUSIVE;
 
-/// Generational slot handle returned by [`EpollSet::add`] and stored in B5's
-/// per-interest `PollWaker` for O(1) lock-separated [`ReadyQueue`] operations.
+/// Extract the monitored event bits from a normalized `events` mask (stripping
+/// [`EP_PRIVATE_BITS`]).
+pub(crate) const fn watch_mask(events: u32) -> u32 {
+    events & !EP_PRIVATE_BITS
+}
+
+/// Generational slot handle returned by [`EpollSet::add`] (via [`Added::handle`])
+/// and stored in B5's per-interest `PollWaker` for O(1) lock-separated
+/// [`ReadyQueue`] operations.
 ///
-/// Reusing a freed slot bumps `gen`, so any stale `Handle` held by an in-flight
-/// waker or unreport path is rejected safely.
+/// Reusing a freed slot bumps `generation`, so any stale `Handle` held by an
+/// in-flight waker is rejected safely. Each `Handle` belongs exclusively to the
+/// paired `(`[`EpollSet`]`, `[`ReadyQueue`]`)` instance that created it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Handle {
     idx: u32,
@@ -214,6 +253,11 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// Sentinel invalid handle (`generation == 0`) for initializing scratch
+    /// buffers passed to [`ReadyQueue::begin_scan`]. Always rejected as stale
+    /// by every lookup and queue operation.
+    pub const INVALID: Self = Self { idx: 0, generation: 0 };
+
     pub(crate) const fn new(idx: u32, generation: u32) -> Self {
         Self { idx, generation }
     }
@@ -223,7 +267,8 @@ impl Handle {
         self.idx
     }
 
-    /// Non-zero slot generation distinguishing reused slots from stale handles.
+    /// Non-zero slot generation distinguishing reused slots from stale handles
+    /// (`0` only for [`Self::INVALID`]).
     pub const fn generation(self) -> u32 {
         self.generation
     }
@@ -253,8 +298,9 @@ pub enum Errno {
     /// Entry not found (`ENOENT` = 2): `modify` or `remove` on a key not
     /// present in the interest set.
     NoEnt,
-    /// Out of memory (`ENOMEM` = 12): fallible slot/storage reservation failed
-    /// and state is unchanged.
+    /// Out of memory (`ENOMEM` = 12): fallible slot-table (`Vec::try_reserve`)
+    /// or [`ReadyQueue::prepare_grow`] storage reservation failed and state is
+    /// unchanged. (`BTreeMap::insert` in stable Rust is not fallible.)
     NoMem,
     /// Entry already exists (`EEXIST` = 17): `add` on a key already present
     /// in the interest set.

@@ -1,29 +1,34 @@
 //! Leaf-spinlock ready list ([`ReadyQueue`]), two-phase scan
-//! (`begin_scan` / `finish_scan` / `finish_peek`), and copy-out rollback
-//! (`unreport`), corresponding to Linux `fs/eventpoll.c` `ep->lock`,
-//! `ep_poll_callback`, `ep_start_scan`, `ep_send_events`, `ep_done_scan`, and
-//! `ep_read_events_proc`.
+//! (`begin_scan` / `finish_scan` / `finish_peek` / `abort_scan`), and copy-out
+//! rollback (`unreport`), corresponding to Linux `fs/eventpoll.c` `ep->lock`,
+//! `ep_poll_callback`, `ep_events_available`, `ep_start_scan`,
+//! `ep_send_events`, `ep_done_scan`, and `ep_read_events_proc`.
 
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::{EP_ALWAYS_EVENTS, EP_PRIVATE_BITS, EPOLLET, EPOLLONESHOT, EpollSet, Errno, Event, Handle};
+use crate::{Added, EPOLLET, EPOLLONESHOT, EpollSet, Errno, Event, Handle, Modified};
 
 /// Outcome of [`ReadyQueue::wake`].
 ///
 /// This is **not** Linux `ep_poll_callback`'s integer return value (`1`/`0` for
-/// waitqueue traversal). It tells the caller whether the interest newly entered
-/// the ready list (`Queued`) so B5 knows when to wake threads sleeping in
-/// `epoll_wait`.
+/// waitqueue traversal). B5 wakes `ep->wq` and notifies the epoll file's
+/// `PollHead` on both [`Self::Queued`] and [`Self::DuringScan`]
+/// ([`Self::should_notify`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub enum Wake {
     /// The interest was armed, matched `ready`, and was newly appended to the
-    /// ready list.
+    /// ready list. Wake `ep->wq` and notify the epoll file's `PollHead`.
     Queued,
-    /// The interest was armed and matched `ready`, and was already on the ready
-    /// list or detached in an active scan (if in a scan, `woke_during_scan` was
-    /// set so the scan will not lose the edge).
+    /// The interest was armed and matched `ready`, and is currently detached
+    /// in an active [`Scan`]; `woke_during_scan` was recorded so the scan will
+    /// not lose the edge. **Notify like [`Self::Queued`]** (wake `ep->wq` and
+    /// notify the epoll file's `PollHead`, matching Linux `ep_poll_callback`'s
+    /// ovflist path).
+    DuringScan,
+    /// The interest was armed and matched `ready`, and was already linked on
+    /// the ready list (`in_ready == true`, not in an active scan).
     AlreadyQueued,
     /// The interest is live, but either disarmed (`EPOLLONESHOT`) or its watch
     /// mask did not intersect `ready`.
@@ -31,6 +36,38 @@ pub enum Wake {
     /// `handle` is out of bounds or its generation no longer matches (the
     /// interest was removed or its slot was reused).
     Stale,
+}
+
+impl Wake {
+    /// Returns `true` when B5 should wake `ep->wq` and notify the epoll file's
+    /// `PollHead` ([`Self::Queued`] or [`Self::DuringScan`]).
+    pub const fn should_notify(self) -> bool {
+        matches!(self, Self::Queued | Self::DuringScan)
+    }
+}
+
+/// Outcome of [`ReadyQueue::finish_scan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "wake ep->wq and notify the epoll file's PollHead when has_ready is true"]
+pub struct ScanDone {
+    /// Number of events appended to `out`.
+    pub reported: usize,
+    /// `true` if the ready list is non-empty after the scan completed; when
+    /// `true`, B5 must wake `ep->wq` and notify the epoll file's `PollHead`
+    /// (Linux `fs/eventpoll.c`, `ep_done_scan`).
+    pub has_ready: bool,
+}
+
+/// Outcome of [`ReadyQueue::finish_peek`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "wake ep->wq and notify the epoll file's PollHead when has_ready is true"]
+pub struct PeekDone {
+    /// `true` if at least one queued interest polled non-zero (`EPOLLIN | EPOLLRDNORM`).
+    pub ready: bool,
+    /// `true` if the ready list is non-empty afterwards (a ready entry was
+    /// restored or a mid-peek wake arrived on a drained entry); when `true`,
+    /// B5 must wake `ep->wq` and notify the epoll file's `PollHead`.
+    pub has_ready: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,10 +107,10 @@ impl ReadySlot {
 
 /// Pre-allocated backing buffer for [`ReadyQueue`], created outside the
 /// spinlock by [`ReadyQueue::prepare_grow`] and swapped in under the spinlock
-/// by [`ReadyQueue::install`].
+/// by [`ReadyQueue::install`] / [`ReadyQueue::activate`].
 ///
-/// Drop the old `Storage` returned by [`ReadyQueue::install`] *after* releasing
-/// the spinlock so no heap deallocation occurs under level-10e.
+/// Drop any returned old `Storage` *after* releasing the spinlock so no heap
+/// deallocation occurs under level-10e.
 #[must_use = "install into ReadyQueue or drop outside the spinlock"]
 pub struct Storage {
     slots: Vec<ReadySlot>,
@@ -108,17 +145,21 @@ impl ReadyList {
     }
 }
 
-/// Detached batch of ready handles produced by [`ReadyQueue::begin_scan`].
+/// Detached batch of the entire ready list produced by
+/// [`ReadyQueue::begin_scan`].
 ///
-/// While a `Scan` is in flight, its handles remain marked in-scan inside the
-/// [`ReadyQueue`]: concurrent [`ReadyQueue::wake`] calls on them record
-/// `woke_during_scan` without touching the ready list, while wakes on other
-/// handles append to the ready list normally.
+/// While a `Scan` is in flight, its handles remain marked `in_scan = true`
+/// inside the [`ReadyQueue`]: concurrent [`ReadyQueue::wake`] calls on them
+/// record `woke_during_scan` without mutating the ready list and return
+/// [`Wake::DuringScan`], while wakes on other handles append to the ready list
+/// and return [`Wake::Queued`].
 ///
-/// Pass every `Scan` back to [`ReadyQueue::finish_scan`] or
-/// [`ReadyQueue::finish_peek`].
+/// Each `Scan` belongs exclusively to the [`ReadyQueue`] that created it and
+/// must be passed back to [`ReadyQueue::finish_scan`],
+/// [`ReadyQueue::finish_peek`], or [`ReadyQueue::abort_scan`]; dropping a
+/// non-empty unfinished `Scan` panics.
 #[derive(Debug)]
-#[must_use = "pass Scan back to ReadyQueue::finish_scan or ReadyQueue::finish_peek"]
+#[must_use = "pass Scan back to finish_scan, finish_peek, or abort_scan"]
 pub struct Scan<'a> {
     handles: &'a [Handle],
     finished: bool,
@@ -143,9 +184,13 @@ impl<'a> Scan<'a> {
 
 impl Drop for Scan<'_> {
     fn drop(&mut self) {
-        debug_assert!(
+        #[cfg(test)]
+        if std::thread::panicking() {
+            return;
+        }
+        assert!(
             self.finished || self.handles.is_empty(),
-            "Scan dropped with {} unfinished handle(s); call finish_scan or finish_peek",
+            "Scan dropped with {} unfinished handle(s); call finish_scan, finish_peek, or abort_scan",
             self.handles.len()
         );
     }
@@ -155,7 +200,7 @@ impl Drop for Scan<'_> {
 /// (Linux `fs/eventpoll.c`, `ep->lock`).
 ///
 /// Every method except [`Self::prepare_grow`] (called without any spinlock
-/// held) performs **zero heap allocations and zero heap deallocations**.
+/// held) performs **zero heap allocations and zero deallocations**.
 pub struct ReadyQueue {
     slots: Vec<ReadySlot>,
     ready: ReadyList,
@@ -189,8 +234,8 @@ impl ReadyQueue {
         self.slots.len()
     }
 
-    /// Number of entries currently linked on the ready list (excluding entries
-    /// temporarily detached in an in-flight [`Scan`]).
+    /// Number of entries currently linked on the ready list (`in_ready == true`,
+    /// excluding entries detached in an in-flight [`Scan`]).
     pub const fn ready_len(&self) -> usize {
         self.ready.len
     }
@@ -198,6 +243,16 @@ impl ReadyQueue {
     /// Returns `true` if at least one entry is currently on the ready list.
     pub const fn has_ready(&self) -> bool {
         !self.ready.is_empty()
+    }
+
+    /// Returns `true` if the ready list is non-empty **or** a [`Scan`] is
+    /// currently in flight (Linux `fs/eventpoll.c`, `ep_events_available`).
+    ///
+    /// B5 checks this under the spinlock before sleeping in `epoll_wait` so a
+    /// waiter does not sleep while another thread is mid-scan with events in
+    /// transit.
+    pub const fn events_available(&self) -> bool {
+        !self.ready.is_empty() || self.scanning
     }
 
     /// Pre-allocate backing [`Storage`] for at least `min_slots` slots outside
@@ -227,52 +282,65 @@ impl ReadyQueue {
         storage
     }
 
-    /// Activate a newly added interest or update an existing interest's watch
-    /// mask and armed state under the spinlock (called after [`EpollSet::add`]
-    /// or [`EpollSet::modify`]).
+    /// Install any growth [`Storage`] from `added`, confirm capacity back to
+    /// `set`, and activate the new interest slot under the level-10e spinlock.
     ///
-    /// Preserves ready-list membership on an existing armed interest. Performs
-    /// **zero heap allocations and zero deallocations**.
+    /// [`EpollSet`] is the authority: if the slot still holds an older
+    /// generation from an un-unlinked removal (e.g., a forgotten `unlink` or a
+    /// partially consumed `RemoveRange`/`Drain`), it is cleanly taken over and
+    /// unlinked from the ready list.
+    ///
+    /// Returns any replaced old [`Storage`] to be dropped *after* releasing the
+    /// spinlock. Performs **zero heap allocations and zero deallocations**.
+    #[must_use = "drop any returned old Storage after releasing the ReadyQueue spinlock"]
+    pub fn activate<K: Ord + Copy, T>(&mut self, set: &mut EpollSet<K, T>, added: Added) -> Option<Storage> {
+        let (handle, mask, growth) = added.into_parts();
+        let old = growth.map(|s| self.install(s));
+        set.confirm_ready_capacity(self.slots.len());
+        self.take_over_slot(handle, mask);
+        old
+    }
+
+    /// Apply a [`Modified`] update from [`EpollSet::modify`] under the
+    /// level-10e spinlock, updating the watch mask and re-arming the interest.
+    ///
+    /// Preserves ready-list membership if the slot already matches
+    /// `modified.handle()`. If the slot holds a different generation (or is
+    /// vacant), [`EpollSet`] is the authority and the slot is taken over
+    /// cleanly. Performs **zero heap allocations and zero deallocations**.
     ///
     /// # Panics
     ///
-    /// Panics if `handle.index()` is out of bounds (caller must [`Self::install`]
-    /// any [`crate::Added::growth`] returned by [`EpollSet::add`] first).
-    pub fn set_mask(&mut self, handle: Handle, watch_mask: u32, armed: bool) {
+    /// Panics if `modified.handle().index()` is out of bounds.
+    pub fn apply(&mut self, modified: Modified) {
+        let handle = modified.handle();
+        let mask = modified.watch_mask();
         let idx = handle.index();
-        let slot = &mut self.slots[idx as usize];
-        let effective_mask = (watch_mask & !EP_PRIVATE_BITS) | EP_ALWAYS_EVENTS;
-        if slot.generation == 0 {
-            debug_assert!(!slot.in_ready && !slot.in_scan);
-            slot.generation = handle.generation();
-            slot.watch_mask = effective_mask;
-            slot.armed = armed;
-            slot.woke_during_scan = false;
-        } else if slot.generation == handle.generation() {
-            slot.watch_mask = effective_mask;
-            slot.armed = armed;
-            if !armed && slot.in_ready {
-                self.unlink_ready(idx);
-            }
+        assert!(
+            (idx as usize) < self.slots.len(),
+            "ReadyQueue::apply slot index {idx} out of bounds (capacity {}); call activate after add",
+            self.slots.len()
+        );
+        if self.slots[idx as usize].generation == handle.generation() {
+            let slot = &mut self.slots[idx as usize];
+            slot.watch_mask = mask;
+            slot.armed = true;
         } else {
-            debug_assert!(false, "ReadyQueue::set_mask called with stale Handle");
+            self.take_over_slot(handle, mask);
         }
     }
 
     /// Remove `handle` from the ready queue and invalidate its generation under
-    /// the spinlock (called after [`EpollSet::remove`] /
-    /// [`EpollSet::remove_range`]).
+    /// the spinlock (called after [`EpollSet::remove`],
+    /// [`EpollSet::remove_range`], or [`EpollSet::drain`]).
     ///
     /// Safely ignores stale or out-of-bounds handles. Performs **zero heap
     /// allocations and zero deallocations**.
     pub fn unlink(&mut self, handle: Handle) {
         let idx = handle.index();
-        let Some(slot) = self.slots.get(idx as usize) else {
+        let Some(slot) = self.slot_mut_if_live(handle) else {
             return;
         };
-        if slot.generation != handle.generation() {
-            return;
-        }
         if slot.in_ready {
             self.unlink_ready(idx);
         }
@@ -288,26 +356,25 @@ impl ReadyQueue {
     ///   masks with [`Wake::Filtered`].
     /// - If the entry is currently detached in an active [`Scan`], records
     ///   `woke_during_scan` without mutating the ready list and returns
+    ///   [`Wake::DuringScan`] (**notify `ep->wq` and the epoll file's
+    ///   `PollHead` just like [`Wake::Queued`]**).
+    /// - If already on the ready list (`in_ready`), returns
     ///   [`Wake::AlreadyQueued`].
-    /// - If already on the ready list, returns [`Wake::AlreadyQueued`].
     /// - Otherwise appends to the tail of the ready list and returns
     ///   [`Wake::Queued`].
     ///
     /// Performs **zero heap allocations and zero deallocations**.
     pub fn wake(&mut self, handle: Handle, ready: u32) -> Wake {
         let idx = handle.index();
-        let Some(slot) = self.slots.get_mut(idx as usize) else {
+        let Some(slot) = self.slot_mut_if_live(handle) else {
             return Wake::Stale;
         };
-        if slot.generation == 0 || slot.generation != handle.generation() {
-            return Wake::Stale;
-        }
         if !slot.armed || (slot.watch_mask & ready) == 0 {
             return Wake::Filtered;
         }
         if slot.in_scan {
             slot.woke_during_scan = true;
-            return Wake::AlreadyQueued;
+            return Wake::DuringScan;
         }
         if slot.in_ready {
             return Wake::AlreadyQueued;
@@ -317,33 +384,38 @@ impl ReadyQueue {
     }
 
     /// Phase 1 of two-phase collection or nested-epoll readiness peeking
-    /// (Linux `fs/eventpoll.c` `ep_start_scan`): detach up to `buf.len()`
-    /// handles from the front of the ready list into `buf` under the spinlock.
+    /// (Linux `fs/eventpoll.c` `ep_start_scan`): detach the **entire** ready
+    /// list into `buf` under the spinlock.
     ///
-    /// Detached entries remain logically queued (`in_scan = true`) until
-    /// [`Self::finish_scan`] or [`Self::finish_peek`] completes, so concurrent
-    /// wakes on them set `woke_during_scan` without duplicating them on the
-    /// ready list. Performs **zero heap allocations and zero deallocations**.
+    /// Size `buf` from [`EpollSet::len`] under `ep->mtx` before taking the
+    /// spinlock. Detached entries remain marked `in_scan = true` until
+    /// [`Self::finish_scan`], [`Self::finish_peek`], or [`Self::abort_scan`]
+    /// completes. Performs **zero heap allocations and zero deallocations**.
     ///
     /// # Panics
     ///
-    /// Panics if another non-empty [`Scan`] is already in flight on this queue.
+    /// Panics if another non-empty [`Scan`] is already in flight, or if
+    /// `buf.len() < self.ready_len()`.
     pub fn begin_scan<'a>(&mut self, buf: &'a mut [Handle]) -> Scan<'a> {
         assert!(!self.scanning, "concurrent scan on ReadyQueue");
-        if buf.is_empty() || self.ready.is_empty() {
+        assert!(
+            buf.len() >= self.ready.len,
+            "begin_scan buffer length ({}) is shorter than ready_len ({}); size from EpollSet::len()",
+            buf.len(),
+            self.ready.len
+        );
+        if self.ready.is_empty() {
             return Scan { handles: &[], finished: true };
         }
         let mut count = 0usize;
-        while count < buf.len() {
-            let Some(idx) = self.pop_front_ready() else {
-                break;
-            };
+        while let Some(idx) = self.pop_front_ready() {
             let slot = &mut self.slots[idx as usize];
             slot.in_scan = true;
             slot.woke_during_scan = false;
             buf[count] = Handle::new(idx, slot.generation);
             count += 1;
         }
+        debug_assert!(self.ready.is_empty());
         self.scanning = true;
         Scan { handles: &buf[..count], finished: false }
     }
@@ -356,40 +428,39 @@ impl ReadyQueue {
     /// than `max` events have been emitted:
     /// - Masks `polled[i]` with the slot's watch mask.
     /// - If zero: drops the entry without disarming `EPOLLONESHOT`, unless a
-    ///   matching [`Self::wake`] arrived mid-scan (`woke_during_scan`), in
-    ///   which case it is requeued at the tail so the new edge is not lost.
-    /// - If non-zero: emits [`Event`] to `out`, then:
-    ///   - disarms `EPOLLONESHOT` entries (not requeued even if woken
-    ///     mid-scan);
-    ///   - requeues level-triggered entries, and edge-triggered entries woken
-    ///     mid-scan (`woke_during_scan`), at the tail of the ready list;
-    ///   - drops edge-triggered entries not woken mid-scan.
+    ///   matching [`Self::wake`] arrived mid-scan (`woke_during_scan`).
+    /// - If non-zero: emits [`Event`] to `out`, then disarms `EPOLLONESHOT`
+    ///   (not requeued even if woken mid-scan), queues LT entries for tail
+    ///   requeue, and drops ET entries unless woken mid-scan.
     ///
-    /// Unvisited handles in `scan` (past `polled.len()` or after hitting `max`)
-    /// are spliced back to the **front** of the ready list in their original
-    /// order for round-robin fairness.
+    /// Resulting ready-list order matches Linux `ep_done_scan`:
+    /// 1. unvisited remainder of `scan` spliced at the **front**;
+    /// 2. entries woken mid-scan (`woke_during_scan` and non-scan wakes) at the
+    ///    head, ahead of LT requeues;
+    /// 3. level-triggered requeues at the **tail**.
     ///
-    /// Returns the number of events appended to `out`. Performs **zero heap
-    /// allocations and zero deallocations** provided `out` does not allocate.
+    /// Returns [`ScanDone`]; when [`ScanDone::has_ready`] is `true`, B5 must
+    /// wake `ep->wq` and notify the epoll file's `PollHead`. Performs **zero
+    /// heap allocations and zero deallocations** provided `out` does not
+    /// allocate.
     pub fn finish_scan<K: Ord + Copy, T>(
         &mut self,
         set: &EpollSet<K, T>,
-        mut scan: Scan<'_>,
+        scan: Scan<'_>,
         polled: &[u32],
         max: usize,
         out: &mut impl Extend<Event>,
-    ) -> usize {
-        let handles = scan.handles;
-        scan.finished = true;
+    ) -> ScanDone {
+        let handles = self.end_scan(scan);
         if handles.is_empty() {
-            return 0;
+            return ScanDone { reported: 0, has_ready: self.has_ready() };
         }
-        debug_assert!(self.scanning);
-        self.scanning = false;
 
         let visit_limit = handles.len().min(polled.len());
         let mut visited = 0usize;
         let mut reported = 0usize;
+        let mut woken_requeue = ReadyList::new();
+        let mut lt_requeue = ReadyList::new();
 
         while visited < visit_limit && reported < max {
             let h = handles[visited];
@@ -397,74 +468,72 @@ impl ReadyQueue {
             visited += 1;
 
             let idx = h.index();
-            let (watch_mask, woke_mid_scan) = {
-                let Some(slot) = self.slot_mut_if_live(h) else {
-                    continue;
-                };
-                debug_assert!(slot.armed, "disarmed interest must never enter a scan");
-                slot.in_scan = false;
-                let woke = core::mem::replace(&mut slot.woke_during_scan, false);
-                (slot.watch_mask, woke)
+            let Some(slot) = self.slot_mut_if_live(h) else {
+                continue;
             };
+            debug_assert!(slot.armed, "disarmed interest must never enter a scan");
+            slot.in_scan = false;
+            let woke_mid_scan = core::mem::replace(&mut slot.woke_during_scan, false);
+            let mask = slot.watch_mask;
 
-            let Some((events, data)) = set.meta(h) else {
+            let Some(entry) = set.get(h) else {
                 continue;
             };
 
-            let revents = ready_bits & watch_mask;
+            let revents = ready_bits & mask;
             if revents == 0 {
                 if woke_mid_scan {
-                    self.push_back_ready(idx);
+                    self.push_back_list(&mut woken_requeue, idx);
                 }
                 continue;
             }
 
-            out.extend(core::iter::once(Event { handle: h, events: revents, data }));
+            out.extend(core::iter::once(Event { handle: h, events: revents, data: entry.data }));
             reported += 1;
 
-            if (events & EPOLLONESHOT) != 0 {
+            if (entry.events & EPOLLONESHOT) != 0 {
                 self.slots[idx as usize].armed = false;
-            } else if (events & EPOLLET) == 0 || woke_mid_scan {
-                self.push_back_ready(idx);
+            } else if (entry.events & EPOLLET) == 0 {
+                self.push_back_list(&mut lt_requeue, idx);
+            } else if woke_mid_scan {
+                self.push_back_list(&mut woken_requeue, idx);
             }
         }
 
-        // Splice unvisited remainder back to the front of `self.ready` in
-        // original order (matching Linux `list_splice(&txlist, &ep->rdllist)`).
+        self.prepend_ready_list(woken_requeue);
+        self.append_ready_list(lt_requeue);
         self.restore_front(&handles[visited..]);
 
-        reported
+        ScanDone { reported, has_ready: self.has_ready() }
     }
 
     /// Complete a non-consuming nested-epoll readiness probe started by
     /// [`Self::begin_scan`] (Linux `fs/eventpoll.c` `__ep_eventpoll_poll` /
     /// `ep_read_events_proc`).
     ///
-    /// Scans `polled` (parallel to `scan.handles()`):
-    /// - At the first handle with non-zero `polled[i] & watch_mask`, stops and
-    ///   returns `true` (`EPOLLIN | EPOLLRDNORM` for the epoll file), restoring
-    ///   that handle and every subsequent handle to the front of the ready list
-    ///   without disarming `EPOLLONESHOT` or dropping `EPOLLET`.
+    /// Scans the whole batch in `polled` (parallel to `scan.handles()`):
+    /// - At the first handle with non-zero `polled[i] & watch_mask`, stops with
+    ///   `ready = true` (`EPOLLIN | EPOLLRDNORM`), restoring that handle and
+    ///   every subsequent handle to the front without disarming `EPOLLONESHOT`
+    ///   or dropping `EPOLLET`.
     /// - Handles with zero masked readiness are pruned from the ready list
     ///   (without disarming `EPOLLONESHOT`) unless a matching wake arrived
-    ///   mid-scan (`woke_during_scan`), in which case they are requeued at the
-    ///   tail.
-    /// - If no polled handle was ready, restores any unpolled tail of `scan` to
-    ///   the front and returns `false`.
+    ///   mid-scan, in which case they are placed back at the head ahead of
+    ///   later entries.
+    /// - Returns [`PeekDone`]; when [`PeekDone::has_ready`] is `true`, B5 must
+    ///   wake `ep->wq` and notify the epoll file's `PollHead`.
     ///
     /// Performs **zero heap allocations and zero deallocations**.
-    pub fn finish_peek(&mut self, mut scan: Scan<'_>, polled: &[u32]) -> bool {
-        let handles = scan.handles;
-        scan.finished = true;
+    pub fn finish_peek(&mut self, scan: Scan<'_>, polled: &[u32]) -> PeekDone {
+        let handles = self.end_scan(scan);
         if handles.is_empty() {
-            return false;
+            return PeekDone { ready: false, has_ready: self.has_ready() };
         }
-        debug_assert!(self.scanning);
-        self.scanning = false;
 
         let visit_limit = handles.len().min(polled.len());
         let mut visited = 0usize;
         let mut found_ready = false;
+        let mut woken_requeue = ReadyList::new();
 
         while visited < visit_limit {
             let h = handles[visited];
@@ -481,48 +550,99 @@ impl ReadyQueue {
             visited += 1;
             slot.in_scan = false;
             let woke = core::mem::replace(&mut slot.woke_during_scan, false);
-            if woke && !slot.in_ready {
-                self.push_back_ready(idx);
+            if woke {
+                debug_assert!(!slot.in_ready);
+                self.push_back_list(&mut woken_requeue, idx);
             }
         }
 
+        self.prepend_ready_list(woken_requeue);
         self.restore_front(&handles[visited..]);
-        found_ready
+        PeekDone { ready: found_ready, has_ready: self.has_ready() }
     }
 
-    /// Roll back reported events whose copy-out to user memory failed
-    /// (Linux `fs/eventpoll.c` `ep_send_events` `-EFAULT` path).
+    /// Abort an in-flight [`Scan`] on a B5 error path between `begin_scan` and
+    /// `finish_scan`/`finish_peek`, restoring the entire batch to the front of
+    /// the ready list in its original order without reporting, disarming, or
+    /// pruning any handle.
     ///
-    /// For each live handle in `handles` (preserving their relative order at
-    /// the front of the ready list): re-arms any disarmed `EPOLLONESHOT` entry
-    /// and requeues the entry at the front of the ready list (or flags
-    /// `woke_during_scan` if another scan already detached it). Safely ignores
-    /// stale handles.
+    /// Returns `true` if the ready list is non-empty afterwards (when `true`,
+    /// wake `ep->wq` and notify the epoll file's `PollHead`). Performs **zero
+    /// heap allocations and zero deallocations**.
+    #[must_use = "wake ep->wq and notify the epoll file's PollHead when true"]
+    pub fn abort_scan(&mut self, scan: Scan<'_>) -> bool {
+        let handles = self.end_scan(scan);
+        if !handles.is_empty() {
+            self.restore_front(handles);
+        }
+        self.has_ready()
+    }
+
+    /// Roll back reported events whose copy-out to user memory failed under
+    /// `ep->mtx` (Linux `fs/eventpoll.c` `ep_send_events` `-EFAULT` path).
     ///
-    /// Performs **zero heap allocations and zero deallocations**.
-    pub fn unreport<I>(&mut self, handles: I)
+    /// Because B5 holds `ep->mtx` across copy-out, no other scan may be active
+    /// on these handles (asserted). Re-arms `EPOLLONESHOT` entries and requeues
+    /// live handles at the front of the ready list in their original order,
+    /// ignoring stale handles.
+    ///
+    /// Returns `true` if the ready list is non-empty afterwards (when `true`,
+    /// wake `ep->wq` and notify the epoll file's `PollHead`). Performs **zero
+    /// heap allocations and zero deallocations**.
+    #[must_use = "wake ep->wq and notify the epoll file's PollHead when true"]
+    pub fn unreport<I>(&mut self, handles: I) -> bool
     where
         I: IntoIterator<Item = Handle>,
         I::IntoIter: DoubleEndedIterator,
     {
         for h in handles.into_iter().rev() {
             let idx = h.index();
-            let Some(slot) = self.slots.get_mut(idx as usize) else {
+            let Some(slot) = self.slot_mut_if_live(h) else {
                 continue;
             };
-            if slot.generation == 0 || slot.generation != h.generation() {
-                continue;
-            }
+            assert!(
+                !slot.in_scan,
+                "ReadyQueue::unreport called while handle is in an active scan; hold ep->mtx across copy-out"
+            );
             slot.armed = true;
-            if slot.in_scan {
-                slot.woke_during_scan = true;
-                continue;
-            }
             if slot.in_ready {
                 self.unlink_ready(idx);
             }
             self.push_front_ready(idx);
         }
+        self.has_ready()
+    }
+
+    fn take_over_slot(&mut self, handle: Handle, watch_mask: u32) {
+        let idx = handle.index();
+        assert!(
+            (idx as usize) < self.slots.len(),
+            "ReadyQueue slot index {idx} out of bounds (capacity {})",
+            self.slots.len()
+        );
+        if self.slots[idx as usize].in_ready {
+            self.unlink_ready(idx);
+        }
+        self.slots[idx as usize] = ReadySlot {
+            generation: handle.generation(),
+            watch_mask,
+            armed: true,
+            in_ready: false,
+            in_scan: false,
+            woke_during_scan: false,
+            prev: None,
+            next: None,
+        };
+    }
+
+    fn end_scan<'a>(&mut self, mut scan: Scan<'a>) -> &'a [Handle] {
+        let handles = scan.handles;
+        scan.finished = true;
+        if !handles.is_empty() {
+            assert!(self.scanning, "ReadyQueue scan completed while no scan is active");
+            self.scanning = false;
+        }
+        handles
     }
 
     fn slot_mut_if_live(&mut self, handle: Handle) -> Option<&mut ReadySlot> {
@@ -536,16 +656,15 @@ impl ReadyQueue {
             let Some(slot) = self.slot_mut_if_live(h) else {
                 continue;
             };
+            debug_assert!(!slot.in_ready);
             slot.in_scan = false;
             slot.woke_during_scan = false;
-            if !slot.in_ready {
-                self.push_front_ready(idx);
-            }
+            self.push_front_ready(idx);
         }
     }
 
-    fn push_back_ready(&mut self, idx: u32) {
-        let old_tail = self.ready.tail;
+    fn push_back_list(&mut self, list: &mut ReadyList, idx: u32) {
+        let old_tail = list.tail;
         {
             let slot = &mut self.slots[idx as usize];
             debug_assert!(!slot.in_ready);
@@ -557,10 +676,16 @@ impl ReadyQueue {
         }
         match old_tail {
             Some(t) => self.slots[t as usize].next = Some(idx),
-            None => self.ready.head = Some(idx),
+            None => list.head = Some(idx),
         }
-        self.ready.tail = Some(idx);
-        self.ready.len += 1;
+        list.tail = Some(idx);
+        list.len += 1;
+    }
+
+    fn push_back_ready(&mut self, idx: u32) {
+        let mut ready = core::mem::replace(&mut self.ready, ReadyList::new());
+        self.push_back_list(&mut ready, idx);
+        self.ready = ready;
     }
 
     fn push_front_ready(&mut self, idx: u32) {
@@ -580,6 +705,42 @@ impl ReadyQueue {
         }
         self.ready.head = Some(idx);
         self.ready.len += 1;
+    }
+
+    fn prepend_ready_list(&mut self, front: ReadyList) {
+        if front.is_empty() {
+            return;
+        }
+        if self.ready.is_empty() {
+            self.ready = front;
+            return;
+        }
+        let front_tail = front.tail.expect("non-empty list must have tail");
+        let back_head = self.ready.head.expect("non-empty list must have head");
+        debug_assert!(self.slots[front_tail as usize].next.is_none());
+        debug_assert!(self.slots[back_head as usize].prev.is_none());
+        self.slots[front_tail as usize].next = Some(back_head);
+        self.slots[back_head as usize].prev = Some(front_tail);
+        self.ready.head = front.head;
+        self.ready.len += front.len;
+    }
+
+    fn append_ready_list(&mut self, back: ReadyList) {
+        if back.is_empty() {
+            return;
+        }
+        if self.ready.is_empty() {
+            self.ready = back;
+            return;
+        }
+        let front_tail = self.ready.tail.expect("non-empty list must have tail");
+        let back_head = back.head.expect("non-empty list must have head");
+        debug_assert!(self.slots[front_tail as usize].next.is_none());
+        debug_assert!(self.slots[back_head as usize].prev.is_none());
+        self.slots[front_tail as usize].next = Some(back_head);
+        self.slots[back_head as usize].prev = Some(front_tail);
+        self.ready.tail = back.tail;
+        self.ready.len += back.len;
     }
 
     fn pop_front_ready(&mut self) -> Option<u32> {
@@ -643,6 +804,7 @@ impl ReadyQueue {
             }
         }
         assert_eq!(self.scanning, in_scan_slots > 0);
+        assert_eq!(self.events_available(), in_ready_slots > 0 || self.scanning);
 
         let mut cur = self.ready.head;
         let mut prev = None;
