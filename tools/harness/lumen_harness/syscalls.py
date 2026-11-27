@@ -421,10 +421,21 @@ def render_value(label: str, value: str) -> str:
     return hex(n)
 
 
+def _undecoded_ignored_struct(call: Call, pos: int, value: str) -> bool:
+    """`epoll_ctl(.., EPOLL_CTL_DEL, .., event)`: Linux ignores the event
+    (fs/eventpoll.c, ep_op_has_event()), so strace prints its bare address."""
+    return (
+        call.name == "epoll_ctl"
+        and pos == 3
+        and call.args[1] in ("0x2", "EPOLL_CTL_DEL")
+        and re.fullmatch(r"0x[0-9a-f]+", value) is not None
+    )
+
+
 def key_values(call: Call) -> dict[str, str]:
     """The recorded arguments of one call (`KEY_ARGS`). An argument strace
     didn't print is skipped only in a call that never returned (printed in
-    part), and a field only in a `NULL` argument; anything else missing is a
+    part), and a field only in a `NULL` argument or one the kernel ignores; anything else missing is a
     `CensusError`."""
     out: dict[str, str] = {}
     for label, pos, fld in KEY_ARGS.get(call.name, ()):
@@ -436,7 +447,7 @@ def key_values(call: Call) -> dict[str, str]:
         if fld is not None:
             m = re.search(rf"(?:^|[{{,\s]){fld}=([^,}}\s]+)", value)
             if not m:
-                if value == "NULL":
+                if value == "NULL" or _undecoded_ignored_struct(call, pos, value):
                     continue
                 raise CensusError(f"{call.name}: no {fld}= in argument {pos}: {value!r}")
             value = m.group(1)

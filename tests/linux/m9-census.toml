@@ -1,0 +1,766 @@
+# The M9 syscall census (#451), written by tools/syscall-census.sh: do not edit.
+# Regenerate it via .github/workflows/syscall-census.yml or tools/syscall-census.sh m9.
+
+[meta]
+alpine = "3.21.10"
+image = "docker.io/library/alpine:3.21@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab"
+kernel = "7.0.0-1018-aws"
+packages = ["alpine-baselayout-3.6.8-r1", "alpine-baselayout-data-3.6.8-r1", "alpine-keys-2.5-r0", "alpine-release-3.21.10-r0", "apk-tools-2.14.13-r0", "binutils-2.43.1-r3", "brotli-libs-1.1.1-r0", "busybox-1.37.0-r14", "busybox-binsh-1.37.0-r14", "c-ares-1.34.9-r0", "ca-certificates-20261020-r0", "ca-certificates-bundle-20261020-r0", "curl-8.14.1-r3", "gcc-14.2.0-r4", "gdbm-1.24-r0", "gmp-6.3.0-r2", "gmp-dev-6.3.0-r2", "isl26-0.26-r1", "jansson-2.14-r4", "libatomic-14.2.0-r4", "libbz2-1.0.8-r6", "libcrypto3-3.3.7-r2", "libcurl-8.14.1-r3", "libdw-0.191-r0", "libelf-0.191-r0", "libexpat-2.11.0-r0", "libffi-3.8.2-r0", "libgcc-14.2.0-r4", "libgmpxx-6.3.0-r2", "libgomp-14.2.0-r4", "libidn2-2.3.7-r0", "libncursesw-6.5_p20241006-r3", "libpanelw-6.5_p20241006-r3", "libpsl-0.21.5-r3", "libssl3-3.3.7-r2", "libstdc++-14.2.0-r4", "libucontext-1.3.2-r0", "libucontext-dev-1.3.2-r0", "libunistring-1.2-r0", "make-4.4.1-r2", "mpc1-1.3.1-r1", "mpdecimal-4.0.0-r0", "mpfr4-4.2.1-r0", "musl-1.2.5-r12", "musl-dev-1.2.5-r12", "musl-fts-1.2.7-r6", "musl-utils-1.2.5-r12", "ncurses-terminfo-base-6.5_p20241006-r3", "nghttp2-libs-1.69.0-r0", "openssl-3.3.7-r2", "pkgconf-2.3.0-r0", "py3-packaging-24.2-r0", "py3-packaging-pyc-24.2-r0", "py3-parsing-3.1.4-r0", "py3-parsing-pyc-3.1.4-r0", "py3-setuptools-70.3.0-r0", "py3-setuptools-pyc-70.3.0-r0", "pyc-3.12.16-r0", "python3-3.12.16-r0", "python3-dev-3.12.16-r0", "python3-pyc-3.12.16-r0", "python3-pycache-pyc0-3.12.16-r0", "readline-8.2.13-r0", "ruby-3.3.14-r0", "ruby-dev-3.3.14-r0", "ruby-libs-3.3.14-r0", "ruby-rdoc-3.3.14-r0", "scanelf-1.3.8-r1", "sqlite-3.48.0-r4", "sqlite-libs-3.48.0-r4", "ssl_client-1.37.0-r14", "strace-6.12-r0", "xz-libs-5.8.4-r0", "yaml-0.2.5-r2", "zlib-1.3.2-r1", "zstd-libs-1.6.0-r1"]
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.read]
+nr = 0
+calls = 6185
+workloads = ["apk", "busybox-nc", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.read.errors]
+EAGAIN = 11
+
+[syscalls.write]
+nr = 1
+calls = 421
+workloads = ["apk", "busybox-nc", "busybox-wget", "net-bench", "python-cext", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.open]
+nr = 2
+calls = 6052
+workloads = ["apk", "busybox-nc", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.open.args]
+flags = ["0x8000", "0x80c1", "0x80c2", "0x8100", "0x8241", "0x8242", "0x88000", "0x88001", "0x88241", "0x88441", "0x88800", "0x98000", "0xa8042"]
+
+[syscalls.open.errors]
+ENOENT = 2651
+
+[syscalls.close]
+nr = 3
+calls = 3726
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.stat]
+nr = 4
+calls = 3710
+workloads = ["apk", "busybox-nc", "busybox-wget", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.stat.errors]
+ENOENT = 660
+
+[syscalls.fstat]
+nr = 5
+calls = 3890
+workloads = ["apk", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.lstat]
+nr = 6
+calls = 113
+workloads = ["python-asyncio", "python-cext", "python-sqlite", "ruby-gem"]
+
+[syscalls.lstat.errors]
+ENOENT = 83
+
+[syscalls.poll]
+nr = 7
+calls = 27
+workloads = ["apk", "busybox-nc", "busybox-wget", "curl", "ruby-gem"]
+
+[syscalls.lseek]
+nr = 8
+calls = 3269
+workloads = ["apk", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.lseek.args]
+whence = ["0", "1", "2"]
+
+[syscalls.lseek.errors]
+ESPIPE = 10
+
+[syscalls.mmap]
+nr = 9
+calls = 19522
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.mmap.args]
+flags = ["0x1", "0x2", "0x12", "0x22", "0x32", "0x20022"]
+prot = ["0x0", "0x1", "0x3", "0x5"]
+
+[syscalls.mprotect]
+nr = 10
+calls = 496
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.mprotect.args]
+prot = ["0x0", "0x1", "0x3"]
+
+[syscalls.munmap]
+nr = 11
+calls = 15413
+workloads = ["apk", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.brk]
+nr = 12
+calls = 290
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.rt_sigaction]
+nr = 13
+calls = 1318
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.rt_sigaction.args]
+sa_flags = ["0x4000000", "0x4000004", "0xc000000", "0xc000004", "0x14000000"]
+signal = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61", "62", "63", "64"]
+
+[syscalls.rt_sigaction.errors]
+EINVAL = 10
+
+[syscalls.rt_sigprocmask]
+nr = 14
+calls = 510
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.rt_sigprocmask.args]
+how = ["0x0", "0x1", "0x2"]
+
+[syscalls.rt_sigreturn]
+nr = 15
+calls = 21
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "python-cext", "ruby-gem"]
+
+[syscalls.ioctl]
+nr = 16
+calls = 2064
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.ioctl.args]
+request = ["0x5413", "0x5421", "0x5451"]
+
+[syscalls.ioctl.errors]
+ENOTTY = 2049
+
+[syscalls.pread64]
+nr = 17
+calls = 11
+workloads = ["python-sqlite"]
+
+[syscalls.pwrite64]
+nr = 18
+calls = 34
+workloads = ["python-sqlite"]
+
+[syscalls.readv]
+nr = 19
+calls = 1138
+workloads = ["busybox-wget", "python-asyncio", "python-cext", "python-sqlite", "ruby-gem"]
+
+[syscalls.writev]
+nr = 20
+calls = 211
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "python-cext", "ruby-gem"]
+
+[syscalls.access]
+nr = 21
+calls = 102
+workloads = ["apk", "python-cext", "ruby-gem"]
+
+[syscalls.access.errors]
+ENOENT = 48
+
+[syscalls.pipe]
+nr = 22
+calls = 1
+workloads = ["busybox-nc"]
+
+[syscalls.select]
+nr = 23
+calls = 8
+workloads = ["apk"]
+
+[syscalls.madvise]
+nr = 28
+calls = 2
+workloads = ["ruby-fiber"]
+
+[syscalls.madvise.args]
+advice = ["0x8"]
+
+[syscalls.dup2]
+nr = 33
+calls = 35
+workloads = ["busybox-nc", "busybox-ping", "busybox-wget", "ruby-gem"]
+
+[syscalls.setitimer]
+nr = 38
+calls = 22
+workloads = ["busybox-nc", "busybox-ping", "busybox-wget"]
+
+[syscalls.getpid]
+nr = 39
+calls = 77
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "python-cext", "python-sqlite", "ruby-gem", "ruby-http"]
+
+[syscalls.sendfile]
+nr = 40
+calls = 2
+workloads = ["ruby-gem"]
+
+[syscalls.socket]
+nr = 41
+calls = 24
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "ruby-http"]
+
+[syscalls.socket.args]
+domain = ["2", "10"]
+protocol = ["0", "1", "6", "17"]
+type = ["0x1", "0x3", "0x801", "0x80001", "0x80002", "0x80801"]
+
+[syscalls.connect]
+nr = 42
+calls = 20
+workloads = ["apk", "busybox-nc", "busybox-wget", "curl", "net-bench", "python-asyncio", "ruby-http"]
+
+[syscalls.connect.errors]
+EINPROGRESS = 9
+
+[syscalls.accept]
+nr = 43
+calls = 1
+workloads = ["busybox-nc"]
+
+[syscalls.sendto]
+nr = 44
+calls = 26
+workloads = ["busybox-ping", "curl", "net-bench", "python-asyncio", "ruby-http"]
+
+[syscalls.sendto.args]
+flags = ["0x0", "0x40", "0x4000"]
+
+[syscalls.recvfrom]
+nr = 45
+calls = 53
+workloads = ["busybox-ping", "curl", "net-bench", "python-asyncio", "ruby-http"]
+
+[syscalls.recvfrom.args]
+flags = ["0x0", "0x40"]
+
+[syscalls.recvfrom.errors]
+EAGAIN = 3
+ERESTARTSYS = 1
+
+[syscalls.sendmsg]
+nr = 46
+calls = 1
+workloads = ["net-bench"]
+
+[syscalls.sendmsg.args]
+flags = ["0x4000"]
+
+[syscalls.recvmsg]
+nr = 47
+calls = 1
+workloads = ["net-bench"]
+
+[syscalls.recvmsg.args]
+flags = ["0x40000000"]
+
+[syscalls.shutdown]
+nr = 48
+calls = 4
+workloads = ["busybox-nc", "busybox-wget", "net-bench"]
+
+[syscalls.shutdown.args]
+how = ["0x1"]
+
+[syscalls.bind]
+nr = 49
+calls = 4
+workloads = ["busybox-nc", "net-bench", "python-asyncio"]
+
+[syscalls.listen]
+nr = 50
+calls = 3
+workloads = ["busybox-nc", "net-bench", "python-asyncio"]
+
+[syscalls.getsockname]
+nr = 51
+calls = 27
+workloads = ["apk", "busybox-nc", "busybox-wget", "curl", "net-bench", "python-asyncio", "ruby-http"]
+
+[syscalls.getpeername]
+nr = 52
+calls = 4
+workloads = ["net-bench", "python-asyncio"]
+
+[syscalls.socketpair]
+nr = 53
+calls = 3
+workloads = ["busybox-wget", "net-bench", "python-asyncio"]
+
+[syscalls.socketpair.args]
+domain = ["1"]
+protocol = ["0"]
+type = ["0x1", "0x80001", "0x80801"]
+
+[syscalls.setsockopt]
+nr = 54
+calls = 24
+workloads = ["apk", "busybox-nc", "busybox-ping", "curl", "net-bench", "python-asyncio", "ruby-http"]
+
+[syscalls.setsockopt.args]
+level = ["1", "6"]
+optname = ["1", "2", "3", "4", "5", "6", "8", "9"]
+
+[syscalls.getsockopt]
+nr = 55
+calls = 11
+workloads = ["apk", "curl", "net-bench", "python-asyncio", "ruby-http"]
+
+[syscalls.getsockopt.args]
+level = ["1"]
+optname = ["4"]
+
+[syscalls.clone]
+nr = 56
+calls = 33
+workloads = ["python-cext", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.clone.args]
+flags = ["0x4111", "0x7d0f00"]
+
+[syscalls.fork]
+nr = 57
+calls = 18
+workloads = ["apk", "busybox-nc", "busybox-wget", "python-cext", "ruby-gem"]
+
+[syscalls.vfork]
+nr = 58
+calls = 2
+workloads = ["python-cext"]
+
+[syscalls.execve]
+nr = 59
+calls = 56
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.execve.errors]
+ENOENT = 3
+
+[syscalls.exit]
+nr = 60
+calls = 13
+workloads = ["ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.wait4]
+nr = 61
+calls = 48
+workloads = ["apk", "busybox-nc", "busybox-wget", "python-cext", "ruby-gem"]
+
+[syscalls.wait4.args]
+options = ["0x0", "0x1"]
+
+[syscalls.wait4.errors]
+ECHILD = 9
+
+[syscalls.uname]
+nr = 63
+calls = 7
+workloads = ["apk", "python-cext"]
+
+[syscalls.fcntl]
+nr = 72
+calls = 4148
+workloads = ["apk", "busybox-nc", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.fcntl.args]
+cmd = ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x406"]
+
+[syscalls.flock]
+nr = 73
+calls = 1
+workloads = ["apk"]
+
+[syscalls.flock.args]
+operation = ["0x6"]
+
+[syscalls.fdatasync]
+nr = 75
+calls = 10
+workloads = ["python-sqlite"]
+
+[syscalls.ftruncate]
+nr = 77
+calls = 4
+workloads = ["busybox-wget", "python-sqlite"]
+
+[syscalls.getcwd]
+nr = 79
+calls = 31
+workloads = ["apk", "python-cext", "ruby-gem"]
+
+[syscalls.chdir]
+nr = 80
+calls = 11
+workloads = ["python-cext", "ruby-gem"]
+
+[syscalls.fchdir]
+nr = 81
+calls = 1
+workloads = ["apk"]
+
+[syscalls.rename]
+nr = 82
+calls = 1
+workloads = ["ruby-gem"]
+
+[syscalls.mkdir]
+nr = 83
+calls = 22
+workloads = ["python-cext", "ruby-gem"]
+
+[syscalls.mkdir.errors]
+EEXIST = 3
+
+[syscalls.rmdir]
+nr = 84
+calls = 1
+workloads = ["ruby-gem"]
+
+[syscalls.unlink]
+nr = 87
+calls = 19
+workloads = ["python-cext", "python-sqlite", "ruby-gem"]
+
+[syscalls.unlink.errors]
+ENOENT = 5
+
+[syscalls.symlink]
+nr = 88
+calls = 304
+workloads = ["apk"]
+
+[syscalls.symlink.errors]
+EEXIST = 304
+
+[syscalls.readlink]
+nr = 89
+calls = 5355
+workloads = ["apk", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.readlink.errors]
+EINVAL = 5281
+ENOENT = 69
+
+[syscalls.chmod]
+nr = 90
+calls = 6
+workloads = ["python-cext", "ruby-gem"]
+
+[syscalls.fchown]
+nr = 93
+calls = 3
+workloads = ["python-sqlite"]
+
+[syscalls.umask]
+nr = 95
+calls = 20
+workloads = ["apk", "python-cext", "ruby-gem"]
+
+[syscalls.getrusage]
+nr = 98
+calls = 4
+workloads = ["python-cext", "ruby-gem"]
+
+[syscalls.sysinfo]
+nr = 99
+calls = 6
+workloads = ["python-cext", "ruby-gem"]
+
+[syscalls.getuid]
+nr = 102
+calls = 690
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.getgid]
+nr = 104
+calls = 665
+workloads = ["apk", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.geteuid]
+nr = 107
+calls = 674
+workloads = ["apk", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.getegid]
+nr = 108
+calls = 670
+workloads = ["apk", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.getppid]
+nr = 110
+calls = 8
+workloads = ["apk", "busybox-nc", "busybox-wget", "python-cext", "ruby-gem"]
+
+[syscalls.getresuid]
+nr = 118
+calls = 5
+workloads = ["ruby-gem"]
+
+[syscalls.sigaltstack]
+nr = 131
+calls = 12
+workloads = ["ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.statfs]
+nr = 137
+calls = 1
+workloads = ["apk"]
+
+[syscalls.fstatfs]
+nr = 138
+calls = 1
+workloads = ["apk"]
+
+[syscalls.prctl]
+nr = 157
+calls = 6
+workloads = ["ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.prctl.args]
+option = ["0x29"]
+
+[syscalls.arch_prctl]
+nr = 158
+calls = 61
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.arch_prctl.args]
+code = ["4098"]
+
+[syscalls.gettid]
+nr = 186
+calls = 24
+workloads = ["python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.tkill]
+nr = 200
+calls = 5
+workloads = ["ruby-gem"]
+
+[syscalls.tkill.args]
+signal = ["26"]
+
+[syscalls.futex]
+nr = 202
+calls = 49
+workloads = ["ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.futex.args]
+op = ["0x0", "0x80", "0x81"]
+
+[syscalls.futex.errors]
+EAGAIN = 2
+ERESTARTSYS = 4
+
+[syscalls.getdents64]
+nr = 217
+calls = 603
+workloads = ["apk", "busybox-wget", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.set_tid_address]
+nr = 218
+calls = 79
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.clock_gettime]
+nr = 228
+calls = 774
+workloads = ["ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.clock_gettime.args]
+clock = ["2"]
+
+[syscalls.clock_getres]
+nr = 229
+calls = 1
+workloads = ["python-asyncio"]
+
+[syscalls.clock_getres.args]
+clock = ["1"]
+
+[syscalls.exit_group]
+nr = 231
+calls = 52
+workloads = ["apk", "busybox-nc", "busybox-ping", "busybox-wget", "curl", "net-bench", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.epoll_ctl]
+nr = 233
+calls = 35
+workloads = ["net-bench", "python-asyncio", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.epoll_ctl.args]
+events = ["0x1", "0x4", "0x5", "0x80000001"]
+op = ["0x1", "0x2", "0x3"]
+
+[syscalls.openat]
+nr = 257
+calls = 235
+workloads = ["apk", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.openat.args]
+flags = ["0x88000", "0x88042", "0x88242", "0x882c2", "0x98000"]
+
+[syscalls.openat.errors]
+ENOENT = 65
+
+[syscalls.fchownat]
+nr = 260
+calls = 1
+workloads = ["apk"]
+
+[syscalls.newfstatat]
+nr = 262
+calls = 5
+workloads = ["apk"]
+
+[syscalls.newfstatat.args]
+flags = ["0x100"]
+
+[syscalls.newfstatat.errors]
+ENOENT = 1
+
+[syscalls.unlinkat]
+nr = 263
+calls = 2
+workloads = ["apk"]
+
+[syscalls.unlinkat.args]
+flags = ["0x0"]
+
+[syscalls.unlinkat.errors]
+ENOENT = 1
+
+[syscalls.renameat]
+nr = 264
+calls = 5
+workloads = ["apk"]
+
+[syscalls.ppoll]
+nr = 271
+calls = 5
+workloads = ["ruby-http"]
+
+[syscalls.utimensat]
+nr = 280
+calls = 3
+workloads = ["apk", "python-cext", "ruby-gem"]
+
+[syscalls.utimensat.args]
+flags = ["0x0"]
+
+[syscalls.utimensat.errors]
+ENOENT = 1
+
+[syscalls.epoll_pwait]
+nr = 281
+calls = 64
+workloads = ["net-bench", "python-asyncio", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.epoll_pwait.errors]
+EINTR = 4
+
+[syscalls.timerfd_create]
+nr = 283
+calls = 1
+workloads = ["net-bench"]
+
+[syscalls.timerfd_create.args]
+clock = ["1"]
+flags = ["0x80800"]
+
+[syscalls.timerfd_settime]
+nr = 286
+calls = 1
+workloads = ["net-bench"]
+
+[syscalls.timerfd_settime.args]
+flags = ["0x0"]
+
+[syscalls.timerfd_gettime]
+nr = 287
+calls = 1
+workloads = ["net-bench"]
+
+[syscalls.accept4]
+nr = 288
+calls = 5
+workloads = ["net-bench", "python-asyncio"]
+
+[syscalls.accept4.args]
+flags = ["0x80000", "0x80800"]
+
+[syscalls.accept4.errors]
+EAGAIN = 1
+
+[syscalls.eventfd2]
+nr = 290
+calls = 8
+workloads = ["curl", "net-bench", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.eventfd2.args]
+flags = ["0x80800"]
+
+[syscalls.epoll_create1]
+nr = 291
+calls = 11
+workloads = ["net-bench", "python-asyncio", "python-cext", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.epoll_create1.args]
+flags = ["0x80000"]
+
+[syscalls.pipe2]
+nr = 293
+calls = 38
+workloads = ["net-bench", "python-cext", "ruby-gem"]
+
+[syscalls.pipe2.args]
+flags = ["0x80000", "0x80800"]
+
+[syscalls.prlimit64]
+nr = 302
+calls = 34
+workloads = ["python-cext", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.prlimit64.args]
+new_limit = ["NULL", "set"]
+resource = ["3", "5", "7", "9"]
+
+[syscalls.getrandom]
+nr = 318
+calls = 24
+workloads = ["apk", "busybox-wget", "curl", "python-asyncio", "python-cext", "python-sqlite", "ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.getrandom.args]
+flags = ["0x0", "0x1", "0x4"]
+
+[syscalls.membarrier]
+nr = 324
+calls = 6
+workloads = ["ruby-fiber", "ruby-gem", "ruby-http"]
+
+[syscalls.membarrier.args]
+cmd = ["0x10"]
+
+[syscalls.copy_file_range]
+nr = 326
+calls = 2
+workloads = ["ruby-gem"]
+
+[syscalls.faccessat2]
+nr = 439
+calls = 51
+workloads = ["ruby-gem"]
+
+[syscalls.faccessat2.args]
+flags = ["0x200"]
+
+[syscalls.faccessat2.errors]
+ENOENT = 34

@@ -348,6 +348,14 @@ def test_key_values_reads_positions_named_args_and_fields():
     assert key_values(act) == {"signal": "2", "sa_flags": "0x14000000"}
     old_only = Call("rt_sigaction", ["2", "NULL", "{sa_flags=0x4000000}", "8"], "0", None)
     assert key_values(old_only) == {"signal": "2"}
+    # EPOLL_CTL_DEL: strace prints the ignored event as a bare address.
+    dele = Call("epoll_ctl", ["3", "0x2", "7", "0x7ffdfac494ac"], "0", None)
+    assert key_values(dele) == {"op": "0x2"}
+    with pytest.raises(CensusError):
+        key_values(Call("epoll_ctl", ["3", "0x1", "7", "{data=0x1}"], "0", None))
+    # Only DEL's event is ignored: an ADD with an undecoded event is refused.
+    with pytest.raises(CensusError):
+        key_values(Call("epoll_ctl", ["3", "0x1", "7", "0x7ffdfac494ac"], "0", None))
     clone3 = Call("clone3", ["{flags=0x3d0f00, exit_signal=0, stack=0x7f}", "88"], "5", None)
     assert key_values(clone3) == {"flags": "0x3d0f00"}
     # A position past the arguments strace printed records nothing, in a call
