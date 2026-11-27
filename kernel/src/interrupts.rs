@@ -556,11 +556,45 @@ crate::ktest!(
             lumen_pci::msix::CONTROL_ENABLE
         );
         kassert!(command & lumen_pci::command::INTX_DISABLE != 0);
+        let before = crate::rng::stats();
         let (count, rings) = (crate::arch::idt::vector_count(v.idt_vector), crate::rng::ktest_rings());
         let mut buf = [0u8; 64];
         crate::rng::fill(&mut buf).map_err(|_| "fill refused")?;
-        kassert!(crate::arch::idt::vector_count(v.idt_vector) > count);
-        kassert!(crate::rng::ktest_rings() > rings);
+        let after = crate::rng::stats();
+        // Confirm `fill` actually completed a virtio-rng request (not skipped
+        // as busy or lost); otherwise no new MSI-X interrupt would be expected.
+        kassert!(after.requests > before.requests);
+        kassert!(after.posts > before.posts);
+        kassert!(crate::rng::sources().virtio);
+        // `rng::fill` -> `StatusHandle::wait_for` checks `queue.can_pop()`
+        // before blocking on the doorbell. Under KVM with ioeventfd, QEMU can
+        // advance the used ring in guest RAM before `msix_notify` delivers the
+        // MSI-X message to the boot CPU's LAPIC, so `fill` can return before
+        // the interrupt runs. Wait (bounded, generous floor) for the doorbell
+        // to ring; `BELL.ring()` runs after `VECTOR_COUNTS` is incremented in
+        // `idt::dispatch`, so once `rings` rises both counts are visible.
+        let start = crate::time::now_ns();
+        let deadline = start.saturating_add(5_000_000_000);
+        let mut wake = crate::rng::ktest_wait_ring(rings, deadline);
+        while wake == crate::virtio::Wake::CannotBlock
+            && crate::rng::ktest_rings() == rings
+            && crate::time::now_ns() < deadline
+        {
+            core::hint::spin_loop();
+            wake = crate::rng::ktest_wait_ring(rings, deadline);
+        }
+        let after_count = crate::arch::idt::vector_count(v.idt_vector);
+        let after_rings = crate::rng::ktest_rings();
+        if after_count <= count || after_rings <= rings {
+            let waited_ms = crate::time::now_ns().saturating_sub(start) / 1_000_000;
+            crate::ktest::diag(format_args!(
+                "msix_vector_delivered: vec {:#x} count {count}->{after_count}, rings {rings}->{after_rings}, \
+                 wake {wake:?}, waited {waited_ms} ms, requests {}->{}, posts {}->{}, busy {}->{}",
+                v.idt_vector, before.requests, after.requests, before.posts, after.posts, before.busy, after.busy,
+            ));
+        }
+        kassert!(after_count > count);
+        kassert!(after_rings > rings);
         Ok(())
     }
 );

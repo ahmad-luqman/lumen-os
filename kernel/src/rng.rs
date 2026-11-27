@@ -654,6 +654,13 @@ pub fn ktest_rings() -> u64 {
     BELL.rings()
 }
 
+/// Ktests: wait until the device's doorbell has rung past `seen`, or
+/// `deadline` (`time::now_ns`) passes.
+#[cfg(feature = "ktest")]
+pub fn ktest_wait_ring(seen: u64, deadline: u64) -> crate::virtio::Wake {
+    BELL.wait_after(seen, deadline)
+}
+
 /// Ktests: the bound device's `msix_config` and queue 0's
 /// `queue_msix_vector`, as read now.
 #[cfg(feature = "ktest")]
