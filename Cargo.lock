@@ -392,6 +392,13 @@ name = "lumen-elf"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-epoll"
+version = "0.0.1"
+dependencies = [
+ "linux-raw-sys",
+]
+
+[[package]]
 name = "lumen-font"
 version = "0.0.1"
 dependencies = [

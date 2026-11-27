@@ -1,0 +1,6 @@
+# Features: epoll interest sets, ready lists, and syscalls. See tests/features/README.md for the format.
+
+[[feature]]
+name = "epoll interest sets and ready lists (logic)"
+milestone = "M9"
+tests = ["cargo:lumen-epoll"]

@@ -685,6 +685,32 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   chunks and its wake rules; `WriteStep`, `InterruptedWrite`,
   `FaultedWrite`) (host-tested, incl. no allocation outside creation and
   `set_capacity`, `tests/zero_alloc.rs`).
+- `crates/lumen-epoll`: `epoll(7)` interest sets, ready lists and nested-set
+  loop checks as logic (M9, #455; ARCHITECTURE sections 9 and 10), split
+  across two locks: `EpollSet<K, T>` behind B5's sleep mutex (`ep->mtx`:
+  key-to-slot table, per-interest payload `T` with `Option<PollGuard>`,
+  events, user `data`, slot generations; `add` with fallible `Vec::try_reserve`
+  and `ReadyQueue::prepare_grow` (`Errno::NoMem` for slot/storage reservation
+  only; `BTreeMap::insert` is infallible) returning opaque `Added`, zero-alloc
+  `modify` returning opaque `Modified`, `remove` returning `(Handle, T)`,
+  allocation-free `remove_range` and `drain` yielding `(K, Handle, T)`), and
+  `ReadyQueue` behind the level-10e leaf spinlock (`ep->lock`: generational
+  `Handle`-indexed intrusive ready list with `Handle::INVALID`, copied watch
+  masks, `in_ready`/`in_scan`/`armed`/`woke_during_scan` flags; zero-alloc
+  `wake -> Wake` (`Queued`/`AlreadyQueued`/`Filtered`/`Stale`; every matching
+  source wake — `Queued` or `AlreadyQueued`, whether newly queued, already
+  `in_ready`, or `in_scan` — wakes waiters and notifies `PollHead` subscribers
+  via `should_wake_waiters`/`should_notify_subscribers`), `activate(&mut set, Added) -> Option<Storage>`
+  confirming growth capacity and taking over stale slots, `apply(Modified)`,
+  `unlink`, `install(Storage)`, `events_available`, full-list two-phase
+  `begin_scan`/`Scan` + `finish_scan` (`ScanDone.wake_waiters`, `Event`,
+  `ep_done_scan` order) / `finish_peek` (`PeekDone.wake_waiters`) /
+  `abort_scan`, and `unreport` for copy-out rollback under `ep->mtx`
+  (scan/rollback results wake `ep->wq` waiters only, never `PollHead`
+  subscribers)); plus `LoopCheck<Id>` (cycle and Linux v6.17+ `EP_MAX_NESTS` =
+  4 bidirectional depth check with refcounted edges) and `Errno`/`EPOLL*`
+  constants from `linux-raw-sys` (host-tested, incl. randomized models and
+  `tests/zero_alloc.rs`).
 - `crates/lumen-tty`: a terminal line discipline as logic, after Linux's
   n_tty (M8, #340; ARCHITECTURE section 10): `LineDiscipline` (`receive`
   each input byte: canonical editing, echo, `ISIG`'s `JobSignal`; `read`

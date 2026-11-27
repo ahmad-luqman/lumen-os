@@ -122,6 +122,7 @@ lumen-futex = { path = "crates/lumen-futex" }
 lumen-signal = { path = "crates/lumen-signal" }
 lumen-pipe = { path = "crates/lumen-pipe" }
 lumen-tty = { path = "crates/lumen-tty" }
+lumen-epoll = { path = "crates/lumen-epoll" }
 
 # `vendor/ext4plus` is ext4plus 0.1.0-rc.2's crate file unpacked (sha256
 # 6c83a722…, the checksum Cargo.lock had for it), with Lumen's fixes on top,
