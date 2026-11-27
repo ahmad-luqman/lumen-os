@@ -6,6 +6,7 @@ scripts, external commands, pipelines and background jobs (#393).
 
 import os
 import re
+import sqlite3
 import sys
 
 import pytest
@@ -635,3 +636,350 @@ printf 'j2=ok\n'
     )
     assert debugfs(disk, "cat /d2/j2.err") == ""
     assert "--jobserver-auth=fifo:" in debugfs(disk, "cat /d2/j2.flags")
+
+
+def test_local_git_and_sqlite3(boot, tmp_path):
+    """D3: unmodified Alpine `git` and `sqlite3` on the developer image at 512 MiB.
+
+    `git` initializes a repository, commits on `main` and a diverged `feature`
+    branch, checks `git diff` and `git checkout`, performs a three-way merge,
+    checks `git log` and `git fsck --full --strict`. `sqlite3` enables WAL mode,
+    verifies commit and rollback, then holds an active `BEGIN IMMEDIATE` write
+    transaction in one process (synchronized through FIFOs) while a concurrent
+    reader sees the pre-commit WAL snapshot and a competing writer fails with
+    `database is locked` via POSIX `fcntl` locks. After committing while keeping
+    the writer connected, a second process reads the committed frames from the
+    non-empty `-wal` via `-shm`, then the connected writer runs
+    `PRAGMA wal_checkpoint(TRUNCATE)` (`0|0|0`) and `-wal` is confirmed zero
+    bytes before closing. Finally `PRAGMA integrity_check` returns `ok`, the
+    synced ext4 image passes `e2fsck -fn`, and the host's `sqlite3` verifies the
+    persisted database extracted with `debugfs`.
+    """
+    _require_dev_rootfs()
+    disk = copy_dev_rootfs(tmp_path)
+    script = tmp_path / "d3-git-sqlite.sh"
+    script.write_text(
+        r"""set -eu
+export PATH=/bin:/usr/bin
+export HOME=/root
+
+# --- Part 1: local git (init, commit, diff, branch, 3-way merge, log, fsck) ---
+mkdir /d3-git
+cd /d3-git
+git init -q -b main
+git config user.name "Lumen Test"
+git config user.email "test@lumen.local"
+
+printf 'alpha\n' > a.txt
+printf 'line1\nline2\nline3\n' > shared.txt
+git add a.txt shared.txt
+git commit -q -m "initial commit"
+[ -z "$(git status --short)" ]
+
+git checkout -q -b feature
+printf 'line1\nline2\nline3-feature\n' > shared.txt
+printf 'beta\n' > b.txt
+git diff -- shared.txt > /tmp/git-diff.txt
+grep -qx -- '-line3' /tmp/git-diff.txt
+grep -qx -- '+line3-feature' /tmp/git-diff.txt
+git add shared.txt b.txt
+git commit -q -m "feature work"
+
+git checkout -q main
+[ ! -e b.txt ]
+grep -qx 'line3' shared.txt
+printf 'line1-main\nline2\nline3\n' > shared.txt
+printf 'gamma\n' > c.txt
+git add shared.txt c.txt
+git commit -q -m "main work"
+
+git merge -q --no-edit feature >/dev/null
+[ -z "$(git status --short)" ]
+git diff HEAD~1 -- b.txt > /tmp/git-merge-diff.txt
+grep -qx -- '+beta' /tmp/git-merge-diff.txt
+git fsck --full --strict --no-progress >/dev/null
+
+printf 'git-count=%s\n' "$(git rev-list --count HEAD)"
+git --no-pager log --format='git-log=%s'
+printf 'git-shared-begin\n'
+cat shared.txt
+printf 'git-shared-end\n'
+
+# --- Part 2: sqlite3 (WAL mode, commit/rollback, cross-process POSIX locks) ---
+mkdir /d3-sql
+cd /d3-sql
+init_out=$(sqlite3 /d3-sql/app.db <<'SQL'
+PRAGMA journal_mode=WAL;
+CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER NOT NULL);
+BEGIN;
+INSERT INTO items VALUES (1, 'alpha', 10);
+INSERT INTO items VALUES (2, 'beta', 20);
+COMMIT;
+BEGIN;
+INSERT INTO items VALUES (99, 'rolled-back', 999);
+ROLLBACK;
+SELECT COUNT(*), SUM(qty) FROM items;
+SQL
+)
+printf 'sql-init=%s\n' "$(printf '%s\n' "$init_out" | paste -sd, -)"
+
+# Hold an open WAL write transaction in a background sqlite3 process; FIFOs
+# establish that the write lock is held before the concurrent reader and
+# competing writer run, and that committed WAL frames are visible across
+# processes before close-time checkpointing (no timing assumptions).
+mkfifo sql-ready sql-go
+cat > /d3-sql/hold.sh <<'HOLD'
+#!/bin/sh
+printf '%s\n' "$1" > /d3-sql/sql-ready
+read -r tok < /d3-sql/sql-go
+[ "$tok" = "$2" ]
+HOLD
+chmod 755 /d3-sql/hold.sh
+
+sqlite3 /d3-sql/app.db > /tmp/sql-writer.out <<'SQL' &
+BEGIN IMMEDIATE;
+INSERT INTO items VALUES (10, 'from-writer', 100);
+.shell /d3-sql/hold.sh locked commit
+COMMIT;
+.shell /d3-sql/hold.sh committed checkpoint
+PRAGMA wal_checkpoint(TRUNCATE);
+.shell /d3-sql/hold.sh checkpointed close
+SQL
+writer=$!
+
+read -r ready_tok < /d3-sql/sql-ready
+[ "$ready_tok" = locked ]
+[ -f /d3-sql/app.db-shm ]
+
+# WAL allows a concurrent reader to see the pre-commit snapshot while the
+# writer holds the write lock.
+snap=$(sqlite3 /d3-sql/app.db "SELECT COUNT(*), SUM(qty) FROM items;")
+printf 'sql-wal-snapshot=%s\n' "$snap"
+
+# A competing writer must fail immediately due to POSIX fcntl record locking.
+if sqlite3 /d3-sql/app.db "PRAGMA busy_timeout=0; BEGIN IMMEDIATE; INSERT INTO items VALUES (11, 'blocked', 1); COMMIT;" > /tmp/sql-conflict.out 2> /tmp/sql-conflict.err; then
+    printf 'sql-conflict=UNEXPECTED_SUCCESS\n'
+    printf 'commit\n' > /d3-sql/sql-go
+    read -r _ < /d3-sql/sql-ready || true
+    printf 'checkpoint\n' > /d3-sql/sql-go
+    read -r _ < /d3-sql/sql-ready || true
+    printf 'close\n' > /d3-sql/sql-go
+    wait "$writer" || true
+    exit 41
+fi
+grep -q 'database is locked' /tmp/sql-conflict.err
+printf 'sql-lock-conflict=locked\n'
+
+# Commit while keeping the writer's connection open so committed frames sit in
+# -wal and a second process reads them through the shared -shm index.
+printf 'commit\n' > /d3-sql/sql-go
+read -r ready_tok < /d3-sql/sql-ready
+[ "$ready_tok" = committed ]
+[ -s /d3-sql/app.db-wal ]
+wal_live=$(sqlite3 /d3-sql/app.db "SELECT COUNT(*), SUM(qty) FROM items;")
+printf 'sql-wal-committed=%s\n' "$wal_live"
+[ -s /d3-sql/app.db-wal ]
+
+# Run PRAGMA wal_checkpoint(TRUNCATE) while the writer stays connected so it
+# checkpoints real WAL frames and truncates -wal to zero bytes before close.
+printf 'checkpoint\n' > /d3-sql/sql-go
+read -r ready_tok < /d3-sql/sql-ready
+[ "$ready_tok" = checkpointed ]
+[ -f /d3-sql/app.db-wal ]
+[ ! -s /d3-sql/app.db-wal ]
+
+printf 'close\n' > /d3-sql/sql-go
+wait "$writer"
+rm /d3-sql/sql-ready /d3-sql/sql-go /d3-sql/hold.sh
+
+ckpt=$(cat /tmp/sql-writer.out)
+case "$ckpt" in
+    0\|0\|0) ;;
+    *)
+        printf 'sql-checkpoint-failed=%s\n' "$ckpt"
+        exit 42
+        ;;
+esac
+printf 'sql-integrity=%s\n' "$(sqlite3 /d3-sql/app.db 'PRAGMA integrity_check;')"
+sqlite3 /d3-sql/app.db "SELECT id, name, qty FROM items ORDER BY id;"
+""",
+        encoding="utf-8",
+    )
+    debugfs(disk, f'write "{script}" /d3-git-sqlite.sh', write=True)
+    m = boot("qemutest", memory="512M", devices=Devices(blk_image=disk, rng=True))
+    m.expect(PROMPT, BOOT_TIMEOUT)
+
+    # Generous outer timeout for TCG on a busy host (no timing ceilings).
+    raw = run(m, "linux /bin/busybox ash /d3-git-sqlite.sh", 600)
+    lines = raw.splitlines()
+    done = BUSYBOX_EXIT.fullmatch(lines[-1]) if lines else None
+    assert done, f"no `linux: /bin/busybox exit=...` line last:\n{raw}"
+    assert int(done.group(1)) == 0, raw
+    out = lines[:-1]
+    assert out == [
+        "git-count=4",
+        "git-log=Merge branch 'feature'",
+        "git-log=main work",
+        "git-log=feature work",
+        "git-log=initial commit",
+        "git-shared-begin",
+        "line1-main",
+        "line2",
+        "line3-feature",
+        "git-shared-end",
+        "sql-init=wal,2|30",
+        "sql-wal-snapshot=2|30",
+        "sql-lock-conflict=locked",
+        "sql-wal-committed=3|130",
+        "sql-integrity=ok",
+        "1|alpha|10",
+        "2|beta|20",
+        "10|from-writer|100",
+    ], raw
+    assert CRASH_BEGIN not in m.output
+
+    assert run(m, "sync", 60) == "sync: ok\n"
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    e2fsck_check(disk)
+
+    assert {".git", "a.txt", "b.txt", "c.txt", "shared.txt"} <= debugfs_names(disk, "/d3-git")
+    assert debugfs(disk, "cat /d3-git/a.txt") == "alpha\n"
+    assert debugfs(disk, "cat /d3-git/b.txt") == "beta\n"
+    assert debugfs(disk, "cat /d3-git/c.txt") == "gamma\n"
+    assert debugfs(disk, "cat /d3-git/shared.txt") == "line1-main\nline2\nline3-feature\n"
+    assert debugfs(disk, "cat /d3-git/.git/HEAD") == "ref: refs/heads/main\n"
+
+    dumped_db = tmp_path / "app.db"
+    debugfs(disk, f'dump /d3-sql/app.db "{dumped_db}"')
+    with sqlite3.connect(dumped_db) as conn:
+        assert conn.execute("PRAGMA integrity_check;").fetchall() == [("ok",)]
+        assert conn.execute("SELECT id, name, qty FROM items ORDER BY id;").fetchall() == [
+            (1, "alpha", 10),
+            (2, "beta", 20),
+            (10, "from-writer", 100),
+        ]
+
+
+def test_vim_edits_a_file_over_pty(boot, tmp_path):
+    """D3: unmodified Alpine `vim` editing a file over a PTY on the developer image at 512 MiB.
+
+    `/usr/local/bin/ptyrun --script` allocates a PTY via `/dev/ptmx`, starts
+    `vim -u NONE -N -c 'set ttimeoutlen=0 showmode laststatus=2 statusline=size=%{&lines}x%{&columns}'`
+    on `/dev/pts/N` as a session leader with a controlling terminal, and drives
+    it through the PTY master directly (avoiding `/dev/console` before C10).
+    Every step waits in the PTY output stream for vim's rendered state (the
+    initial file lines and `size=24x80`, the `SIGWINCH` resize redraw
+    `size=30x90` after `TIOCSWINSZ`, `-- INSERT --`, the typed text, `written`)
+    before sending the next keys, then waits for exit 0. Afterwards the edited
+    file is verified in the guest and, after `sync` and `e2fsck -fn`, on the
+    ext4 image via `debugfs`.
+    """
+    _require_dev_rootfs()
+    disk = copy_dev_rootfs(tmp_path)
+    pty_script = tmp_path / "d3-vim.pty"
+    pty_script.write_text(
+        r"""# Confirm vim rendered the initial file and initial 24x80 statusline before typing.
+expect first line
+expect second line
+expect size=24x80
+# Resize via TIOCSWINSZ and confirm vim handles SIGWINCH by redrawing 30x90.
+winsize 30 90
+expect size=30x90
+# Move to the last line, open a new line below, wait for Insert mode.
+send Go
+expect -- INSERT --
+# Type the new line and confirm it renders.
+send third line from vim
+expect third line from vim
+# Leave Insert mode, write the file, confirm vim reports written, then quit.
+send \x1b:w\r
+expect written
+send :q\r
+wait_exit 0
+""",
+        encoding="utf-8",
+    )
+    runner = tmp_path / "d3-vim.sh"
+    runner.write_text(
+        r"""set -eu
+export PATH=/bin:/usr/bin
+export HOME=/root
+export TERM=vt100
+
+mkdir /d3-vim
+printf 'first line\nsecond line\n' > /d3-vim/note.txt
+
+/usr/local/bin/ptyrun --script /d3-vim.pty -- /usr/bin/vim -u NONE -N -c 'set ttimeoutlen=0 showmode laststatus=2 statusline=size=%{&lines}x%{&columns}' /d3-vim/note.txt
+
+[ ! -e /d3-vim/.note.txt.swp ]
+printf 'vim-file-begin\n'
+cat /d3-vim/note.txt
+printf 'vim-file-end\n'
+
+# Regression check: expect must match START before a >200 KiB tail evicts it,
+# and still find END across buffer evictions.
+cat > /tmp/large.pty <<'PTY'
+expect START
+expect END
+wait_exit 0
+PTY
+/usr/local/bin/ptyrun --script /tmp/large.pty -- /bin/sh -c 'printf START; dd if=/dev/zero bs=4096 count=50 2>/dev/null | tr "\0" x; printf END'
+
+# Regression check: relay mode forwards piped stdin EOF via VEOF so canonical
+# children finish instead of hanging.
+relay_out=$(printf 'hello-relay\n' | /usr/local/bin/ptyrun /bin/cat)
+case "$relay_out" in
+    *hello-relay*) printf 'pty-relay-eof=ok\n' ;;
+    *)
+        printf 'pty-relay-eof=BAD:%s\n' "$relay_out"
+        exit 51
+        ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    debugfs(disk, f'write "{pty_script}" /d3-vim.pty', write=True)
+    debugfs(disk, f'write "{runner}" /d3-vim.sh', write=True)
+    m = boot("qemutest", memory="512M", devices=Devices(blk_image=disk, rng=True))
+    m.expect(PROMPT, BOOT_TIMEOUT)
+
+    # Generous outer timeout for TCG on a busy host (no timing ceilings).
+    raw = run(m, "linux /bin/busybox ash /d3-vim.sh", 120)
+    lines = raw.splitlines()
+    done = BUSYBOX_EXIT.fullmatch(lines[-1]) if lines else None
+    assert done, f"no `linux: /bin/busybox exit=...` line last:\n{raw}"
+    assert int(done.group(1)) == 0, raw
+    assert lines[:-1] == [
+        "ok step 1 expect first line",
+        "ok step 2 expect second line",
+        "ok step 3 expect size=24x80",
+        "ok step 4 winsize 30x90",
+        "ok step 5 expect size=30x90",
+        "ok step 6 send",
+        "ok step 7 expect -- INSERT --",
+        "ok step 8 send",
+        "ok step 9 expect third line from vim",
+        "ok step 10 send",
+        "ok step 11 expect written",
+        "ok step 12 send",
+        "ok step 13 wait_exit 0",
+        "vim-file-begin",
+        "first line",
+        "second line",
+        "third line from vim",
+        "vim-file-end",
+        "ok step 1 expect START",
+        "ok step 2 expect END",
+        "ok step 3 wait_exit 0",
+        "pty-relay-eof=ok",
+    ], raw
+    assert CRASH_BEGIN not in m.output
+
+    assert run(m, "sync", 60) == "sync: ok\n"
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    e2fsck_check(disk)
+
+    assert debugfs_names(disk, "/d3-vim") == {"note.txt"}
+    assert debugfs(disk, "cat /d3-vim/note.txt") == "first line\nsecond line\nthird line from vim\n"

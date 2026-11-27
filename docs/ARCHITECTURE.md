@@ -10850,10 +10850,12 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
   (processes, threads, signals, faults, `futex`, timers, sessions, the
   small calls), `m8_io` (pipes, FIFOs, `poll`/`select`, PTYs), `m8_vm`
   (shootdowns) and `ptyrun` (D3: opens `/dev/ptmx`, starts its argument
-  on the slave as a session leader with it as its controlling terminal,
-  puts its own terminal (the console) in raw mode without echo, and relays
-  bytes between its own stdin/stdout and the master, setting the PTY's
-  window size from its own). Dynamically linked against musl,
+  on the slave as a session leader with it as its controlling terminal;
+  `--script <file> -- <program> [args...]` drives the program directly
+  over the PTY master, used by D3's vim scenario, while the interactive
+  console relay mode puts its own terminal in raw mode without echo,
+  copies its window size and relays stdin/stdout to the master, which
+  needs C10). Dynamically linked against musl,
   `#![no_std]`, built with the pinned `rustc --target
   x86_64-unknown-linux-musl` and `rust-lld` exactly as `tools/linux-m7/`
   (above), into `build/linux/`, so both images stage them. Each mode
@@ -11479,9 +11481,12 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   - D3: `scenario:test_alpine::test_local_git_and_sqlite3` (git
     init/commit/log/diff/merge; sqlite3 with WAL and POSIX locks) and
     `scenario:test_alpine::test_vim_edits_a_file_over_pty` (vim `-u NONE
-    -N -c 'set ttimeoutlen=0 showmode'` under `ptyrun`, keys typed over the
-    console, each step waiting in the byte stream for `-- INSERT --` or
-    the `written` message, the file checked after);
+    -N -c 'set ttimeoutlen=0 showmode ...'` driven directly over a PTY
+    master by `ptyrun --script` rather than over the console, whose raw
+    relay mode needs C10; each step waiting in the PTY byte stream for the
+    initial file, resize redraw after `TIOCSWINSZ`/`SIGWINCH`,
+    `-- INSERT --`, typed text or the `written` message, the file checked
+    after);
   - D4: `scenario:test_conformance::test_musl_libc_test_core` (below).
 - C5 updated `tests/scenarios/test_linux_user.py` to check signal exits,
   including `exit=135 signal=7` for file-backed bus errors.
