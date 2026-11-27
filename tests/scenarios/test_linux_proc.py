@@ -482,3 +482,68 @@ def test_futex_and_pthread_mutex_stress(boot, tmp_path):
     expect_screen(m, rf"^ok futex-kernel-blocking\nlinux: {PROC} exit=0 leaked_frames=0$", 30)
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_posix_shm_and_named_semaphores(boot, tmp_path):
+    """#433: musl shm/sem APIs share across fork and survive removal of their names."""
+    from test_fs import TMPFS_LIMIT, mount_table, quota_in, stat_fields
+
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    table = mount_table(m)
+    assert table["/dev/shm"][:3] == ("tmpfs", "0:7", "rw"), table
+    assert quota_in(table, "/dev/shm") == (0, TMPFS_LIMIT), table
+    tmp_quota = quota_in(table, "/tmp")
+    # Show that the new mount charges its own quota, independently of /tmp.
+    assert run(m, "vfstest write-pattern /dev/shm/quota-probe 8192") == "wrote 8192\n"
+    charged = mount_table(m)
+    assert quota_in(charged, "/dev/shm")[0] >= 8192, charged
+    assert quota_in(charged, "/tmp") == tmp_quota, charged
+    assert run(m, "vfstest unlink /dev/shm/quota-probe") == "unlink: ok\n"
+    st = stat_fields(m, "/dev/shm")
+    assert (st["type"], st["mode"]) == ("dir", "1777"), st
+    assert "tmpfs /dev/shm tmpfs rw 0 0\n" in run(m, "vfstest cat /proc/mounts")
+    for _ in range(2):
+        out = run(m, f"linux {PROC} posix-shm", 120)
+        assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+            "shm-metadata-and-open-flags",
+            "shm-and-semaphores-across-fork",
+        ], out
+        assert re.search(rf"linux: {PROC} exit=0 leaked_frames=0\b", out), out
+        assert "FAIL" not in out, out
+        assert set(run(m, "vfstest ls /dev/shm").splitlines()) == {".", ".."}
+        assert quota_in(mount_table(m), "/dev/shm") == (0, TMPFS_LIMIT)
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+@pytest.mark.parametrize(
+    ("stage", "failure"),
+    [
+        ("child-early", "injected child before post"),
+        ("child-late", "injected child after wait"),
+        ("parent", "injected parent before release"),
+    ],
+)
+def test_posix_shm_failure_releases_peer(boot, tmp_path, stage, failure):
+    """On EBADF the failing side releases the other; the parent reaps the child."""
+    from test_fs import TMPFS_LIMIT, mount_table, quota_in
+
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    out = run(m, f"linux {PROC} posix-shm-fail {stage}", 120)
+    assert "ok shm-metadata-and-open-flags\n" in out, out
+    assert f"{failure} (got -9)" in out, out
+    assert "FAIL shm child wait: exit status word (got 256)\n" in out, out
+    assert f"linux: {PROC} exit=2 " in out, out
+    for error in ("FAIL shm child release", "FAIL shm parent release", "FAIL shm cleanup"):
+        assert error not in out, out
+    assert set(run(m, "vfstest ls /dev/shm").splitlines()) == {".", ".."}
+    assert quota_in(mount_table(m), "/dev/shm") == (0, TMPFS_LIMIT)
+    # The same names and resources remain usable after the failed run.
+    recovered = run(m, f"linux {PROC} posix-shm", 120)
+    assert re.search(rf"linux: {PROC} exit=0 leaked_frames=0\b", recovered), recovered
+    assert "FAIL" not in recovered, recovered
+    assert quota_in(mount_table(m), "/dev/shm") == (0, TMPFS_LIMIT)
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

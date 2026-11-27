@@ -32,6 +32,8 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     let (args, n) = unsafe { common::args(argc, argv) };
     match &args[..n] {
         [_, b"fork-wait"] => fork_wait(),
+        [_, b"posix-shm"] => posix_shm::run(b"none"),
+        [_, b"posix-shm-fail", stage] => posix_shm::run(stage),
         [_, b"sessions"] => sessions::run(),
         [_, b"sessions-exec-hold"] => sessions::exec_hold(),
         [_, b"threads"] => threads::run(),
@@ -725,3 +727,281 @@ const E2BIG: i64 = 7;
 const ELOOP: i64 = 40;
 
 const O_RDONLY: u64 = 0;
+
+/// POSIX shared memory and named semaphores through musl, including its
+/// temporary-file/link publication of a newly created semaphore.
+mod posix_shm {
+    use super::{
+        EAGAIN, EBADF, ELOOP, ENOENT, F_GETFD, MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, SIGKILL, SYS_FCNTL,
+        SYS_KILL, SYS_OPEN, wait,
+    };
+    use crate::common::{self, R, ensure, eq, ok, sys};
+    use core::ffi::{c_char, c_int, c_void};
+    use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
+
+    // SAFETY: declarations match musl's x86-64 C ABI; sem_t is opaque here.
+    unsafe extern "C" {
+        fn shm_open(name: *const c_char, flags: c_int, mode: u32) -> c_int;
+        fn shm_unlink(name: *const c_char) -> c_int;
+        fn sem_open(name: *const c_char, flags: c_int, ...) -> *mut c_void;
+        fn sem_close(sem: *mut c_void) -> c_int;
+        fn sem_unlink(name: *const c_char) -> c_int;
+        fn sem_post(sem: *mut c_void) -> c_int;
+        fn sem_wait(sem: *mut c_void) -> c_int;
+        fn sem_trywait(sem: *mut c_void) -> c_int;
+        fn fork() -> c_int;
+        fn ftruncate(fd: c_int, size: i64) -> c_int;
+        fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> c_int;
+        fn __errno_location() -> *mut c_int;
+    }
+
+    const EINTR: i64 = 4;
+    const EEXIST: i64 = 17;
+    const O_DIRECTORY: u64 = 0x10000;
+    const O_EXCL: c_int = 0x80;
+    const SYS_SYMLINK: u64 = 88;
+    const EXCLUSIVE: c_int = O_CREAT as c_int | O_EXCL;
+    const SIZE: usize = 8192;
+    const NAME: &core::ffi::CStr = c"/lumen-433-shm";
+    const READY: &core::ffi::CStr = c"/lumen-433-ready";
+    const DONE: &core::ffi::CStr = c"/lumen-433-done";
+
+    fn errno() -> i64 {
+        // SAFETY: musl supplies this thread's live errno slot.
+        unsafe { i64::from(*__errno_location()) }
+    }
+
+    fn libc_ok(what: &'static str, ret: c_int) -> Result<c_int, common::Fail> {
+        if ret == -1 { Err(common::Fail { what, got: -errno() }) } else { Ok(ret) }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Failure {
+        None,
+        ChildEarly,
+        ChildLate,
+        Parent,
+    }
+
+    fn metadata() -> R {
+        let fd = ok("open /dev/shm", sys(SYS_OPEN, [c"/dev/shm".as_ptr() as u64, O_DIRECTORY, 0, 0, 0, 0]))? as i32;
+        let mode = common::fstat_mode(fd)?;
+        common::close(fd)?;
+        eq("/dev/shm directory and sticky mode", i64::from(mode), 0o041777)?;
+        // SAFETY: names are NUL-terminated and retained for every call.
+        unsafe {
+            let fd = shm_open(NAME.as_ptr(), EXCLUSIVE | O_RDWR as c_int, 0o600);
+            ensure("shm_open create", fd >= 0, errno())?;
+            eq("shm descriptor is CLOEXEC", sys(SYS_FCNTL, [fd as u64, F_GETFD, 0, 0, 0, 0]), 1)?;
+            eq("shm exclusive collision", shm_open(NAME.as_ptr(), EXCLUSIVE | O_RDWR as c_int, 0o600) as i64, -1)?;
+            eq("shm EEXIST", errno(), EEXIST)?;
+            common::close(fd)?;
+            libc_ok("shm_unlink", shm_unlink(NAME.as_ptr()))?;
+            // A final symlink must not be followed by shm_open.
+            eq(
+                "symlink",
+                sys(SYS_SYMLINK, [c"/dev/zero".as_ptr() as u64, c"/dev/shm/lumen-433-shm".as_ptr() as u64, 0, 0, 0, 0]),
+                0,
+            )?;
+            eq("shm nofollow", shm_open(NAME.as_ptr(), O_RDWR as c_int, 0) as i64, -1)?;
+            eq("shm ELOOP", errno(), ELOOP)?;
+            libc_ok("unlink symlink", shm_unlink(NAME.as_ptr()))?;
+        }
+        Ok(())
+    }
+
+    fn shared_memory_and_semaphores(failure: Failure) -> R {
+        // SAFETY: all names are static C strings. Successful mmap results
+        // cover SIZE writable bytes, aligned for AtomicU32; accesses stay
+        // in those mappings until munmap. Semaphore pointers are checked
+        // against musl's SEM_FAILED (NULL) before use; each successful open
+        // owns a reference. The single-threaded fork inherits no held libc locks.
+        unsafe {
+            let fd = shm_open(NAME.as_ptr(), EXCLUSIVE | O_RDWR as c_int, 0o600);
+            ensure("shm_open", fd >= 0, errno())?;
+            libc_ok("ftruncate", ftruncate(fd, SIZE as i64))?;
+            let mapping =
+                mmap(core::ptr::null_mut(), SIZE, (PROT_READ | PROT_WRITE) as c_int, MAP_SHARED as c_int, fd, 0);
+            ensure("MAP_SHARED", mapping as usize != usize::MAX, errno())?;
+            common::close(fd)?;
+            let words = mapping.cast::<AtomicU32>();
+            eq("shm starts zero", (*words).load(SeqCst) as i64, 0)?;
+            (*words).store(17, SeqCst);
+            // Leave the second page unfaulted until after fork.
+            let ready = sem_open(READY.as_ptr(), EXCLUSIVE, 0o600u32, 0u32);
+            let done = sem_open(DONE.as_ptr(), EXCLUSIVE, 0o600u32, 0u32);
+            ensure("sem_open create", !ready.is_null() && !done.is_null(), errno())?;
+            ensure("sem exclusive collision", sem_open(READY.as_ptr(), EXCLUSIVE, 0o600u32, 0u32).is_null(), errno())?;
+            eq("sem EEXIST", errno(), EEXIST)?;
+            eq("zero semaphore", sem_trywait(done) as i64, -1)?;
+            eq("sem EAGAIN", errno(), EAGAIN)?;
+            let pid = i64::from(libc_ok("musl fork", fork())?);
+            if pid == 0 {
+                let result = (|| -> R {
+                    if failure == Failure::ChildEarly {
+                        libc_ok("injected child before post", ftruncate(-1, 0))?;
+                    }
+                    eq("child inherits shared data", (*words).load(SeqCst) as i64, 17)?;
+                    // Reopening ready creates a fresh mapping; musl's table
+                    // returns the inherited done mapping. The shm reopen is
+                    // asserted at a second VA. This tests the published link;
+                    // the file-backed futex wait path depends on scheduling.
+                    libc_ok("child close ready", sem_close(ready))?;
+                    // Keep the inherited done handle alive for failure
+                    // notification even if reopening or later checks fail.
+                    let ready = sem_open(READY.as_ptr(), 0);
+                    let done = sem_open(DONE.as_ptr(), 0);
+                    ensure("child sem_open existing", !ready.is_null() && !done.is_null(), errno())?;
+                    let fd = shm_open(NAME.as_ptr(), O_RDWR as c_int, 0);
+                    ensure("child shm_open existing", fd >= 0, errno())?;
+                    let second = mmap(
+                        core::ptr::null_mut(),
+                        SIZE,
+                        (PROT_READ | PROT_WRITE) as c_int,
+                        MAP_SHARED as c_int,
+                        fd,
+                        0,
+                    );
+                    ensure("child second mapping", second as usize != usize::MAX && second != mapping, errno())?;
+                    common::close(fd)?;
+                    let other = second.cast::<AtomicU32>();
+                    eq("reopened data", (*other).load(SeqCst) as i64, 17)?;
+                    (*words.add(1)).store(29, SeqCst);
+                    libc_ok("child sem_post", sem_post(done))?;
+                    libc_ok("child sem_wait", sem_wait(ready))?;
+                    if failure == Failure::ChildLate {
+                        libc_ok("injected child after wait", ftruncate(-1, 0))?;
+                    }
+                    eq("inherited mapping sees parent", (*words).load(SeqCst) as i64, 41)?;
+                    eq("reopened mapping sees parent", (*other).load(SeqCst) as i64, 41)?;
+                    eq("late fault sees parent", (*other.add(1024)).load(SeqCst) as i64, 47)?;
+                    eq("inherited late fault sees parent", (*words.add(1024)).load(SeqCst) as i64, 47)?;
+                    (*other).store(43, SeqCst);
+                    libc_ok("child unmap reopened", munmap(second, SIZE))?;
+                    libc_ok("child unmap inherited", munmap(mapping, SIZE))?;
+                    libc_ok("child post after unlink", sem_post(done))?;
+                    libc_ok("child close ready", sem_close(ready))?;
+                    libc_ok("child close done", sem_close(done))?;
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    say!("FAIL shm child: {} (got {})", e.what, e.got);
+                    // The parent may be in either wait. The inherited
+                    // handle remains valid regardless of the failing step.
+                    // The second post covers a failure at the first
+                    // sem_post(done), which no failure stage injects.
+                    for _ in 0..2 {
+                        if let Err(e) = libc_ok("child failure sem_post", sem_post(done)) {
+                            say!("FAIL shm child release: {} (got {})", e.what, e.got);
+                        }
+                    }
+                    common::exit_group(1);
+                }
+                if let Err(e) = libc_ok("child close inherited done", sem_close(done)) {
+                    say!("FAIL shm child: {} (got {})", e.what, e.got);
+                    common::exit_group(1);
+                }
+                common::exit_group(0);
+            }
+            let result = (|| -> R {
+                libc_ok("parent sem_wait", sem_wait(done))?;
+                eq("parent sees child store", (*words.add(1)).load(SeqCst) as i64, 29)?;
+                if failure == Failure::Parent {
+                    libc_ok("injected parent before release", ftruncate(-1, 0))?;
+                }
+                libc_ok("shm_unlink while mapped", shm_unlink(NAME.as_ptr()))?;
+                eq("shm name gone", shm_open(NAME.as_ptr(), O_RDWR as c_int, 0) as i64, -1)?;
+                eq("shm ENOENT", errno(), ENOENT)?;
+                for name in [READY, DONE] {
+                    libc_ok("sem_unlink while open", sem_unlink(name.as_ptr()))?;
+                    ensure("sem name gone", sem_open(name.as_ptr(), 0).is_null(), errno())?;
+                    eq("sem ENOENT", errno(), ENOENT)?;
+                }
+                (*words).store(41, SeqCst);
+                (*words.add(1024)).store(47, SeqCst);
+                libc_ok("parent post after unlink", sem_post(ready))?;
+                libc_ok("parent wait after unlink", sem_wait(done))?;
+                eq("parent sees reopened child store", (*words).load(SeqCst) as i64, 43)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                // Release a child still waiting for ready before reaping.
+                // If the semaphore itself fails, kill is the fallback.
+                if let Err(e) = libc_ok("parent failure sem_post", sem_post(ready)) {
+                    say!("FAIL shm parent release: {} (got {})", e.what, e.got);
+                    let killed = sys(SYS_KILL, [pid as u64, SIGKILL, 0, 0, 0, 0]);
+                    if killed < 0 {
+                        say!("FAIL shm parent kill (got {killed})");
+                    }
+                }
+            }
+            let reaped = loop {
+                match wait(pid, 0) {
+                    Err(e) if e.got == -EINTR => continue,
+                    result => break result,
+                }
+            };
+            if let Err(ref e) = reaped {
+                say!("FAIL shm child wait: {} (got {})", e.what, e.got);
+            }
+            result?;
+            reaped?;
+            eq("token consumed", sem_trywait(done) as i64, -1)?;
+            eq("consumed EAGAIN", errno(), EAGAIN)?;
+            libc_ok("parent sem_close ready", sem_close(ready))?;
+            libc_ok("parent sem_close done", sem_close(done))?;
+            libc_ok("parent munmap", munmap(mapping, SIZE))?;
+        }
+        Ok(())
+    }
+
+    pub fn run(stage: &[u8]) -> c_int {
+        let failure = match stage {
+            b"none" => Failure::None,
+            b"child-early" => Failure::ChildEarly,
+            b"child-late" => Failure::ChildLate,
+            b"parent" => Failure::Parent,
+            _ => return common::USAGE_EXIT,
+        };
+        // Check that libc_ok turns a real libc failure into -EBADF before
+        // running the shm checks. The injected failures make their own calls.
+        // SAFETY: ftruncate has no pointer arguments; -1 is deliberately invalid.
+        let bad_fd = libc_ok("ftruncate errno", unsafe { ftruncate(-1, 0) });
+        match bad_fd {
+            Err(e) if e.got == -EBADF => {}
+            Err(e) => {
+                say!("FAIL libc_ok expected -EBADF, got Err({}: {})", e.what, e.got);
+                return 1;
+            }
+            Ok(ret) => {
+                say!("FAIL libc_ok expected -EBADF, got Ok({ret})");
+                return 1;
+            }
+        }
+        let mut result = common::run_checks(&[
+            ("shm-metadata-and-open-flags", &metadata),
+            ("shm-and-semaphores-across-fork", &|| shared_memory_and_semaphores(failure)),
+        ]);
+        // libc owns the namespace spelling. ENOENT is expected after the
+        // normal path already unlinked; any other cleanup error is reported.
+        // SAFETY: names are static C strings, valid for each libc call.
+        unsafe {
+            for cleanup in [
+                libc_ok("cleanup shm_unlink", shm_unlink(NAME.as_ptr())),
+                libc_ok("cleanup sem_unlink ready", sem_unlink(READY.as_ptr())),
+                libc_ok("cleanup sem_unlink done", sem_unlink(DONE.as_ptr())),
+            ] {
+                if let Err(e) = cleanup
+                    && e.got != -ENOENT
+                {
+                    say!("FAIL shm cleanup: {} (got {})", e.what, e.got);
+                    if result == 0 {
+                        result = 3;
+                    }
+                }
+            }
+        }
+        result
+    }
+}

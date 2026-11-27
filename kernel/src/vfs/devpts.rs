@@ -33,7 +33,7 @@ impl Devpts {
 
 impl FileSystem for Devpts {
     fn dev_id(&self) -> DevId {
-        DevId::makedev(0, 5)
+        DevId::DEVPTS
     }
     fn name(&self) -> &'static str {
         "devpts"
@@ -197,7 +197,7 @@ impl PtyInode {
             myself: myself.clone(),
             locks: SleepMutex::new(AdvisoryLocks::new()),
             meta: SleepMutex::new(Metadata {
-                dev: DevId::makedev(0, 5),
+                dev: DevId::DEVPTS,
                 ino,
                 inode_type: if dir { InodeType::Dir } else { InodeType::CharDevice },
                 mode: if dir {
@@ -227,7 +227,7 @@ impl VfsInode for PtyInode {
         self.lock_id
     }
     fn dev_id(&self) -> DevId {
-        DevId::makedev(0, 5)
+        DevId::DEVPTS
     }
     fn ino(&self) -> u64 {
         self.ino

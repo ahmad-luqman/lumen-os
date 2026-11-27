@@ -166,8 +166,8 @@ def test_heap_command_reports_usage(boot):
     heap = shell_heap(m)
     # What boot keeps (`acpi::Info`, for one), the four virtual terminals
     # (each grid's cells, scrollback, tab stops and dirty marks), the VFS
-    # boot mounts (`/`, `/tmp`, `/dev` + 7 char nodes + the pts mountpoint,
-    # `/proc`, `/dev/pts`, and the mount/inode tables), pid 1 (its process,
+    # boot mounts (`/`, `/tmp`, `/dev` + 7 char nodes + the pts/shm mountpoints,
+    # `/proc`, `/dev/pts`, `/dev/shm`, and the mount/inode tables), pid 1 (its process,
     # its placeholder address space and the process table's nodes, #372),
     # and the shells (their editors and histories, the screen shells' threads and the keyboard's
     # wait queue they block in) is in use (91 allocations when the VFS mounts
@@ -182,12 +182,16 @@ def test_heap_command_reports_usage(boot):
     # /dev/pts (two names, each kept in the map and eviction queue, plus
     # those containers' initial buffers). C10 adds 15 persistent allocations:
     # five consoles, each with its Tty Arc, input ring and PollHead Arc.
-    # The settled count is 144. Keep the same five-block margin; the rest
+    # /dev/shm (#433) adds eight: its devfs mountpoint, four tmpfs Arcs
+    # (filesystem, shared state, quota, root inode), mount-path string,
+    # and two dentry-cache name allocations. Measured over two settled boots
+    # of 7c0e054a: 152 live blocks (144 before /dev/shm).
+    # Keep the same five-block margin; the rest
     # of what the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert 0 < heap["live"] <= 149, (
+    assert 0 < heap["live"] <= 157, (
         f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     )
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap

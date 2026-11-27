@@ -108,9 +108,10 @@ def test_ext4_read_write_persists_across_reboot(boot, tmp_path):
         "/dev": ("devfs", "0:3", "rw"),
         "/proc": ("procfs", "0:4", "ro"),
         "/dev/pts": ("devpts", "0:5", "rw"),
+        "/dev/shm": ("tmpfs", "0:7", "rw"),
     }
     assert table["/"][3:] == ("-", "-")  # ext4 has no quota to show
-    assert run(m1, "mount | count") == "5\n"
+    assert run(m1, "mount | count") == "6\n"
     assert "devpts /dev/pts devpts rw 0 0\n" in run(m1, "vfstest cat /proc/mounts")
 
     assert run(m1, "vfstest cat /etc/alpine-release").strip() == "3.21.10"
@@ -294,12 +295,12 @@ def test_ext4_readonly_device_mounts_ro(boot, tmp_path):
 
 def test_dev_tmp_proc_filesystems(boot):
     # Boot without a disk: falls back to a tmpfs root (0:1), with no warning,
-    # plus /tmp, /dev, /proc, /dev/pts.
+    # plus /tmp, /dev, /proc, /dev/pts, /dev/shm.
     m = shell(boot, devices=Devices(rng=True))
     assert_quiet_boot(m.output)
 
     out = run(m, "mount")
-    assert out.startswith("mount: 5 mounts\n"), out  # the header counts the table's rows
+    assert out.startswith("mount: 6 mounts\n"), out  # the header counts the table's rows
     table = parse_mount(out)
     assert without_quota(table) == {
         "/": ("tmpfs", "0:1", "rw"),
@@ -307,19 +308,20 @@ def test_dev_tmp_proc_filesystems(boot):
         "/dev": ("devfs", "0:3", "rw"),
         "/proc": ("procfs", "0:4", "ro"),
         "/dev/pts": ("devpts", "0:5", "rw"),
+        "/dev/shm": ("tmpfs", "0:7", "rw"),
     }
-    assert run(m, "mount | count") == "5\n"
-    assert "INFO  vfs: mounted / (tmpfs, rw) + /tmp /dev /proc /dev/pts\n" in m.output
-    # Both tmpfs mounts show their quota (#324), the others none.
-    for target in ("/", "/tmp"):
+    assert run(m, "mount | count") == "6\n"
+    assert "INFO  vfs: mounted / (tmpfs, rw) + /tmp /dev /proc /dev/pts /dev/shm\n" in m.output
+    # All three tmpfs mounts show their quota (#324), the others none.
+    for target in ("/", "/tmp", "/dev/shm"):
         used, limit = quota_in(table, target)
         assert limit == TMPFS_LIMIT and 0 <= used <= limit, (target, used, limit)
     for target in ("/dev", "/proc", "/dev/pts"):
         assert table[target][3:] == ("-", "-"), (target, table[target])
-    assert run(m, "mount | where limit > 0 | count") == "2\n"
+    assert run(m, "mount | where limit > 0 | count") == "3\n"
 
     dev_ls = set(run(m, "vfstest ls /dev").splitlines())
-    assert {"null", "zero", "random", "urandom", "tty", "console", "ptmx", "pts"}.issubset(
+    assert {"null", "zero", "random", "urandom", "tty", "console", "ptmx", "pts", "shm"}.issubset(
         dev_ls
     ), dev_ls
 
@@ -333,6 +335,9 @@ def test_dev_tmp_proc_filesystems(boot):
     assert "devfs /dev devfs rw 0 0\n" in proc_mounts, proc_mounts
     assert "devpts /dev/pts devpts rw 0 0\n" in proc_mounts, proc_mounts
     assert "tmpfs /tmp tmpfs rw 0 0\n" in proc_mounts, proc_mounts
+    assert "tmpfs /dev/shm tmpfs rw 0 0\n" in proc_mounts, proc_mounts
+    shm = stat_fields(m, "/dev/shm")
+    assert (shm["type"], shm["mode"], shm["dev"]) == ("dir", "1777", "0:7")
     assert "Linux version" in run(m, "vfstest cat /proc/version")
 
     out = run(m, "vfstest dev-tmp-proc")

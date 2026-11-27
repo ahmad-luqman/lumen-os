@@ -22,8 +22,12 @@ impl DevId {
     pub const DEVFS: Self = Self::makedev(0, 3);
     /// `/proc` (`0:4`, procfs).
     pub const PROCFS: Self = Self::makedev(0, 4);
+    /// `/dev/pts` (`0:5`, devpts).
+    pub const DEVPTS: Self = Self::makedev(0, 5);
     /// Internal anonymous pipe filesystem (`0:6`, pipefs, never mounted).
     pub const PIPEFS: Self = Self::makedev(0, 6);
+    /// `/dev/shm` (`0:7`, tmpfs for POSIX shared memory and semaphores).
+    pub const DEV_SHM: Self = Self::makedev(0, 7);
 
     /// Encode `(major, minor)` using Linux's canonical `gnu_dev_makedev` layout.
     pub const fn makedev(major: u32, minor: u32) -> Self {

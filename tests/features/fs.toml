@@ -466,3 +466,25 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_extent_allocation_does_not_retry_nonspace_errors",
     "ktest:lumen_kernel::vfs::ext4::ext4_stopped_cache_syncs_return_eio_before_the_latch_trips",
 ]
+
+[[feature]]
+name = "/dev/shm: independent 32 MiB tmpfs, mode 1777, POSIX shared memory and named semaphores across fork (#433)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::vfs::devfs::devfs_directory_mountpoints_are_fixed",
+    "scenario:test_linux_proc::test_posix_shm_and_named_semaphores",
+    "scenario:test_fs::test_dev_tmp_proc_filesystems",
+    "scenario:test_conformance::test_musl_libc_test_core",
+]
+
+[[feature]]
+name = "A failed shm/sem run leaves /dev/shm empty and its quota at zero, and the next run succeeds (#433)"
+milestone = "M8"
+tests = [
+    "scenario:test_linux_proc::test_posix_shm_failure_releases_peer[*]",
+]
+
+[[feature]]
+name = "Named filesystem device IDs are pairwise distinct (#433)"
+milestone = "M8"
+tests = ["cargo:lumen-vfs"]

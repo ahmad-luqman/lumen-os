@@ -1,4 +1,4 @@
-//! The `/dev` namespace (`devfs`, `dev = 0:3`) with terminal devices and the devpts mountpoint.
+//! The `/dev` namespace (`devfs`, `dev = 0:3`) with devices and directory mountpoints.
 //!
 //! A writable mount, as Linux's devtmpfs (`FileSystem::read_only` is
 //! false, #301), whose names never change: lumen-vfs's own checks answer
@@ -6,8 +6,8 @@
 //! devfs (create, unlink, mkdir, rename, ...) returns `-EROFS`
 //! (`lumen_vfs::fixed_namespace_ops!`; a divergence: devtmpfs takes these
 //! from root, and Linux never answers `-EROFS` on an `rw` mount), and so
-//! does a metadata change on `/dev` itself (a divergence too: devtmpfs
-//! takes those on `/dev`). A character node's setters take `chmod`,
+//! does a metadata change on `/dev` or its mountpoint directories (a
+//! divergence too: devtmpfs takes those). A character node's setters take `chmod`,
 //! `chown` and `utimensat` and keep the new mode, owner and times in
 //! memory until reboot, as devtmpfs does, on any instance's node (#293).
 //! `random` and `urandom` read from `crate::rng` and return `-EAGAIN` while
@@ -39,13 +39,17 @@ enum DevKind {
     Tty,
     Console,
     Ptmx,
-    Pts,
+    MountDir,
 }
 
 impl DevKind {
+    const fn is_dir(self) -> bool {
+        matches!(self, Self::Root | Self::MountDir)
+    }
+
     const fn rdev(self) -> DevId {
         match self {
-            Self::Root | Self::Pts => DevId::makedev(0, 0),
+            Self::Root | Self::MountDir => DevId::makedev(0, 0),
             Self::Null => DevId::makedev(1, 3),
             Self::Zero => DevId::makedev(1, 5),
             Self::Random => DevId::makedev(1, 8),
@@ -58,7 +62,7 @@ impl DevKind {
 
     const fn mode(self) -> u16 {
         match self {
-            Self::Root | Self::Pts => 0o755,
+            Self::Root | Self::MountDir => 0o755,
             Self::Console => 0o620,
             Self::Null | Self::Zero | Self::Random | Self::Urandom | Self::Tty | Self::Ptmx => 0o666,
         }
@@ -91,8 +95,9 @@ impl Devfs {
             ("console", mk_dev(7, DevKind::Console)),
             ("null", mk_dev(2, DevKind::Null)),
             ("ptmx", mk_dev(8, DevKind::Ptmx)),
-            ("pts", mk_dev(9, DevKind::Pts)),
+            ("pts", mk_dev(9, DevKind::MountDir)),
             ("random", mk_dev(4, DevKind::Random)),
+            ("shm", mk_dev(10, DevKind::MountDir)),
             ("tty", mk_dev(6, DevKind::Tty)),
             ("urandom", mk_dev(5, DevKind::Urandom)),
             ("zero", mk_dev(3, DevKind::Zero)),
@@ -178,7 +183,7 @@ impl DevfsInode {
     /// the syscall layer's `writable_mount` lets every devfs inode through,
     /// and `vfstest chmod` calls the setters directly.
     fn changeable_meta(&self) -> Result<SleepMutexGuard<'_, DevfsMeta>, VfsError> {
-        if matches!(self.kind, DevKind::Root | DevKind::Pts) {
+        if self.kind.is_dir() {
             return Err(VfsError::RoFs);
         }
         Ok(self.meta.lock())
@@ -218,10 +223,7 @@ impl VfsInode for DevfsInode {
     }
 
     fn inode_type(&self) -> InodeType {
-        match self.kind {
-            DevKind::Root | DevKind::Pts => InodeType::Dir,
-            _ => InodeType::CharDevice,
-        }
+        if self.kind.is_dir() { InodeType::Dir } else { InodeType::CharDevice }
     }
 
     fn open_count(&self) -> u32 {
@@ -247,7 +249,7 @@ impl VfsInode for DevfsInode {
             ino: self.ino,
             inode_type: self.inode_type(),
             mode: meta.mode,
-            nlink: if matches!(self.kind, DevKind::Root | DevKind::Pts) { 2 } else { 1 },
+            nlink: if self.kind.is_dir() { 2 } else { 1 },
             uid: meta.uid,
             gid: meta.gid,
             rdev: self.kind.rdev(),
@@ -261,7 +263,7 @@ impl VfsInode for DevfsInode {
     }
 
     fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-        if !matches!(self.kind, DevKind::Root | DevKind::Pts) {
+        if !self.kind.is_dir() {
             return Err(VfsError::NotDir);
         }
         if name == b"." || name == b".." {
@@ -281,7 +283,7 @@ impl VfsInode for DevfsInode {
     }
 
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
-        if !matches!(self.kind, DevKind::Root | DevKind::Pts) {
+        if !self.kind.is_dir() {
             return Err(VfsError::NotDir);
         }
         // Each entry's key is its index: the names never change.
@@ -293,7 +295,7 @@ impl VfsInode for DevfsInode {
     }
 
     fn truncate(&self, _size: u64) -> Result<(), VfsError> {
-        if matches!(self.kind, DevKind::Root | DevKind::Pts) { Err(VfsError::IsDir) } else { Err(VfsError::Inval) }
+        if self.kind.is_dir() { Err(VfsError::IsDir) } else { Err(VfsError::Inval) }
     }
 
     fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
@@ -328,7 +330,7 @@ impl VfsInode for DevfsInode {
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
         match self.kind {
-            DevKind::Root | DevKind::Pts => Err(VfsError::IsDir),
+            DevKind::Root | DevKind::MountDir => Err(VfsError::IsDir),
             DevKind::Ptmx => Err(VfsError::Io),
             DevKind::Null => Ok(0),
             DevKind::Zero => {
@@ -357,7 +359,7 @@ impl VfsInode for DevfsInode {
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
         match self.kind {
-            DevKind::Root | DevKind::Pts => Err(VfsError::IsDir),
+            DevKind::Root | DevKind::MountDir => Err(VfsError::IsDir),
             DevKind::Ptmx => Err(VfsError::Io),
             DevKind::Null | DevKind::Zero | DevKind::Random | DevKind::Urandom => Ok(buf.len()),
             DevKind::Tty => match process::try_current_io() {
@@ -441,6 +443,37 @@ impl Pollable for DevfsInode {
         (mask, guard)
     }
 }
+
+crate::ktest!(
+    fn devfs_directory_mountpoints_are_fixed() {
+        use crate::{kassert, kassert_eq};
+        let fs = Devfs::new(DevId::makedev(0, 433));
+        let root = fs.root_inode();
+        let mut entries = Vec::new();
+        root.readdir(0, &mut entries, 32).map_err(|_| "list /dev")?;
+        let pts = root.lookup(b"pts").map_err(|_| "pts")?;
+        let shm = root.lookup(b"shm").map_err(|_| "shm")?;
+        kassert!(pts.ino() != shm.ino());
+        for (name, node) in [(b"pts", pts), (b"shm", shm)] {
+            let st = node.stat().map_err(|_| "stat mountpoint")?;
+            kassert_eq!(st.nlink, 2);
+            kassert_eq!((st.inode_type, st.mode, st.rdev), (InodeType::Dir, 0o755, DevId::makedev(0, 0)));
+            kassert!(entries.iter().any(|e| e.name == name && e.ino == node.ino() && e.inode_type == InodeType::Dir));
+            kassert_eq!(node.lookup(b"missing").err(), Some(VfsError::NoEnt));
+            kassert_eq!(node.create(b"file", 0o600).err(), Some(VfsError::RoFs));
+            kassert_eq!(node.set_mode(0o777), Err(VfsError::RoFs));
+            kassert_eq!(node.read_at(0, &mut [0]), Err(VfsError::IsDir));
+            kassert_eq!(node.write_at(0, &[0]), Err(VfsError::IsDir));
+            kassert_eq!(node.truncate(0), Err(VfsError::IsDir));
+            let mut children = Vec::new();
+            node.readdir(0, &mut children, 32).map_err(|_| "list mountpoint")?;
+            kassert_eq!(children.len(), 2);
+            kassert_eq!(children[0].name.as_slice(), b".");
+            kassert_eq!(children[1].name.as_slice(), b"..");
+        }
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn devfs_nodes_start_with_their_boot_metadata() {

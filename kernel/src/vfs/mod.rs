@@ -207,7 +207,9 @@ fn has_ext4_magic(cache: &dyn ext4::BlockCacheBackend) -> Result<bool, lumen_bca
     Ok(u16::from_le_bytes(magic) == 0xef53)
 }
 
-/// Initialize the kernel VFS and mount `/`, `/tmp`, `/dev`, and `/proc`.
+const TMPFS_DEFAULT_QUOTA_BYTES: usize = page_cache::TMPFS_DEFAULT_QUOTA_PAGES * page_cache::PAGE_SIZE;
+
+/// Initialize the kernel VFS and mount `/`, `/tmp`, `/dev`, `/proc`, `/dev/pts`, and `/dev/shm`.
 ///
 /// Called from `kmain_on_kernel_stack` right after `drivers::probe_all()` and
 /// `rng::init()`. Scans bound `virtio-blk` devices in PCI address order and
@@ -218,7 +220,8 @@ fn has_ext4_magic(cache: &dyn ext4::BlockCacheBackend) -> Result<bool, lumen_bca
 /// lost rootfs is never silent.
 /// Missing `/tmp`, `/dev` and `/proc` directories are created on any writable
 /// root (a writable ext4 disk included); the closing `INFO` line names only
-/// the mounts that succeeded.
+/// the mounts that succeeded. `/dev/pts` and `/dev/shm` are devfs's fixed
+/// directories, present wherever `/dev` is mounted, on a read-only root too.
 pub fn init() {
     let mut devs = crate::blk::devices();
     devs.sort_by_key(|e| e.dev.addr());
@@ -261,7 +264,7 @@ pub fn init() {
         }
         None => {
             debug!(target: "vfs", "no ext4 volume found; mounting tmpfs fallback at /");
-            tmpfs::Tmpfs::new(DevId::ROOT, page_cache::TMPFS_DEFAULT_QUOTA_PAGES * page_cache::PAGE_SIZE)
+            tmpfs::Tmpfs::new(DevId::ROOT, TMPFS_DEFAULT_QUOTA_BYTES)
         }
     };
 
@@ -273,7 +276,7 @@ pub fn init() {
     let root_inode = root_fs.root_inode();
     let root_ro = root_fs.read_only();
 
-    let tmp_fs = tmpfs::Tmpfs::new(DevId::TMPFS, page_cache::TMPFS_DEFAULT_QUOTA_PAGES * page_cache::PAGE_SIZE);
+    let tmp_fs = tmpfs::Tmpfs::new(DevId::TMPFS, TMPFS_DEFAULT_QUOTA_BYTES);
     // `/tmp` shows the mounted root, not the mountpoint under it: world
     // writable with the sticky bit, as on Linux.
     if let Err(e) = tmp_fs.root_inode().set_mode(0o1777) {
@@ -303,6 +306,15 @@ pub fn init() {
     match resolve_path_from_root("/dev/pts").and_then(|mp| TABLES.mount(mp, "/dev/pts", devpts::Devpts::new())) {
         Ok(()) => mounted.push_str(" /dev/pts"),
         Err(e) => warn!(target: "vfs", "can't mount /dev/pts: {e:?}"),
+    }
+    // A separate tmpfs for musl's POSIX shared memory and named semaphores.
+    let shm_fs = tmpfs::Tmpfs::new(DevId::DEV_SHM, TMPFS_DEFAULT_QUOTA_BYTES);
+    match shm_fs.root_inode().set_mode(0o1777) {
+        Err(e) => warn!(target: "vfs", "can't make /dev/shm 1777: {e:?}"),
+        Ok(()) => match resolve_path_from_root("/dev/shm").and_then(|mp| TABLES.mount(mp, "/dev/shm", shm_fs)) {
+            Ok(()) => mounted.push_str(" /dev/shm"),
+            Err(e) => warn!(target: "vfs", "can't mount /dev/shm: {e:?}"),
+        },
     }
     let others = if mounted.is_empty() { String::new() } else { format!(" +{mounted}") };
     info!(target: "vfs", "mounted / ({}, {}){others}", root_fs.name(), if root_ro { "ro" } else { "rw" });
