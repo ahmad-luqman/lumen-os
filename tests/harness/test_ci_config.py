@@ -175,3 +175,77 @@ def test_feature_gate_runs_after_failed_scenarios():
     [gate] = [s for s in steps if "run: make status-check" in s]
     assert "id: scenarios" in scenarios
     assert "if: ${{ !cancelled() && steps.scenarios.outcome != 'skipped' }}" in gate
+
+
+_USES_RE = re.compile(r"^\s*(?:-\s+)?uses:\s*(\S+)\s*$", re.MULTILINE)
+_ALPINE_DIGEST_RE = re.compile(r"docker\.io/library/alpine:3\.21@sha256:[0-9a-f]{64}")
+
+
+def _workflow_actions(text: str) -> dict[str, set[str]]:
+    """Map action name (before `@`) to the set of `@ref` values in a workflow."""
+    actions: dict[str, set[str]] = {}
+    for ref in _USES_RE.findall(text):
+        name, sep, pin = ref.partition("@")
+        actions.setdefault(name, set()).add(pin if sep else "")
+    return actions
+
+
+def _syscall_census_pin_problems(
+    workflow_text: str, ci_text: str, census_sh_text: str
+) -> list[str]:
+    problems: list[str] = []
+    script_pin = re.search(r"^IMAGE=(\S+)$", census_sh_text, re.MULTILINE)
+    if not script_pin:
+        return ["tools/syscall-census.sh has no IMAGE= pin"]
+    expected_image = script_pin.group(1)
+    if not _ALPINE_DIGEST_RE.fullmatch(expected_image):
+        problems.append(f"script IMAGE is not a sha256-pinned alpine:3.21 digest: {expected_image}")
+
+    wf_images = set(_ALPINE_DIGEST_RE.findall(workflow_text))
+    if wf_images != {expected_image}:
+        problems.append(
+            f"workflow alpine digest {sorted(wf_images)} != script IMAGE {expected_image}"
+        )
+
+    ci_actions = _workflow_actions(ci_text)
+    wf_actions = _workflow_actions(workflow_text)
+    if not wf_actions:
+        problems.append("workflow uses no actions")
+    for action, pins in sorted(wf_actions.items()):
+        for pin in sorted(pins):
+            if not pin or pin in {"main", "master", "HEAD", "latest"}:
+                problems.append(f"{action}: unpinned ref {pin!r}")
+            elif action in ci_actions and pin not in ci_actions[action]:
+                problems.append(
+                    f"{action}@{pin} does not match ci.yml's {sorted(ci_actions[action])}"
+                )
+    return problems
+
+
+def test_syscall_census_workflow_is_pinned():
+    """The unattended syscall-census workflow (#451) runs on ubuntu-24.04 with
+    timeouts and if: always() artifact upload, matches tools/syscall-census.sh's
+    pinned alpine:3.21 digest, and pins every action as ci.yml does."""
+    wf_text = (REPO_ROOT / ".github/workflows/syscall-census.yml").read_text()
+    ci_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    sh_text = (REPO_ROOT / "tools/syscall-census.sh").read_text()
+
+    assert _syscall_census_pin_problems(wf_text, ci_text, sh_text) == []
+    assert "runs-on: ubuntu-24.04" in wf_text
+    assert "workflow_dispatch:" in wf_text
+    assert "pull_request:" in wf_text
+    assert "tools/census/**" in wf_text
+    assert "tools/syscall-census.sh" in wf_text
+    assert "contents: read" in wf_text
+    assert "if: always()" in wf_text
+    assert re.search(r"^\s+timeout-minutes:\s+\d+$", wf_text, re.MULTILINE)
+
+    # Negative checks: drifting digest, unpinned action or ci.yml mismatch fails.
+    bad_digest = _ALPINE_DIGEST_RE.sub(
+        "docker.io/library/alpine:3.21@sha256:" + "0" * 64, wf_text, count=1
+    )
+    assert _syscall_census_pin_problems(bad_digest, ci_text, sh_text)
+    unpinned = wf_text.replace("actions/checkout@v7", "actions/checkout@main", 1)
+    assert _syscall_census_pin_problems(unpinned, ci_text, sh_text)
+    drifted = wf_text.replace("actions/upload-artifact@v7", "actions/upload-artifact@v4", 1)
+    assert _syscall_census_pin_problems(drifted, ci_text, sh_text)

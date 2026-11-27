@@ -1,0 +1,81 @@
+name: syscall-census
+
+# Unattended x86-64 Linux syscall census (#451): runs tools/syscall-census.sh
+# in a pinned alpine:3.21 container on ubuntu-24.04 and uploads the raw traces
+# and generated TOML as an artifact (even if a workload fails).
+on:
+  workflow_dispatch:
+    inputs:
+      milestone:
+        description: "census milestone (m9 or m8)"
+        type: choice
+        options:
+          - m9
+          - m8
+        default: m9
+  pull_request:
+    paths:
+      - "tools/census/**"
+      - "tools/syscall-census.sh"
+      - "tools/harness/lumen_harness/syscalls.py"
+      - ".github/workflows/syscall-census.yml"
+
+concurrency:
+  group: syscall-census-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    name: syscall census (${{ inputs.milestone || 'm9' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Must match IMAGE in tools/syscall-census.sh (checked below and by test_ci_config).
+      ALPINE_IMAGE: docker.io/library/alpine:3.21@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab
+      MILESTONE: ${{ inputs.milestone || 'm9' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Pull pinned Alpine x86-64 image
+        timeout-minutes: 5
+        run: |
+          grep -Fxq "IMAGE=$ALPINE_IMAGE" tools/syscall-census.sh
+          docker pull --platform linux/amd64 "$ALPINE_IMAGE"
+
+      - name: Run syscall census workloads
+        timeout-minutes: 20
+        run: tools/syscall-census.sh "$MILESTONE"
+
+      - name: Generate M9 census report
+        if: ${{ success() && env.MILESTONE == 'm9' }}
+        timeout-minutes: 2
+        run: |
+          python3 tools/harness/lumen_harness/syscalls.py report \
+            --milestone M9 \
+            --census build/census-m9/m9-census.toml \
+            --tables kernel/src/linux/mod.rs \
+            --verbose | tee build/census-m9/m9-report.txt
+          {
+            echo "## M9 Syscall Census Report"
+            echo '```'
+            cat build/census-m9/m9-report.txt
+            echo '```'
+            echo "## /proc/net/* trace hits"
+            echo '```'
+            cat build/census-m9/m9-proc-net.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload census traces and toml
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: syscall-census-${{ inputs.milestone || 'm9' }}
+          path: |
+            build/census-m9
+            build/census
+          if-no-files-found: ignore

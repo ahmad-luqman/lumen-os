@@ -1,22 +1,40 @@
 #!/usr/bin/env bash
-# The M8 syscall census (#337): run the gate workloads on stock Alpine x86-64
-# under strace and write tests/linux/m8-census.toml.
+# The M8 (#337) and M9 (#451) syscall censuses: run the gate workloads on stock
+# Alpine x86-64 under strace and write tests/linux/m<8|9>-census.toml.
 #
-#   tools/syscall-census.sh
+#   tools/syscall-census.sh [m8|m9]   # default: m8
 #
 # Needs bash and Docker or Podman on an x86-64 Linux kernel: a Linux
-# machine, or WSL2 with Docker Desktop's integration or Podman (clone the repo
-# inside the WSL filesystem, not under /mnt/c). The engine is docker if it
-# runs, else podman; CONTAINER_ENGINE=podman (or docker) picks one. Not an Apple Silicon Mac: an amd64 container
-# there runs under Rosetta, where strace sees the translator's calls, not the
-# program's. Not run in CI. Raw traces stay in build/census/.
+# machine (such as GitHub Actions ubuntu-24.04), or WSL2 with Docker Desktop's
+# integration or Podman (clone the repo inside the WSL filesystem, not under
+# /mnt/c). The engine is docker if it runs, else podman; CONTAINER_ENGINE=podman
+# (or docker) picks one. Not an Apple Silicon Mac: an amd64 container there runs
+# under Rosetta, where strace sees the translator's calls, not the program's.
+# Raw traces stay in build/census/ (m8) or build/census-m9/ (m9).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # alpine:3.21 (3.21.10 at the pin, the minirootfs' release in tools/fetch-deps.sh).
 IMAGE=docker.io/library/alpine:3.21@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab
-OUT="$ROOT/build/census"
-DEST="$ROOT/tests/linux/m8-census.toml"
+
+MILESTONE=${1:-m8}
+case "$MILESTONE" in
+m8)
+    WORKLOAD_SCRIPT=/census/workloads.sh
+    OUT="$ROOT/build/census"
+    TOML="m8-census.toml"
+    ;;
+m9)
+    WORKLOAD_SCRIPT=/census/m9-workloads.sh
+    OUT="$ROOT/build/census-m9"
+    TOML="m9-census.toml"
+    ;;
+*)
+    echo "syscall-census: milestone must be m8 or m9, not $MILESTONE" >&2
+    exit 1
+    ;;
+esac
+DEST="$ROOT/tests/linux/$TOML"
 
 engine=${CONTAINER_ENGINE:-}
 if [[ -z "$engine" ]]; then
@@ -52,8 +70,8 @@ echo "$IMAGE" >"$OUT/image"
     -v "$ROOT/tools/census:/census:ro" \
     -v "$ROOT/tools/harness/lumen_harness:/harness:ro" \
     -v "$OUT:/out" \
-    "$IMAGE" sh /census/workloads.sh
+    "$IMAGE" sh "$WORKLOAD_SCRIPT"
 
 mkdir -p "$(dirname "$DEST")"
-cp "$OUT/m8-census.toml" "$DEST"
+cp "$OUT/$TOML" "$DEST"
 echo "syscall-census: wrote ${DEST#"$ROOT"/}"

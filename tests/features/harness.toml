@@ -260,3 +260,12 @@ tests = ["harness:test_rootfs_dev::*"]
 name = "musl libc-test built reproducibly with pinned zig; result parser and expected-failure list"
 milestone = "M8"
 tests = ["harness:test_libctest::*"]
+
+[[feature]]
+name = "M9 syscall census of apk, curl, python3, ruby, busybox net tools and a socketpair/SCM_RIGHTS/epoll microbenchmark (#451): unattended ubuntu-24.04 workflow pinned to ci.yml's action refs and tools/syscall-census.sh's alpine:3.21 digest, deterministic TOML with socket families/types/protocols, sockopt levels/names, epoll/eventfd/timerfd/message flags and ioctls, and `syscalls.py report --milestone M9` flagging M10 rows, M8 ENOSYS_BY_DECISION syscalls, CPU-time clocks and #450 design probes"
+milestone = "M9"
+tests = [
+    "harness:test_syscalls::test_m9_census_parses",
+    "harness:test_syscalls::test_m9_report_lists_m10_rows_the_gate_needs",
+    "harness:test_ci_config::test_syscall_census_workflow_is_pinned",
+]

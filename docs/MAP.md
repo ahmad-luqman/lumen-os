@@ -941,9 +941,12 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   /bin/busybox` run's output, exit code and leaked frames (`BusyboxRun`,
   `BUSYBOX_EXIT`), #324, and `warm_up`: one uncounted
   `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts),
-  `syscalls.py` (#337: M8 syscall census — stdlib-only `build` turning
-  `strace -f -X raw` traces into `tests/linux/m8-census.toml`, and `report`
-  comparing it against the kernel's dispatch table and planned milestones),
+  `syscalls.py` (#337, #451: M8 and M9 syscall censuses — stdlib-only `build`
+  turning `strace -f -X raw` traces into deterministic `tests/linux/m<8|9>-census.toml`
+  with socket families/types/protocols, sockopt levels/names, epoll/message/timerfd/eventfd
+  flags and ioctls, and `report` / `report --milestone M9` (`report_m9`) comparing against
+  the kernel's dispatch table, M6–M8 tables, ROADMAP M9/M10 rows, M8 `ENOSYS_BY_DECISION`
+  incl. CPU-time clocks, and #450 design probes),
   `libctest.py` (#345, #396: musl libc-test transcripts, one
   `EXIT <path> <code>` line per test, read as `Outcome` (`PASS`, `FAIL`,
   `TIMEOUT`, `ERROR`), a runner error never a verdict;
@@ -959,9 +962,12 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   libc-test`, #369, after `tools/fetch-libc-test.sh`'s pinned checkout):
   libc-test's `src/functional` and `src/regression`, static and dynamic,
   with `zig cc -target x86_64-linux-musl` into `build/libc-test/`
-  (`tests.txt`, `not-built.txt`). `tools/syscall-census.sh` and
-  `tools/census/workloads.sh` (#337): Docker/Podman strace census on stock
-  Alpine x86-64 generating `tests/linux/m8-census.toml`.
+  (`tests.txt`, `not-built.txt`). `tools/syscall-census.sh` (`m8` or `m9`),
+  `tools/census/workloads.sh` (#337), `tools/census/m9-workloads.sh`,
+  `tools/census/local_server.py`, `tools/census/m9_net_bench.c` and
+  `.github/workflows/syscall-census.yml` (#451): unattended Docker/Podman strace
+  census on pinned stock Alpine 3.21 x86-64 generating `tests/linux/m8-census.toml`
+  and `tests/linux/m9-census.toml`.
 - `tools/mkrootfs.sh`, `tools/mkrootfs-dev.sh`, `tools/linux-m7/`,
   `tools/linux-m8/`: deterministic `build/alpine-rootfs.ext4`
   assembly (`s_flags` saying signed directory hashes on every host,

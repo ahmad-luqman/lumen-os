@@ -248,7 +248,36 @@ KEY_ARG_LINES = [
     ("prctl(0xf, 0x7ffe0000)            = 0", {"option": "0xf"}),
     ('renameat2(-100, "/a", -100, "/b", 0x1) = 0', {"flags": "0x1"}),
     ("rt_sigqueueinfo(5, 10, {si_signo=10, si_code=-1}) = 0", {"signal": "10"}),
-    ("socket(0x1, 0x80001, 0)           = 3", {"domain": "1", "type": "0x80001"}),
+    ("socket(0x1, 0x80001, 0)           = 3", {"domain": "1", "type": "0x80001", "protocol": "0"}),
+    (
+        "socketpair(0x1, 0x80801, 0, [3, 4]) = 0",
+        {"domain": "1", "type": "0x80801", "protocol": "0"},
+    ),
+    ("accept4(3, NULL, NULL, 0x80800)   = 4", {"flags": "0x80800"}),
+    ("epoll_create1(0x80000)            = 3", {"flags": "0x80000"}),
+    (
+        "epoll_ctl(3, 0x1, 4, {events=0x80000001, data={u32=4, u64=4}}) = 0",
+        {"op": "0x1", "events": "0x80000001"},
+    ),
+    ("eventfd2(0, 0x80800)              = 3", {"flags": "0x80800"}),
+    ("getsockopt(3, 0x1, 0x4, [0], [4]) = 0", {"level": "1", "optname": "4"}),
+    ("inotify_init1(0x80800)            = 3", {"flags": "0x80800"}),
+    ('memfd_create("x", 0x1)            = 3', {"flags": "0x1"}),
+    ('recvfrom(3, ""..., 64, 0x40, NULL, NULL) = 4', {"flags": "0x40"}),
+    ("recvmmsg(3, [...], 2, 0x40, NULL) = 1", {"flags": "0x40"}),
+    ("recvmsg(3, {msg_name=NULL}, 0x40000000) = 1", {"flags": "0x40000000"}),
+    ("sendmmsg(3, [...], 2, 0x4000)     = 2", {"flags": "0x4000"}),
+    ("sendmsg(3, {msg_name=NULL}, 0x4000) = 1", {"flags": "0x4000"}),
+    ('sendto(3, ""..., 5, 0x4000, NULL, 0) = 5', {"flags": "0x4000"}),
+    ("setsockopt(3, 0x1, 0x2, [1], 4)   = 0", {"level": "1", "optname": "2"}),
+    ("shutdown(3, 0x1)                  = 0", {"how": "0x1"}),
+    ("signalfd4(-1, [17], 8, 0x80800)   = 3", {"flags": "0x80800"}),
+    ("timer_create(0x1, NULL, [0])      = 0", {"clock": "1"}),
+    ("timerfd_create(0x1, 0x80800)      = 3", {"clock": "1", "flags": "0x80800"}),
+    (
+        "timerfd_settime(3, 0x1, {it_interval={tv_sec=0, tv_nsec=0}, it_value={tv_sec=1, tv_nsec=0}}, NULL) = 0",
+        {"flags": "0x1"},
+    ),
     ('statx(-100, "/x", 0x100, 0xfff, 0x7ffe0000) = 0', {"flags": "0x100"}),
     ("tgkill(5, 6, 6)                   = 0", {"signal": "6"}),
     ('unlinkat(-100, "/x", 0x200)       = 0', {"flags": "0x200"}),
@@ -815,3 +844,273 @@ def test_the_report_lists_a_stub_under_its_milestone(capsys):
     for name in stubbed & tomllib.loads(CENSUS.read_text())["syscalls"].keys():
         assert re.search(rf"^ +\d+ {name} ", m8, re.MULTILINE), name
         assert not re.search(rf"^ +\d+ {name} ", implemented, re.MULTILINE), name
+
+
+M9_CENSUS = ROOT / "tests/linux/m9-census.toml"
+M9_WORKLOADS_SH = ROOT / "tools/census/m9-workloads.sh"
+
+# Fixture traces in `strace -f -qq -X raw -s 0` format for M9 (#451).
+# Linux x86-64 syscall numbers and ABI constants cited from Linux 6.12:
+# - arch/x86/entry/syscalls/syscall_64.tbl: read(0), ioctl(16), mremap(25),
+#   madvise(28), sendfile(40), socket(41)..getsockopt(55), times(100),
+#   clock_gettime(228), epoll_wait(232), epoll_ctl(233), epoll_pwait(281),
+#   timerfd_create(283), timerfd_settime(286), timerfd_gettime(287),
+#   accept4(288), signalfd4(289), eventfd2(290), epoll_create1(291),
+#   recvmmsg(299), sendmmsg(307), memfd_create(319), clone3(435),
+#   epoll_pwait2(441).
+# - include/linux/socket.h: AF_UNIX(1), AF_INET(2), AF_INET6(10),
+#   AF_NETLINK(16), AF_PACKET(17).
+# - include/uapi/linux/sockios.h: SIOCGIFCONF(0x8912), SIOCGIFFLAGS(0x8913).
+# - include/uapi/linux/time.h: CLOCK_MONOTONIC(1), CLOCK_PROCESS_CPUTIME_ID(2),
+#   CLOCK_THREAD_CPUTIME_ID(3).
+# - include/uapi/asm-generic/socket.h & linux/in.h & linux/tcp.h:
+#   SOL_SOCKET(1), SO_REUSEADDR(2), SO_ERROR(4), IPPROTO_TCP(6),
+#   TCP_NODELAY(1), IPPROTO_IPV6(41), IPV6_V6ONLY(26).
+M9_TRACE_NET = """\
+101   read(3, ""..., 64)                = 6
+101   socket(0x2, 0x80801, 0x6)         = 4
+101   socket(0xa, 0x80801, 0x6)         = 5
+101   socket(0x10, 0x80003, 0)          = 6
+101   socket(0x11, 0x3, htons(0x0003))  = 7
+101   socketpair(0x1, 0x80801, 0, [8, 9]) = 0
+101   setsockopt(4, 0x1, 0x2, [1], 4)   = 0
+101   setsockopt(4, 0x6, 0x1, [1], 4)   = 0
+101   setsockopt(5, 0x29, 0x1a, [1], 4) = 0
+101   getsockopt(4, 0x1, 0x4, [0], [4]) = 0
+101   bind(4, {sa_family=0x2, sin_port=htons(0), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+101   listen(4, 128)                    = 0
+101   getsockname(4, {sa_family=0x2}, [16]) = 0
+101   connect(5, {sa_family=0xa}, 28)   = -1 EINPROGRESS (Operation now in progress)
+101   accept(4, {sa_family=0x2}, [16])  = 10
+101   accept4(4, {sa_family=0x2}, [16], 0x80800) = 11
+101   getpeername(11, {sa_family=0x2}, [16]) = 0
+101   sendto(11, ""..., 5, 0x4000, NULL, 0) = 5
+101   recvfrom(11, ""..., 64, 0x40, NULL, NULL) = -1 EAGAIN (Resource temporarily unavailable)
+101   sendmsg(8, {msg_name=NULL, msg_control=[{cmsg_level=0x1, cmsg_type=0x1}]}, 0x4000) = 1
+101   recvmsg(9, {msg_name=NULL}, 0x40000000) = 1
+101   shutdown(11, 0x1)                 = 0
+101   ioctl(4, 0x8913, {ifr_name="lo"}) = 0
+101   ioctl(4, 0x8912, {ifc_len=4096})  = 0
+101   epoll_create1(0x80000)            = 12
+101   epoll_ctl(12, 0x1, 9, {events=0x80000001, data={u32=9, u64=9}}) = 0
+101   epoll_ctl(12, 0x3, 9, {events=0x5, data={u32=9, u64=9}}) = 0
+101   epoll_ctl(12, 0x2, 9, NULL)       = 0
+101   epoll_wait(12, [{events=0x1, data={u32=9, u64=9}}], 8, 100) = 1
+101   epoll_pwait(12, [{events=0x1, data={u32=9, u64=9}}], 8, 100, [], 8) = 1
+101   epoll_pwait2(12, [], 8, {tv_sec=0, tv_nsec=1000}, NULL, 8) = 0
+101   eventfd2(0, 0x80800)              = 13
+101   timerfd_create(0x1, 0x80800)      = 14
+101   timerfd_settime(14, 0, {it_interval={tv_sec=0, tv_nsec=0}, it_value={tv_sec=0, tv_nsec=1000}}, NULL) = 0
+101   timerfd_gettime(14, {it_interval={tv_sec=0, tv_nsec=0}, it_value={tv_sec=0, tv_nsec=500}}) = 0
+101   sendmmsg(4, [{msg_hdr={msg_name=NULL}, msg_len=4}], 1, 0x4000) = 1
+101   recvmmsg(4, [{msg_hdr={msg_name=NULL}, msg_len=4}], 1, 0x40, NULL) = 1
+"""
+
+M9_TRACE_RUNTIME = """\
+202   clock_gettime(0x1, {tv_sec=1, tv_nsec=0}) = 0
+202   clock_gettime(0x2, {tv_sec=0, tv_nsec=10}) = 0
+202   clock_gettime(0x3, {tv_sec=0, tv_nsec=5}) = 0
+202   mremap(0x7f0000, 4096, 8192, 0x1) = 0x7f1000
+202   madvise(0x7f1000, 4096, 0x4)      = 0
+202   memfd_create("jit", 0x1)          = 5
+202   sendfile(4, 5, NULL, 1024)        = 1024
+202   times({tms_utime=1, tms_stime=0, tms_cutime=0, tms_cstime=0}) = 100
+202   clone3({flags=0x3d0f00, exit_signal=0}, 88) = -1 ENOSYS (Function not implemented)
+202   signalfd4(-1, [17], 8, 0x80800)   = 6
+"""
+
+
+def _m9_script_workloads() -> set[str]:
+    script = M9_WORKLOADS_SH.read_text()
+    return set(re.findall(r"^\s*trace (\S+) ", script, re.MULTILINE))
+
+
+def test_m9_census_parses(tmp_path):
+    """M9 census (#451): strace traces of socket/epoll/eventfd/timerfd and
+    runtime syscalls parse into a deterministic TOML recording families, types,
+    protocols, sockopt levels/names, epoll ops/events, flags and ioctls; when
+    the generated tests/linux/m9-census.toml is present, it is validated too."""
+    (tmp_path / "net-bench.strace").write_text(M9_TRACE_NET)
+    (tmp_path / "python-asyncio.strace").write_text(M9_TRACE_RUNTIME)
+    _write_meta(tmp_path)
+
+    toml_a = syscalls.build(tmp_path, tmp_path, milestone="M9")
+    assert toml_a.splitlines()[0].startswith("# The M9 syscall census (#451)")
+    data = tomllib.loads(toml_a)
+
+    names = list(data["syscalls"])
+    assert names == sorted(names, key=X86_64.__getitem__)
+    assert data["meta"]["workloads"] == ["net-bench", "python-asyncio"]
+
+    # Socket families, types and protocols (AF_PACKET htons(0x0003) -> 768).
+    assert data["syscalls"]["socket"]["args"] == {
+        "domain": ["2", "10", "16", "17"],
+        "protocol": ["0", "6", "768"],
+        "type": ["0x3", "0x80003", "0x80801"],
+    }
+    assert data["syscalls"]["socketpair"]["args"] == {
+        "domain": ["1"],
+        "protocol": ["0"],
+        "type": ["0x80801"],
+    }
+    assert data["syscalls"]["setsockopt"]["args"] == {
+        "level": ["1", "6", "41"],
+        "optname": ["1", "2", "26"],
+    }
+    assert data["syscalls"]["getsockopt"]["args"] == {"level": ["1"], "optname": ["4"]}
+    assert data["syscalls"]["ioctl"]["args"] == {"request": ["0x8912", "0x8913"]}
+    assert data["syscalls"]["epoll_ctl"]["args"] == {
+        "events": ["0x5", "0x80000001"],
+        "op": ["0x1", "0x2", "0x3"],
+    }
+    assert data["syscalls"]["accept4"]["args"] == {"flags": ["0x80800"]}
+    assert data["syscalls"]["sendmsg"]["args"] == {"flags": ["0x4000"]}
+    assert data["syscalls"]["recvmsg"]["args"] == {"flags": ["0x40000000"]}
+    assert data["syscalls"]["sendmmsg"]["args"] == {"flags": ["0x4000"]}
+    assert data["syscalls"]["recvmmsg"]["args"] == {"flags": ["0x40"]}
+    assert data["syscalls"]["shutdown"]["args"] == {"how": ["0x1"]}
+    assert data["syscalls"]["timerfd_create"]["args"] == {"clock": ["1"], "flags": ["0x80800"]}
+    assert data["syscalls"]["connect"]["errors"] == {"EINPROGRESS": 1}
+    assert data["syscalls"]["recvfrom"]["errors"] == {"EAGAIN": 1}
+
+    # Determinism: meta keys and trace insertion order do not change output.
+    seen_rev = census(
+        {
+            "python-asyncio": parse_trace(M9_TRACE_RUNTIME.splitlines()),
+            "net-bench": parse_trace(M9_TRACE_NET.splitlines()),
+        }
+    )
+    meta_rev = {
+        "workloads": ["net-bench", "python-asyncio"],
+        "packages": ["busybox-1.37.0-r14", "musl-1.2.5-r9"],
+        "kernel": "6.6.87.2-microsoft-standard-WSL2",
+        "image": IMAGE,
+        "alpine": "3.21.10",
+    }
+    assert render_toml(meta_rev, seen_rev, milestone="M9") == toml_a
+
+    # The M9 workload script declares all expected gate workloads.
+    assert _m9_script_workloads() == {
+        "apk",
+        "busybox-nc",
+        "busybox-ping",
+        "busybox-wget",
+        "curl",
+        "net-bench",
+        "python-asyncio",
+        "python-cext",
+        "python-sqlite",
+        "ruby-fiber",
+        "ruby-gem",
+        "ruby-http",
+    }
+
+    # Once the CI workflow artifact is checked in, validate the real file too.
+    if M9_CENSUS.exists():
+        real = tomllib.loads(M9_CENSUS.read_text())
+        meta = real["meta"]
+        assert meta["alpine"].startswith("3.21.")
+        pin = re.search(r"^IMAGE=(\S+)$", CENSUS_SH.read_text(), re.MULTILINE)
+        assert pin and meta["image"] == pin.group(1)
+        assert meta["kernel"] and meta["packages"]
+        assert set(meta["workloads"]) == _m9_script_workloads()
+        real_names = list(real["syscalls"])
+        assert real_names == sorted(real_names, key=X86_64.__getitem__)
+        for name, entry in real["syscalls"].items():
+            assert entry["nr"] == X86_64[name], name
+            assert entry["calls"] > 0, name
+            assert set(entry["workloads"]) <= set(meta["workloads"]), name
+
+
+def test_m9_report_lists_m10_rows_the_gate_needs(tmp_path, capsys):
+    """M9 census report (#451): compares the census against M6-M8 kernel tables
+    and ROADMAP's M9/M10 lists, surfacing M10 rows needed by the M9 gate, M8
+    ENOSYS_BY_DECISION calls (incl. CPU-time clocks), unplanned calls, and the
+    #450 design probes."""
+    (tmp_path / "net-bench.strace").write_text(M9_TRACE_NET)
+    (tmp_path / "ruby-fiber.strace").write_text(M9_TRACE_RUNTIME)
+    _write_meta(tmp_path)
+    census_file = tmp_path / "m9-census.toml"
+    census_file.write_text(syscalls.build(tmp_path, tmp_path, milestone="M9"))
+
+    assert (
+        syscalls.main(
+            [
+                "report",
+                "--milestone",
+                "M9",
+                "--census",
+                str(census_file),
+                "--tables",
+                str(LINUX_MOD_RS),
+                "--verbose",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    sections = {s.splitlines()[0]: s for s in out.split("\n\n")}
+
+    # Priority section order.
+    order = [
+        "unplanned (2):",
+        "M10 rows needed by M9 gate (3):",
+        "M8 ENOSYS_BY_DECISION seen in M9 gate (5):",
+        "M9 planned (25):",
+        "M6-M8 tables (3):",
+        "M9 design probes (#450):",
+    ]
+    positions = [out.index(header) for header in order]
+    assert positions == sorted(positions)
+
+    # M10 rows needed by the gate: exactly the three present in the trace.
+    m10 = sections["M10 rows needed by M9 gate (3):"]
+    for name in ("mremap", "madvise", "memfd_create"):
+        assert re.search(rf"^ +\d+ {name} ", m10, re.MULTILINE), m10
+    assert "io_uring_setup" not in m10
+    assert " read " not in m10
+
+    # M8 ENOSYS_BY_DECISION rows + CPU-time clocks from clock_gettime.
+    enosys = sections["M8 ENOSYS_BY_DECISION seen in M9 gate (5):"]
+    for name in ("sendfile", "times", "signalfd4", "clone3"):
+        assert re.search(rf"^ +\d+ {name} ", enosys, re.MULTILINE), enosys
+    assert "CPU-time clocks on clock_gettime: 2, 3 (ruby-fiber)" in enosys
+
+    # Unplanned: sendmmsg and recvmmsg (not in M6-M8, M9, M10 or ENOSYS_BY_DECISION).
+    unplanned = sections["unplanned (2):"]
+    assert "recvmmsg" in unplanned and "sendmmsg" in unplanned
+
+    # M6-M8 already-implemented calls (read, ioctl, clock_gettime).
+    m6_m8 = sections["M6-M8 tables (3):"]
+    for name in ("read", "ioctl", "clock_gettime"):
+        assert re.search(rf"^ +\d+ {name} ", m6_m8, re.MULTILINE), m6_m8
+
+    # Design probes for #450.
+    probes = sections["M9 design probes (#450):"]
+    assert "AF_NETLINK (domain 16): seen (net-bench)" in probes
+    assert "AF_PACKET (domain 17): seen (net-bench)" in probes
+    assert "SIOCGIF* ioctls: 0x8912, 0x8913" in probes
+    assert "accept: 1 calls (net-bench); accept4: 1 calls (net-bench)" in probes
+    assert "sendmmsg: 1 calls (net-bench); recvmmsg: 1 calls (net-bench)" in probes
+    assert "epoll_pwait2: 1 calls (net-bench)" in probes
+    assert "sendfile: 1 calls (ruby-fiber)" in probes
+    assert "CPU-time clocks: clock_gettime=2,3" in probes
+
+    # Contrast: a trace with no M10, no ENOSYS_BY_DECISION, no unplanned, and
+    # only CLOCK_MONOTONIC reports none of those sections and `none` for probes.
+    clean_dir = tmp_path / "clean"
+    clean_dir.mkdir()
+    (clean_dir / "curl.strace").write_text(
+        "10    socket(0x2, 0x80801, 0x6) = 3\n10    clock_gettime(0x1, {tv_sec=1, tv_nsec=0}) = 0\n"
+    )
+    _write_meta(clean_dir)
+    clean_data = tomllib.loads(syscalls.build(clean_dir, clean_dir, milestone="M9"))
+    tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
+    clean_out = syscalls.report_m9(clean_data, tables)
+    assert "M10 rows needed by M9 gate" not in clean_out
+    assert "M8 ENOSYS_BY_DECISION seen in M9 gate" not in clean_out
+    assert "unplanned (" not in clean_out
+    assert "AF_NETLINK (domain 16): none" in clean_out
+    assert "AF_PACKET (domain 17): none" in clean_out
+    assert "SIOCGIF* ioctls: none" in clean_out
+    assert "CPU-time clocks: none" in clean_out
