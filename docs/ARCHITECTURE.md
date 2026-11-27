@@ -7393,13 +7393,19 @@ through `[patch.crates-io]` in the workspace `Cargo.toml`; the dependency
 line still says `=0.1.0-rc.2`. Lumen's changes sit on top, each its own
 commit, its code changes marked `Lumen (#n)` (the crate's own tests only
 adjusted to new signatures), so `git log vendor/` lists them and a diff
-against the crate file shows them all. So far one:
+against the crate file shows them all. So far two:
 #313, the htree hash's signedness from `s_flags` (the #308 caveat below;
 `Superblock::htree_hash_unsigned`, and `htree_hash`, public only for
-`lumen-vfs`'s host test). The crate's own unit tests don't build from the
+`lumen-vfs`'s host test); and #350, the allocators' bounded search: each
+group visited once (block searches from the inode's group, wrapping once),
+only a group's real bits searched, a positive count over a bitmap with no
+free bit returned as `CorruptKind::AllocationBitmapMismatch` and reported
+through `Ext4Write::on_allocation_corruption`, and `Extent::allocate`
+retrying only `NoSpace`. The crate's own unit tests don't build from the
 crate file (their `test_data/` isn't in it), so Lumen tests its changes
-from outside. Its other known bugs (the allocator retry of #350, #355) are
-fixable there now, each in a PR of its own.
+from outside. Its other known bug (#355, a truncate's frees reaching the
+device before its inode) needs ordering at the device, not in the crate's
+call order (#355's comments).
 
 `ext4plus` `=0.1.0-rc.2` is vetted against all six hard gates:
 1. Compiles on pinned stable `rustc 1.99.1` for `x86_64-unknown-none` with
@@ -7770,16 +7776,14 @@ fixable there now, each in a PR of its own.
       retry turns that into `ext4plus`'s `Ok` (the operation's `EIO` since
       #349), the allocation's into `NoSpc` (nothing
       doubled or leaked; the victim stays dirty).
-    - `ext4plus`'s allocators (`alloc_block`, `alloc_contiguous_blocks`,
-      `alloc_inode`) loop forever on a group whose count promises more than
-      its bitmap has, or, for `alloc_contiguous_blocks(n)`, on one with no
-      run of `n` free bits: the next allocation from such a group hangs
-      (read from the source, and seen hanging a file's writeback on an
-      image made so; #350). Any allocation whose checksum write fails after
-      its bit landed leaves such a count, retry or not, whether it reports
-      `Io` (`alloc_block` for a directory's or an index block,
-      `alloc_inode` for create, mkdir, symlink) or `NoSpc` (through
-      `Extent::allocate`); so does the free's double count.
+    - A group whose count promises more than its bitmap has: any
+      allocation whose checksum write fails after its bit landed leaves
+      one (it reports `Io`), and so does the free's double count. Before
+      #350 `ext4plus`'s allocators looped forever on such a group; since
+      #350 an allocation that meets one returns `EIO` and makes the volume
+      read-only (the second trigger below), and a group with free bits but
+      no run of `n` for `alloc_contiguous_blocks(n)` is skipped as
+      fragmentation.
     - Two narrow paths drop an error before any of these (read from the
       source, not probed): `ext4plus`'s duplicate-name check in
       `add_dir_entry` (`dir.rs`) takes a failed lookup (an eviction's write
@@ -7841,6 +7845,15 @@ fixable there now, each in a PR of its own.
       and refusals made before anything is written (`EFBIG`, the page
       cache's hard cap), don't trigger it. In the ktests the `FaultCache`
       reports each write or sync it fails as the device's failure.
+    - *Second trigger (#350):* an allocator meeting a group whose free count
+      is positive but whose bitmap has no free bit (ext4plus's
+      `Ext4Write::on_allocation_corruption`). It trips the latch with that
+      cause if the latch was healthy (`trip_corrupt`: a device failure that
+      came first keeps its own line) and stops the block cache's writeback
+      (`stop_writeback`, on `LatchableCache`) without freezing it, so the
+      operations running then finish against the cache, the failing one's
+      undo included; the last of them settles and freezes, as for a failed
+      write. The operation itself returns `EIO`.
     - *Nothing more reaches the device, from the failure on:* the block
       cache stops writing back inside the call that met it
       (`stop_writeback_on_failure`, above): no later eviction, sync or
@@ -7907,7 +7920,11 @@ fixable there now, each in a PR of its own.
       `writeback`, `fsync`, ...: the innermost write-type operation, begun
       before the failure, of the thread whose call first saw it, which with
       two operations running at the failure may be the other one's), or
-      `a read's eviction`, and `<cause>` the block cache's first failure. `mount` shows its mode as
+      `a read's eviction`, and `<cause>` the block cache's first failure;
+      for the second trigger, `ERROR vfs: ext4 <dev>: <op> found group <n>'s
+      block|inode bitmap has no free bit despite a positive free count; the
+      volume is read-only until reboot (errors=remount-ro); run e2fsck -f`.
+      `mount` shows its mode as
       `ro,errors`, `/proc/mounts` as `ro,errors=remount-ro`.
     - *Not marked on disk:* the superblock's `s_state` error bit and
       `s_error_count` aren't set. `ext4plus` 0.1.0-rc.2 neither reads nor
