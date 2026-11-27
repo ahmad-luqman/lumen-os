@@ -4289,8 +4289,8 @@ below). Sockets are M9.
 
 #### M7 POSIX VFS, file-backed `mmap`, and dynamic-linking syscalls (designed in #246)
 
-In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (matching
-`RLIMIT_NOFILE`), storing `Option<FdEntry { file: Arc<OpenFile>, cloexec: bool }>`.
+In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (the default
+`RLIMIT_NOFILE` and its ceiling; a lowered soft limit bounds allocation since #435), storing `Option<FdEntry { file: Arc<OpenFile>, cloexec: bool }>`.
 
 **Built in #254b** (`kernel/src/linux/process.rs`, `syscall/fd.rs`,
 `syscall/dir.rs`; split into M8's `Process` and `Files` by B1, below): the
@@ -4384,7 +4384,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); same cap and the same errors in the same order as `pread64` (`-EBADF` if not writable; no `-EISDIR`, as a directory can't be open for writing) |
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
 | 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` (or a `len` within a page of 2^64, which Linux's rounding wraps to 0) and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` when `addr + len` rounded up overflows and on any unmapped hole (with `MS_SYNC`, after writing back the mapped parts; a writeback error such as `-EIO` wins); for `MS_SYNC`, writes back each `MAP_SHARED` file's dirty pages (a writable mapping keeps its pages dirty, section 5) through its filesystem and block cache to the device, with the address space's lock released |
-| 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0) / `F_DUPFD_CLOEXEC` (1030) (`-EINVAL` if `arg < 0 \|\| arg >= MAX_FDS`, `-EMFILE` if no free slot in `[arg, MAX_FDS)`), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`; the access mode and creation flags ignored, as on Linux, and `O_ASYNC`/`O_DIRECT`/`O_NOATIME` too, which Linux would change and Lumen doesn't track), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped; a bad `l_type`/`l_whence` or negative start `-EINVAL`, a range past `OFFSET_MAX` `-EOVERFLOW`, then the open mode `F_WRLCK` → writable / `F_RDLCK` → readable else `-EBADF`; normalizing `l_len < 0`; `F_SETLKW` is `-EDEADLK` where its wait would close a cycle of waiting processes, section 9); on an `O_PATH` fd every `cmd` but `F_DUPFD*`/`F_GETFD`/`F_SETFD`/`F_GETFL` is `-EBADF`, unknown ones included; on any other fd an unknown `cmd` is `-EINVAL` |
+| 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0) / `F_DUPFD_CLOEXEC` (1030) (`-EINVAL` if `arg < 0` or `arg` is at or past the soft `RLIMIT_NOFILE`, `-EMFILE` if no free slot in `[arg, limit)`; the limit was `MAX_FDS` before #435), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`; the access mode and creation flags ignored, as on Linux, and `O_ASYNC`/`O_DIRECT`/`O_NOATIME` too, which Linux would change and Lumen doesn't track), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped; a bad `l_type`/`l_whence` or negative start `-EINVAL`, a range past `OFFSET_MAX` `-EOVERFLOW`, then the open mode `F_WRLCK` → writable / `F_RDLCK` → readable else `-EBADF`; normalizing `l_len < 0`; `F_SETLKW` is `-EDEADLK` where its wait would close a cycle of waiting processes, section 9); on an `O_PATH` fd every `cmd` but `F_DUPFD*`/`F_GETFD`/`F_SETFD`/`F_GETFL` is `-EBADF`, unknown ones included; on any other fd an unknown `cmd` is `-EINVAL` |
 | 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; independent of `fcntl` POSIX locks); as Linux 6.0+, `LOCK_MAND` is ignored (returns 0; reported once a boot, at info) and `op` is checked (`-EINVAL`) before `fd` (`-EBADF`, `O_PATH` too); atomic upgrade/downgrade on same `OpenFileId` when nothing conflicts (a blocking request that conflicts gives the held lock up first, as Linux; section 9), `-EWOULDBLOCK` on conflict with `LOCK_NB` (the held lock kept: a deviation, Linux drops it), released when last FD to the `OpenFile` closes |
 | 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs (and detached unlinked inodes as a no-op), `-EBADF` on `O_PATH`, and `-EINVAL` on console/tty, `/dev/*`, character-device, FIFO and socket nodes and anything on procfs, as Linux (no `->fsync`); also on block-device nodes, an M7 deviation (Linux's `blkdev_fsync` syncs the device, which M7 can't open) |
 | 75 | `fdatasync(fd)` | flushes file data pages and size-changing metadata (ext4: all dirty metadata) through `BlockCache` + `BlockDevice::flush()` (same `-EBADF`/`-EINVAL` rules as `fsync`) |
@@ -4516,8 +4516,8 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 22 | `pipe(fds)` | `pipe2(fds, 0)` | C7 |
 | 23 | `select(n, readfds, writefds, exceptfds, tv)` | `n < 0` `-EINVAL`, `n` capped at `MAX_FDS`; a set naming a closed fd `-EBADF`; a negative `tv` field `-EINVAL`; bad pointers `-EFAULT`; an `O_PATH` fd is open (`max_select_fd` uses `open_fds`) and answers `POLLNVAL` (`select_poll_one`), which sits in all three sets; any other descriptor is readable for `POLLIN_SET`, writable for `POLLOUT_SET`, exceptional for `POLLEX_SET` (`fs/select.c`'s sets: `POLLEX_SET` is `POLLPRI \| POLLNVAL`, and `POLLNVAL` is in all three; `POLLPRI` is never set on a pipe, PTY or the console, so the census's vim exception set on its pty is simply never ready); writes the time left back to `tv` (not for a zero timeout; a failed write-back keeps a ready count and turns `-ERESTARTNOHAND` into `-EINTR`, as Linux's `poll_select_finish`); interrupted `-ERESTARTNOHAND` | B3 |
 | 24 | `sched_yield()` | `sched::yield_now`; 0 | C12 |
-| 32 | `dup(oldfd)` | the lowest free fd, `FD_CLOEXEC` clear, looked up and installed in one hold of the FD table (section 9's fourth hazard); `-EBADF`, `-EMFILE` | C7 |
-| 33 | `dup2(oldfd, newfd)` | `oldfd == newfd`: `newfd` if open, else `-EBADF`; `newfd >= MAX_FDS` `-EBADF`; a `newfd` reserved by an open still in progress `-EBUSY`, as Linux's `do_dup2`; a displaced descriptor closed through `process::release_fd` after the table's lock is released | C7 |
+| 32 | `dup(oldfd)` | the lowest free fd below the soft `RLIMIT_NOFILE` (since #435), `FD_CLOEXEC` clear, looked up and installed in one hold of the FD table (section 9's fourth hazard); `-EBADF`, `-EMFILE` | C7 |
+| 33 | `dup2(oldfd, newfd)` | `oldfd == newfd`: `newfd` if open, else `-EBADF`; `newfd` at or past the soft `RLIMIT_NOFILE` (since #435; `MAX_FDS` by default) `-EBADF`; a `newfd` reserved by an open still in progress `-EBUSY`, as Linux's `do_dup2`; a displaced descriptor closed through `process::release_fd` after the table's lock is released | C7 |
 | 34 | `pause()` | waits, interruptible, for a signal; interrupted `-ERESTARTNOHAND` (musl's `pause` calls it on x86-64) | C6 |
 | 35 | `nanosleep(req, rem)` | `-EFAULT`; `tv_sec < 0` or `tv_nsec` outside 0..1e9 `-EINVAL`; sleeps at least `req` on `CLOCK_MONOTONIC`; interrupted `-ERESTART_RESTARTBLOCK`, with the time left written to `rem` (if not `NULL`); if no time remains after interruption, returns 0 | C4 |
 | 36 | `getitimer(which, value)` | `ITIMER_REAL`: the time left and the interval; `ITIMER_VIRTUAL`, `ITIMER_PROF` and anything else `-EINVAL` (Lumen has no CPU-time timers: a deviation); `-EFAULT` | C13 |
@@ -4579,7 +4579,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 292 | `dup3(oldfd, newfd, flags)` | `flags` other than `O_CLOEXEC` `-EINVAL`; `oldfd == newfd` `-EINVAL`; else `dup2` with `FD_CLOEXEC` from `flags` | C7 |
 | 293 | `pipe2(fds, flags)` | `O_CLOEXEC` and `O_NONBLOCK` (each end's own description); `O_DIRECT` (packet mode: a deviation) and any other flag `-EINVAL`; two slots reserved first (`-EMFILE`); a bad `fds` `-EFAULT`, both reservations dropped without installing either descriptor; section 10 | C7 |
 | 297 | `rt_tgsigqueueinfo(tgid, tid, sig, info)` | copy `info` first (`-EFAULT`); then `tgid`/`tid <= 0` gives `-EINVAL`; otherwise as `rt_sigqueueinfo`, to one thread | C5 |
-| 302 | `prlimit64(pid, res, new, old)` | M6's checks; a write to `RLIMIT_STACK` (`rlim_cur > rlim_max` `-EINVAL`) is kept and used by the next `execve` (its stack and argument budget, section 8). Since #435, `RLIMIT_NOFILE` and `RLIMIT_NPROC` writes are kept per process (inherited across `fork`, kept across `execve`) and enforced: `open`, `openat`, `pipe`, `pipe2` and `dup` return `-EMFILE` with no free fd below the soft limit; `dup2`/`dup3` to a target at or past it `-EBADF`; `fcntl(F_DUPFD*)` with `arg` at or past it `-EINVAL`; `poll`/`ppoll` with `nfds` past it `-EINVAL`; the kernel's own installs (`Stdio`, the fork and exec copies) aren't limited; and an `RLIMIT_NOFILE` hard limit above `MAX_FDS` (1024) is refused with `-EPERM`, as Linux refuses one above `nr_open`; `fork`, `vfork` and `clone` return `-EAGAIN` once the extant user tasks (processes other than init, non-leader threads, unreaped zombies) reach the soft `RLIMIT_NPROC`. Unlike Linux, root is not exempt: Lumen has one uid, 0, and no capabilities, so an exemption would make the limit unenforceable (libc-test's `pthread_atfork-errno-clobber` sets it to 0 and expects `fork` to fail). Every other resource's write is still checked and ignored until M10. The census: gcc and g++ raise the stack to 64 MiB and `cc1`/`cc1plus` read it back | C12 |
+| 302 | `prlimit64(pid, res, new, old)` | M6's checks; a write to `RLIMIT_STACK` (`rlim_cur > rlim_max` `-EINVAL`) is kept and used by the next `execve` (its stack and argument budget, section 8). Since #435, `RLIMIT_NOFILE` and `RLIMIT_NPROC` writes are kept per process (inherited across `fork`, kept across `execve`) and enforced: `open`, `openat`, `pipe`, `pipe2` and `dup` return `-EMFILE` with no free fd below the soft limit; `dup2`/`dup3` to a target at or past it `-EBADF`; `fcntl(F_DUPFD*)` with `arg` at or past it `-EINVAL`; `poll`/`ppoll` with `nfds` past it `-EINVAL`; the kernel's own installs (`Stdio`, the fork and exec copies) aren't limited; and an `RLIMIT_NOFILE` hard limit above `MAX_FDS` (1024) is refused with `-EPERM`, as Linux refuses one above `nr_open`; `fork`, `vfork` and `clone` return `-EAGAIN` once the extant user tasks (processes other than init, non-leader threads, unreaped zombies) reach the soft `RLIMIT_NPROC`. Unlike Linux, which exempts uid 0 and tasks with `CAP_SYS_RESOURCE`/`CAP_SYS_ADMIN`, root is not exempt: Lumen has one uid, 0, and no capabilities, so an exemption would make the limit unenforceable (libc-test's `pthread_atfork-errno-clobber` sets it to 0 and expects `fork` to fail). Every other resource's write is still checked and ignored until M10. The census: gcc and g++ raise the stack to 64 MiB and `cc1`/`cc1plus` read it back | C12 |
 | 309 | `getcpu(cpu, node, cache)` | the current CPU's index and node 0 (either pointer may be `NULL`); with no vDSO, musl's `sched_getcpu` makes this syscall | C12 |
 | 324 | `membarrier(cmd, flags, cpu_id)` | **`-ENOSYS`**: musl registers `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED` when it starts a thread, ignores the result, and its barrier falls back to signalling each thread (the census: git, pthread, vim over the pty) | — |
 
@@ -4616,9 +4616,9 @@ nor that list.
   and `accept4` (288), `AF_UNIX` (`socketpair`, `SCM_RIGHTS`), `epoll_*`
   (on section 10's readiness interface), `eventfd2`, and `timerfd_*`.
 - **M10 (JIT VM & Tier-1 runtimes):** `mremap`, `madvise` (`MADV_DONTNEED`,
-  `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64` (the
-  resources not yet enforced: `RLIMIT_STACK` since C12, `RLIMIT_NOFILE` and
-  `RLIMIT_NPROC` since #435), and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery (`sysinfo`
+  `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64` (every
+  resource but `RLIMIT_STACK`, enforced since C12, and `RLIMIT_NOFILE` and
+  `RLIMIT_NPROC`, since #435), and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery (`sysinfo`
   moved to M8 with #337's census).
 
 ### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` loader built #255, designed in #246; `dlopen` through ld-musl's file `mmap` built #255, M7)
@@ -5193,7 +5193,7 @@ untouched):
    `-EFAULT`, `MAX_ARG_STRINGS` gives `-E2BIG`, and each iteration checks
    fatal pending state (`-EINTR`, consumed by syscall exit). Then start `lumen_elf::args::ArgBudget::new(argc, envc,
    limit)`, with Linux's `bprm_stack_limits`: `limit = max(min(6 MiB,
-   rlimit_stack / 4), 128 KiB)`, 2 MiB at the default 8 MiB stack. Then
+   rlimits.stack / 4), 128 KiB)`, 2 MiB at the default 8 MiB stack. Then
    charge and copy, in the budget's documented order: `execfn` (the path
    as given), `envp` last to first, `argv` last to first (each length from
    a bounded `strnlen_user`; 0, a fault, is `-EFAULT`), and, when `argc` is
@@ -5239,7 +5239,7 @@ untouched):
      cache.
 5. Build the new `AddressSpace` completely (`AddressSpace::from_images_with_stack`,
    the initial stack from the copied strings): `-ENOMEM` if frames or heap
-   run out. The stack's size is the soft limit `rlimit_stack.soft()` clamped to 128 KiB..=256
+   run out. The stack's size is the soft limit `rlimits.stack.soft()` clamped to 128 KiB..=256
    MiB, rounded up to a page by `StackSize` (section 5), whose argument
    budget also supplies step 2. Each `AddressSpace` retains the bottom.
    **No whole-file read:** the kernel's `ElfImage` (in

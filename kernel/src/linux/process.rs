@@ -574,7 +574,7 @@ impl Process {
     }
 
     /// Read or atomically replace one per-process resource limit; returns the
-    /// previous pair, or `EPERM` if a `Nofile` write exceeds [`lumen_vfs::MAX_FDS`].
+    /// previous pair, or `EPERM` if a `Nofile` write's hard limit exceeds [`lumen_vfs::MAX_FDS`].
     pub fn rlimit(&self, kind: RlimitKind, new: Option<Rlimit>) -> Result<Rlimit, u32> {
         self.signal.lock().rlimits.exchange(kind, new)
     }
@@ -1792,7 +1792,9 @@ pub fn install_current_fd(file: KernelFile, cloexec: bool) -> Result<i32, VfsErr
 /// current process, closing what was there (its locks released outside the
 /// table's lock). `EBUSY` for a reserved slot; `EBADF` for an fd outside
 /// `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s inode
-/// number from it and relies on that range.
+/// number from it and relies on that range. Kernel-internal (the `vfstest`
+/// shell command, ktests): it ignores the soft `RLIMIT_NOFILE` on purpose,
+/// so no syscall path may use it.
 pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
     place_current_fd(fd, Arc::new(file), false)
 }
@@ -4945,9 +4947,8 @@ crate::ktest!(
             );
 
             let base = PROCS.lock().nproc_task_count() as u64;
-            if base != 1 {
-                return Err("expected baseline nproc_task_count == 1 (only this test process, excluding pid 1)");
-            }
+            // Only this test process, excluding pid 1.
+            kassert_eq!(base, 1);
 
             // Soft limit 0 refuses both fork (link_child) and thread clone (fork_current & link_thread) with EAGAIN.
             kassert_eq!(process.rlimit(RlimitKind::Nproc, Some(Rlimit::new(0, 0).unwrap())), Ok(Rlimit::INFINITY));

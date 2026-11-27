@@ -437,8 +437,8 @@ impl<F> FdTable<F> {
 
     /// Insert or replace `fd` directly within `0..MAX_FDS`, intentionally
     /// unbounded by `RLIMIT_NOFILE`: used for kernel-internal installs (stdio
-    /// seeding, fork/exec descriptor table copies, ktest fixtures) that must
-    /// never be refused by a lowered soft limit.
+    /// seeding, the exec copy, ktest fixtures; fork clones the whole table)
+    /// that must never be refused by a lowered soft limit.
     ///
     /// Returns `Err(Busy)` for a reserved slot, `Err(BadF)` outside `0..MAX_FDS`.
     /// Returns the displaced `FdEntry` (if any) so the caller can drop it
