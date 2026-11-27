@@ -166,42 +166,39 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
     });
     assert_eq!(rq.ready_len(), 33);
 
-    // 2. `begin_scan`, mid-scan `wake` (`DuringScan`), `finish_scan`, `unreport`,
+    // 2. `begin_scan`, mid-scan `wake` (`AlreadyQueued`), `finish_scan`, `unreport`,
     //    `finish_peek`, and `abort_scan`: 0 allocs, 0 deallocs.
-    assert_zero_heap_traffic(
-        "begin_scan + DuringScan wake + finish_scan + unreport + finish_peek + abort_scan",
-        || {
-            let scan = rq.begin_scan(&mut hbuf);
-            let len = scan.len();
-            assert_eq!(len, 33);
-            assert!(rq.events_available());
-            for (i, &h) in scan.handles().iter().enumerate() {
-                let e = set.get(h).unwrap();
-                pbuf[i] = if e.key.1.is_multiple_of(7) { 0 } else { EPOLLIN | EPOLLOUT };
-            }
-            assert_eq!(rq.wake(handles[1], EPOLLIN), Wake::DuringScan);
-            sink.clear();
-            let done = rq.finish_scan(&set, scan, &pbuf[..len], 7, &mut sink);
-            assert_eq!(done.reported, 7);
-            assert!(done.wake_waiters);
+    assert_zero_heap_traffic("begin_scan + mid-scan wake + finish_scan + unreport + finish_peek + abort_scan", || {
+        let scan = rq.begin_scan(&mut hbuf);
+        let len = scan.len();
+        assert_eq!(len, 33);
+        assert!(rq.events_available());
+        for (i, &h) in scan.handles().iter().enumerate() {
+            let e = set.get(h).unwrap();
+            pbuf[i] = if e.key.1.is_multiple_of(7) { 0 } else { EPOLLIN | EPOLLOUT };
+        }
+        assert_eq!(rq.wake(handles[1], EPOLLIN), Wake::AlreadyQueued);
+        sink.clear();
+        let done = rq.finish_scan(&set, scan, &pbuf[..len], 7, &mut sink);
+        assert_eq!(done.reported, 7);
+        assert!(done.wake_waiters);
 
-            // Roll back the tail via `unreport` (zero alloc).
-            assert!(rq.unreport(sink.slice()[3..done.reported].iter().map(|e| e.unwrap().handle)));
+        // Roll back the tail via `unreport` (zero alloc).
+        assert!(rq.unreport(sink.slice()[3..done.reported].iter().map(|e| e.unwrap().handle)));
 
-            // Nested-epoll non-consuming `begin_scan` + `finish_peek`.
-            let pscan = rq.begin_scan(&mut hbuf);
-            let plen = pscan.len();
-            for p in &mut pbuf[..plen] {
-                *p = EPOLLIN | EPOLLOUT;
-            }
-            let pdone = rq.finish_peek(pscan, &pbuf[..plen]);
-            assert!(pdone.ready && pdone.wake_waiters);
+        // Nested-epoll non-consuming `begin_scan` + `finish_peek`.
+        let pscan = rq.begin_scan(&mut hbuf);
+        let plen = pscan.len();
+        for p in &mut pbuf[..plen] {
+            *p = EPOLLIN | EPOLLOUT;
+        }
+        let pdone = rq.finish_peek(pscan, &pbuf[..plen]);
+        assert!(pdone.ready && pdone.wake_waiters);
 
-            // Error-path `abort_scan`.
-            let ascan = rq.begin_scan(&mut hbuf);
-            assert!(rq.abort_scan(ascan));
-        },
-    );
+        // Error-path `abort_scan`.
+        let ascan = rq.begin_scan(&mut hbuf);
+        assert!(rq.abort_scan(ascan));
+    });
 
     // 3. `EpollSet::modify` + `ReadyQueue::apply` (updates, re-arms, ENOENT, and EINVAL): 0 allocs, 0 deallocs.
     assert_zero_heap_traffic("modify + apply (update, re-arm, ENOENT, EINVAL)", || {

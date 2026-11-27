@@ -697,9 +697,10 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `ReadyQueue` behind the level-10e leaf spinlock (`ep->lock`: generational
   `Handle`-indexed intrusive ready list with `Handle::INVALID`, copied watch
   masks, `in_ready`/`in_scan`/`armed`/`woke_during_scan` flags; zero-alloc
-  `wake -> Wake` (`Queued`/`DuringScan`/`AlreadyQueued`/`Filtered`/`Stale`;
-  only real source wakes notify `PollHead` subscribers via
-  `should_notify_subscribers`), `activate(&mut set, Added) -> Option<Storage>`
+  `wake -> Wake` (`Queued`/`AlreadyQueued`/`Filtered`/`Stale`; every matching
+  source wake — `Queued` or `AlreadyQueued`, whether newly queued, already
+  `in_ready`, or `in_scan` — wakes waiters and notifies `PollHead` subscribers
+  via `should_wake_waiters`/`should_notify_subscribers`), `activate(&mut set, Added) -> Option<Storage>`
   confirming growth capacity and taking over stale slots, `apply(Modified)`,
   `unlink`, `install(Storage)`, `events_available`, full-list two-phase
   `begin_scan`/`Scan` + `finish_scan` (`ScanDone.wake_waiters`, `Event`,

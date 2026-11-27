@@ -279,8 +279,12 @@ fn et_reported_once_per_wake() {
     assert!(Wake::Queued.should_wake_waiters());
     assert!(Wake::Queued.should_notify_subscribers());
     assert_eq!(p.rq.wake(h, EPOLLIN), Wake::AlreadyQueued);
-    assert!(!Wake::AlreadyQueued.should_wake_waiters());
-    assert!(!Wake::AlreadyQueued.should_notify_subscribers());
+    assert!(Wake::AlreadyQueued.should_wake_waiters());
+    assert!(Wake::AlreadyQueued.should_notify_subscribers());
+    assert!(!Wake::Filtered.should_wake_waiters());
+    assert!(!Wake::Filtered.should_notify_subscribers());
+    assert!(!Wake::Stale.should_wake_waiters());
+    assert!(!Wake::Stale.should_notify_subscribers());
     assert_eq!(p.rq.ready_len(), 1);
 
     let (out, done) = p.scan_with(4, |_, _| EPOLLIN, |_| {});
@@ -384,13 +388,14 @@ fn post_scan_order_matches_linux_ep_done_scan() {
         3,
         |k, _| if k.1 == 2 { 0 } else { EPOLLIN },
         |rq| {
-            // Mid-scan wake on entries in the scan returns Wake::DuringScan (notify like Queued).
-            assert_eq!(rq.wake(h_zero, EPOLLIN), Wake::DuringScan);
-            assert!(Wake::DuringScan.should_wake_waiters());
-            assert!(Wake::DuringScan.should_notify_subscribers());
-            assert_eq!(rq.wake(h_et, EPOLLIN), Wake::DuringScan);
-            assert_eq!(rq.wake(h_os, EPOLLIN), Wake::DuringScan);
-            assert_eq!(rq.wake(h_unvisited, EPOLLIN), Wake::DuringScan);
+            // Mid-scan wake on entries in the scan returns Wake::AlreadyQueued
+            // (still wakes waiters and notifies subscribers, and records woke_during_scan).
+            assert_eq!(rq.wake(h_zero, EPOLLIN), Wake::AlreadyQueued);
+            assert!(Wake::AlreadyQueued.should_wake_waiters());
+            assert!(Wake::AlreadyQueued.should_notify_subscribers());
+            assert_eq!(rq.wake(h_et, EPOLLIN), Wake::AlreadyQueued);
+            assert_eq!(rq.wake(h_os, EPOLLIN), Wake::AlreadyQueued);
+            assert_eq!(rq.wake(h_unvisited, EPOLLIN), Wake::AlreadyQueued);
             // Non-matching mask mid-scan is still filtered.
             assert_eq!(rq.wake(h_et, EPOLLOUT), Wake::Filtered);
             // Entry outside scan enters `ready` immediately -> Wake::Queued.
@@ -740,15 +745,30 @@ fn outer_et_watching_inner_lt_does_not_feedback_loop() {
     assert!(inner_done.wake_waiters);
     assert!(!outer.rq.has_ready());
 
-    // 4. Pipe drains (inner scans and drops it), then a new real source wake
-    //    arrives -> outer reports inner once again, then stays quiet.
+    // 4. Codex's Round 4 scenario: pipe is drained by the application WITHOUT
+    //    any inner scan pruning `h_pipe` (so `h_pipe` is STILL queued on
+    //    `inner.rq`), then a new real write arrives on the pipe!
+    //    `inner.rq.wake` returns `Wake::AlreadyQueued`, which MUST still notify
+    //    subscribers so `outer` does not miss the new edge!
+    assert!(inner.rq.has_ready(), "h_pipe is still queued inside inner");
+    assert_eq!(
+        wake_pipe(&mut inner, &mut outer, EPOLLIN),
+        (Wake::AlreadyQueued, Some(Wake::Queued)),
+        "source wake on already-queued inner entry must notify outer ET subscriber"
+    );
+    let (out2, done2) = outer.scan_with(4, |_, _| poll_inner(&mut inner, EPOLLIN, &mut inner_waiter_wakes), |_| {});
+    assert_eq!(out2, vec![Event { handle: h_inner, events: EPOLLIN, data: 999 }]);
+    assert!(!done2.wake_waiters, "outer ET interest must still not feedback-loop after peek");
+    assert!(outer.scan(4, |_, _| poll_inner(&mut inner, EPOLLIN, &mut inner_waiter_wakes)).is_empty());
+
+    // 5. Also check full drain + inner prune + fresh source wake -> outer reports once again.
     assert!(inner.scan(4, |_, _| 0).is_empty());
     assert!(!inner.rq.has_ready());
     assert_eq!(wake_pipe(&mut inner, &mut outer, EPOLLIN), (Wake::Queued, Some(Wake::Queued)));
 
-    let (out2, done2) = outer.scan_with(4, |_, _| poll_inner(&mut inner, EPOLLIN, &mut inner_waiter_wakes), |_| {});
-    assert_eq!(out2, vec![Event { handle: h_inner, events: EPOLLIN, data: 999 }]);
-    assert!(!done2.wake_waiters);
+    let (out3, done3) = outer.scan_with(4, |_, _| poll_inner(&mut inner, EPOLLIN, &mut inner_waiter_wakes), |_| {});
+    assert_eq!(out3, vec![Event { handle: h_inner, events: EPOLLIN, data: 999 }]);
+    assert!(!done3.wake_waiters);
     assert!(outer.scan(4, |_, _| poll_inner(&mut inner, EPOLLIN, &mut inner_waiter_wakes)).is_empty());
     inner.assert_invariants();
     outer.assert_invariants();
@@ -851,20 +871,21 @@ fn nested_epoll_peek_drained_and_ready_pipes() {
 
     // Scenario 4 (mid-peek real source wake on drained entry):
     // During outer's scan -> poll_inner -> after poll(pipe) == 0 -> a real
-    // source wake fires on inner (`Wake::DuringScan`), which forwards to outer
-    // (`Wake::DuringScan` on h_inner_in_outer). `finish_peek` returns
-    // `PeekDone { ready: false, wake_waiters: true }` (waking inner's waiters
-    // only), and outer's `finish_scan` requeues h_inner_in_outer because of the
-    // forwarded source wake so the next outer wait delivers the new data!
+    // source wake fires on inner (`Wake::AlreadyQueued`, `in_scan == true`),
+    // which forwards to outer (`Wake::AlreadyQueued` on h_inner_in_outer).
+    // `finish_peek` returns `PeekDone { ready: false, wake_waiters: true }`
+    // (waking inner's waiters only), and outer's `finish_scan` requeues
+    // h_inner_in_outer because of the forwarded source wake so the next outer
+    // wait delivers the new data!
     let _ = outer.scan(4, |_, _| 0);
     assert_eq!(wake_inner(&mut inner, &mut outer.rq, h_pipe_et, EPOLLIN), Wake::Queued);
     let oscan = outer.rq.begin_scan(&mut obuf);
     let (mask, done) = poll_inner(&mut inner, &mut outer.rq, &drained, &mut |inner_rq, outer_rq| {
         let w = inner_rq.wake(h_pipe_et, EPOLLIN);
-        assert_eq!(w, Wake::DuringScan);
+        assert_eq!(w, Wake::AlreadyQueued);
         assert!(w.should_notify_subscribers());
         // Protocol forwards real source wake to outer subscriber mid-scan!
-        assert_eq!(outer_rq.wake(h_inner_in_outer, EPOLLIN | EPOLLRDNORM), Wake::DuringScan);
+        assert_eq!(outer_rq.wake(h_inner_in_outer, EPOLLIN | EPOLLRDNORM), Wake::AlreadyQueued);
     });
     assert_eq!(mask, 0);
     assert_eq!(done, PeekDone { ready: false, wake_waiters: true });
@@ -1027,7 +1048,7 @@ impl NaiveEpoll {
         }
         if self.in_scan.contains(&h) {
             self.woke_during_scan.insert(h);
-            return Wake::DuringScan;
+            return Wake::AlreadyQueued;
         }
         if self.ready.contains(&h) {
             return Wake::AlreadyQueued;

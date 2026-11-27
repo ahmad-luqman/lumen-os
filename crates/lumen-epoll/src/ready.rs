@@ -12,46 +12,47 @@ use crate::{Added, EPOLLET, EPOLLONESHOT, EpollSet, Errno, Event, Handle, Modifi
 /// Outcome of [`ReadyQueue::wake`].
 ///
 /// This is **not** Linux `ep_poll_callback`'s integer return value (`1`/`0` for
-/// waitqueue traversal). Only a real source wake returning [`Self::Queued`] or
-/// [`Self::DuringScan`] triggers **both** waking this epoll's own `epoll_wait`
-/// waiters (`ep->wq`, [`Self::should_wake_waiters`]) and notifying this epoll
-/// file's `PollHead` subscribers (`ep->poll_wait`,
-/// [`Self::should_notify_subscribers`]).
+/// waitqueue traversal). Matching Linux `fs/eventpoll.c` `ep_poll_callback`,
+/// **every** source wake that passes the live/armed/mask checks
+/// ([`Self::Queued`] and [`Self::AlreadyQueued`], whether newly queued,
+/// already on `ready`, or detached in an active [`Scan`]) triggers both waking
+/// this epoll's `epoll_wait` waiters (`ep->wq`, [`Self::should_wake_waiters`])
+/// and notifying this epoll file's `PollHead` subscribers (`ep->poll_wait`,
+/// [`Self::should_notify_subscribers`]). Only [`Self::Filtered`] and
+/// [`Self::Stale`] notify nobody.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub enum Wake {
     /// The interest was armed, matched `ready`, and was newly appended to the
     /// ready list. Wake `ep->wq` waiters **and** notify `PollHead` subscribers.
     Queued,
-    /// The interest was armed and matched `ready`, and is currently detached
-    /// in an active [`Scan`]; `woke_during_scan` was recorded so the scan will
-    /// not lose the edge. **Notify like [`Self::Queued`]** (wake `ep->wq`
-    /// waiters **and** notify `PollHead` subscribers, matching Linux
-    /// `ep_poll_callback`'s ovflist path).
-    DuringScan,
     /// The interest was armed and matched `ready`, and was already linked on
-    /// the ready list (`in_ready == true`, not in an active scan).
+    /// the ready list (`in_ready`) or detached in an active [`Scan`]
+    /// (`in_scan`, where `woke_during_scan` was recorded so the scan will not
+    /// lose the edge). Wake `ep->wq` waiters **and** notify `PollHead`
+    /// subscribers (matching Linux `ep_poll_callback`, so an outer `EPOLLET`
+    /// epoll does not miss a new write on a still-queued inner LT interest).
     AlreadyQueued,
     /// The interest is live, but either disarmed (`EPOLLONESHOT`) or its watch
-    /// mask did not intersect `ready`.
+    /// mask did not intersect `ready`. Notify nobody.
     Filtered,
     /// `handle` is out of bounds or its generation no longer matches (the
-    /// interest was removed or its slot was reused).
+    /// interest was removed or its slot was reused). Notify nobody.
     Stale,
 }
 
 impl Wake {
     /// Returns `true` when B5 should wake this epoll's own `epoll_wait` waiters
-    /// (`ep->wq`) ([`Self::Queued`] or [`Self::DuringScan`]).
+    /// (`ep->wq`) ([`Self::Queued`] or [`Self::AlreadyQueued`]).
     pub const fn should_wake_waiters(self) -> bool {
-        matches!(self, Self::Queued | Self::DuringScan)
+        matches!(self, Self::Queued | Self::AlreadyQueued)
     }
 
     /// Returns `true` when B5 should notify this epoll file's `PollHead`
     /// subscribers (`ep->poll_wait`: outer epolls and `poll`/`select`)
-    /// ([`Self::Queued`] or [`Self::DuringScan`]).
+    /// ([`Self::Queued`] or [`Self::AlreadyQueued`]).
     pub const fn should_notify_subscribers(self) -> bool {
-        matches!(self, Self::Queued | Self::DuringScan)
+        matches!(self, Self::Queued | Self::AlreadyQueued)
     }
 }
 
@@ -167,8 +168,9 @@ impl ReadyList {
 /// While a `Scan` is in flight, its handles remain marked `in_scan = true`
 /// inside the [`ReadyQueue`]: concurrent [`ReadyQueue::wake`] calls on them
 /// record `woke_during_scan` without mutating the ready list and return
-/// [`Wake::DuringScan`], while wakes on other handles append to the ready list
-/// and return [`Wake::Queued`].
+/// [`Wake::AlreadyQueued`] (which still wakes waiters and notifies
+/// subscribers), while wakes on other handles append to the ready list and
+/// return [`Wake::Queued`].
 ///
 /// Each `Scan` belongs exclusively to the [`ReadyQueue`] that created it and
 /// must be passed back to [`ReadyQueue::finish_scan`],
@@ -370,16 +372,17 @@ impl ReadyQueue {
     /// - Rejects out-of-bounds or stale-generation handles with [`Wake::Stale`].
     /// - Ignores disarmed (`EPOLLONESHOT`) interests or non-matching `ready`
     ///   masks with [`Wake::Filtered`].
-    /// - If the entry is currently detached in an active [`Scan`], records
-    ///   `woke_during_scan` without mutating the ready list and returns
-    ///   [`Wake::DuringScan`] (**notify `ep->wq` and the epoll file's
-    ///   `PollHead` just like [`Wake::Queued`]**).
+    /// - If the entry is currently detached in an active [`Scan`] (`in_scan`),
+    ///   records `woke_during_scan` without mutating the ready list and returns
+    ///   [`Wake::AlreadyQueued`].
     /// - If already on the ready list (`in_ready`), returns
     ///   [`Wake::AlreadyQueued`].
     /// - Otherwise appends to the tail of the ready list and returns
     ///   [`Wake::Queued`].
     ///
-    /// Performs **zero heap allocations and zero deallocations**.
+    /// Both [`Wake::Queued`] and [`Wake::AlreadyQueued`] wake `ep->wq` waiters
+    /// and notify `PollHead` subscribers. Performs **zero heap allocations and
+    /// zero deallocations**.
     pub fn wake(&mut self, handle: Handle, ready: u32) -> Wake {
         let idx = handle.index();
         let Some(slot) = self.slot_mut_if_live(handle) else {
@@ -390,7 +393,7 @@ impl ReadyQueue {
         }
         if slot.in_scan {
             slot.woke_during_scan = true;
-            return Wake::DuringScan;
+            return Wake::AlreadyQueued;
         }
         if slot.in_ready {
             return Wake::AlreadyQueued;

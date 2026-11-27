@@ -57,7 +57,7 @@
 //!    [`EpollSet::payload_mut`], and call
 //!    `rq.wake(handle, initial_mask.bits() as u32)` under the spinlock
 //!    (matching Linux `ep_insert`, which calls `ep_item_poll` after linking).
-//!    If `wake` returns [`Wake::Queued`] or [`Wake::DuringScan`]:
+//!    If `wake` returns [`Wake::Queued`] or [`Wake::AlreadyQueued`]:
 //!    - wake this epoll's `epoll_wait` waiters (`ep->wq`, [`Wake::should_wake_waiters`]), **and**
 //!    - notify this epoll file's `PollHead` subscribers (`ep->poll_wait`,
 //!      [`Wake::should_notify_subscribers`]: outer epolls and `poll`/`select`).
@@ -73,7 +73,7 @@
 //!    `Pollable::poll(mode, None)` on the payload and pass the current mask to
 //!    [`ReadyQueue::wake`] under the spinlock (matching Linux `ep_modify`, so
 //!    an already-ready descriptor or freshly re-armed `EPOLLONESHOT` is queued).
-//!    If `wake` returns [`Wake::Queued`] or [`Wake::DuringScan`], wake this
+//!    If `wake` returns [`Wake::Queued`] or [`Wake::AlreadyQueued`], wake this
 //!    epoll's `ep->wq` waiters (`should_wake_waiters`) **and** notify this epoll
 //!    file's `PollHead` subscribers (`should_notify_subscribers`).
 //!
@@ -136,10 +136,10 @@
 //! If [`PeekDone::wake_waiters`] is `true`, wake **only** the inner epoll's own
 //! `ep->wq` waiters — **never** notify the inner epoll's `PollHead` subscribers
 //! (doing so while an outer `EPOLLET` epoll is scanning the inner handle would
-//! trigger `Wake::DuringScan` on the outer handle and cause an infinite
-//! self-requeue loop; real source wakes arriving mid-peek already notify
-//! subscribers via [`Wake::should_notify_subscribers`]). Return
-//! `EPOLLIN | EPOLLRDNORM` iff [`PeekDone::ready`] is `true`.
+//! set `woke_during_scan` on the outer handle and cause an infinite self-requeue
+//! loop; real source wakes arriving mid-peek already notify subscribers via
+//! [`Wake::should_notify_subscribers`]). Return `EPOLLIN | EPOLLRDNORM` iff
+//! [`PeekDone::ready`] is `true`.
 //!
 //! # Event bits and documented boundaries
 //!
@@ -160,11 +160,13 @@
 //!   on an epoll target (`is_file_epoll`, `EINVAL`) are B5's checks.
 //! - **Notification split (Linux `ep->wq` vs `ep->poll_wait`):** [`Wake`] is
 //!   **not** Linux `ep_poll_callback`'s integer return value (`1`/`0` for
-//!   waitqueue traversal); only a real source wake returning [`Wake::Queued`]
-//!   or [`Wake::DuringScan`] both wakes this epoll's `ep->wq` waiters
-//!   ([`Wake::should_wake_waiters`]) and notifies this epoll file's `PollHead`
-//!   subscribers ([`Wake::should_notify_subscribers`]). Scan/rollback results
-//!   ([`ScanDone::wake_waiters`], [`PeekDone::wake_waiters`],
+//!   waitqueue traversal); every real source wake passing the live/armed/mask
+//!   check ([`Wake::Queued`] or [`Wake::AlreadyQueued`], whether newly queued,
+//!   already on `ready`, or in an active scan) both wakes this epoll's `ep->wq`
+//!   waiters ([`Wake::should_wake_waiters`]) and notifies this epoll file's
+//!   `PollHead` subscribers ([`Wake::should_notify_subscribers`]). Only
+//!   [`Wake::Filtered`] and [`Wake::Stale`] notify nobody. Scan/rollback
+//!   results ([`ScanDone::wake_waiters`], [`PeekDone::wake_waiters`],
 //!   [`ReadyQueue::unreport`], [`ReadyQueue::abort_scan`]) mean wake `ep->wq`
 //!   waiters **only**, never `PollHead` subscribers.
 
