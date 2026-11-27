@@ -575,10 +575,12 @@ crate::ktest!(
                 v.idt_vector, before.requests, after.requests, before.posts, after.posts, before.busy, after.busy,
             ));
         };
-        // `busy` unchanged ties the draw to this `fill` (not another caller's);
-        // `requests` and `posts` rising mean a buffer was posted, not skipped
-        // as busy; `sources().virtio` still on means the request didn't fail
-        // and lose the device (a seeded pool would still let `fill` return Ok).
+        // `busy` unchanged: no caller collided with the device during the
+        // request (ours or another's; conservative), so this `fill` took it;
+        // `requests` rising: it made a request; `posts` rising: it posted a
+        // buffer (`Device::one` posts none past its deadline);
+        // `sources().virtio` still on: the request didn't fail and lose the
+        // device (a seeded pool would still let `fill` return Ok).
         if after.busy != before.busy || after.requests <= before.requests || after.posts <= before.posts || !virtio_on {
             diag(None, 0, crate::arch::idt::vector_count(v.idt_vector), rings_at_return);
         }
@@ -589,32 +591,33 @@ crate::ktest!(
         // `rng::fill` -> `StatusHandle::wait_for` checks `queue.can_pop()`
         // before blocking on the doorbell. QEMU writes the used ring before
         // it sends the MSI-X message, and a vCPU polling `can_pop()` can see
-        // the ring first (most likely under KVM), so `fill` can return before
+        // the used-ring entry first (most likely under KVM), so `fill` can return before
         // the interrupt runs. Wait until the doorbell rings, bounded by a
         // give-up deadline; `BELL.ring()` (AcqRel) runs after `VECTOR_COUNTS`
         // is bumped in `idt::dispatch`, so once `ktest_rings()` (Acquire)
         // rises both counts are visible.
         let deadline = start.saturating_add(RING_WAIT_NS);
+        // `wake` is what the last wait returned: `CannotBlock` if this thread
+        // spun instead of blocking (the counts say whether it rang).
         let wake = loop {
-            match crate::rng::ktest_wait_ring(rings, deadline) {
-                crate::virtio::Wake::CannotBlock => {
-                    if crate::rng::ktest_rings() > rings {
-                        break crate::virtio::Wake::Rang;
-                    }
-                    if crate::time::now_ns() >= deadline {
-                        break crate::virtio::Wake::CannotBlock;
-                    }
-                    core::hint::spin_loop();
-                }
-                wake => break wake,
+            let wake = crate::rng::ktest_wait_ring(rings, deadline);
+            if wake != crate::virtio::Wake::CannotBlock
+                || crate::rng::ktest_rings() > rings
+                || crate::time::now_ns() >= deadline
+            {
+                break wake;
             }
+            core::hint::spin_loop();
         };
         let waited_ns = crate::time::now_ns().saturating_sub(start);
         let after_count = crate::arch::idt::vector_count(v.idt_vector);
         let after_rings = crate::rng::ktest_rings();
+        // Seen locally and in a failed run's artifacts (CI keeps ktest.tap
+        // only on failure); an upper bound (it includes the wake-up), and
+        // counted per vector, not per request.
         if rings_at_return == rings && after_rings > rings {
             crate::ktest::diag(format_args!(
-                "msix_vector_delivered: the ring came {} us after fill returned (wake {wake:?})",
+                "msix_vector_delivered: the ring was seen at most {} us after fill returned (wake {wake:?})",
                 waited_ns / 1_000,
             ));
         }
