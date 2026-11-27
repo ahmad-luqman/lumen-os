@@ -39,6 +39,6 @@ milestone = "M8"
 tests = ["ktest:lumen_kernel::tty::console_vt_output_batches_renders", "ktest:lumen_kernel::tty::console_vt_key_encoding_and_processed_output"]
 
 [[feature]]
-name = "ptyrun console relay mode: two-way backpressure, partial writes, stdout error and SIGPIPE cleanup, and SIGWINCH resize forwarding"
+name = "ptyrun console relay mode: two-way backpressure, partial writes, stdout error and SIGPIPE cleanup, SIGWINCH resize forwarding, exit-status/EOF forwarding, and console tty restoration"
 milestone = "M8"
 tests = ["scenario:test_linux_io::test_ptyrun_console_relay"]

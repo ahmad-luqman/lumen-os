@@ -8,10 +8,14 @@
 //!   script's `expect` / `send` / `winsize` / `wait_exit` steps directly over
 //!   the PTY master, printing one `ok <step>` line per completed step.
 //! - Interactive relay mode: `ptyrun <program> [args...]`. Opens `/dev/ptmx`,
-//!   copies stdin's window size onto the PTY (default 24x80), puts stdin in
-//!   raw mode without echo if it is a tty (restoring on exit), forks the
-//!   program on the slave as a session leader with it as its controlling
-//!   terminal, and relays bytes between stdin/stdout and the PTY master.
+//!   copies stdin's window size onto the PTY (default 24x80), forwards
+//!   `SIGWINCH` resizes from stdin (`TIOCGWINSZ`) to the PTY master
+//!   (`TIOCSWINSZ`), puts stdin in raw mode without echo if it is a tty, sets
+//!   `O_NONBLOCK` on stdout, ignores `SIGPIPE` in the parent (resetting it to
+//!   `SIG_DFL` in the child), forks the program on the slave as a session
+//!   leader with it as its controlling terminal, and relays bytes between
+//!   stdin/stdout and the PTY master. Restores stdout's flags, stdin's termios,
+//!   `SIGWINCH`, and `SIGPIPE` on exit.
 //!
 //! A `#![no_std]` dynamically linked musl x86-64 executable, built into
 //! `build/linux/ptyrun` and staged in `/usr/local/bin/ptyrun`.
@@ -32,6 +36,7 @@ use core::ffi::c_int;
 use core::fmt;
 use core::sync::atomic::{AtomicI32, Ordering};
 
+// SA_RESTORER stub invoking rt_sigreturn (nr 15) on x86-64.
 global_asm!(".global ptyrun_sigreturn", "ptyrun_sigreturn:", "mov eax, 15", "syscall", "ud2");
 
 // SAFETY: musl exposes `environ` as a NUL-terminated array of C string pointers,
@@ -134,6 +139,9 @@ macro_rules! say_err {
 
 static WINCH_PIPE_W: AtomicI32 = AtomicI32::new(-1);
 
+/// Async-signal-safe `SIGWINCH` handler: performs one atomic load and one raw
+/// `write` syscall to the non-blocking self-pipe. `EAGAIN` on a full pipe is
+/// harmless because the read end is already readable and will coalesce resizes.
 extern "C" fn sigwinch_handler(_sig: c_int) {
     let fd = WINCH_PIPE_W.load(Ordering::Acquire);
     if fd >= 0 {
@@ -171,7 +179,10 @@ fn read_stdin_winsize() -> Option<[u16; 4]> {
 
 fn forward_winsize(master: i32) {
     if let Some(ws) = read_stdin_winsize() {
-        let _ = ioctl(master, TIOCSWINSZ, ws.as_ptr() as u64);
+        let r = ioctl(master, TIOCSWINSZ, ws.as_ptr() as u64);
+        if r < 0 {
+            say_err!("ptyrun: TIOCSWINSZ failed (got {r})");
+        }
     }
 }
 
@@ -233,9 +244,10 @@ struct PtyChild {
 
 /// Open `/dev/ptmx`, unlock its slave, set the window size, and fork/exec
 /// `argv[cmd_idx..]` on the slave as a session leader with it as its
-/// controlling terminal. When `reset_sigpipe` or `reset_sigwinch` is true, the
-/// child resets those signals to `SIG_DFL` before `execve`, and closes any
-/// parent `winch_pipe` descriptors.
+/// controlling terminal. When `reset_sigpipe` is true, the child resets
+/// `SIGPIPE` to `SIG_DFL` before `execve` (caught handlers such as `SIGWINCH`
+/// are reset and `O_CLOEXEC` descriptors such as the winch pipe are closed by
+/// `execve`; the child clears `WINCH_PIPE_W` immediately after `fork`).
 ///
 /// # Safety
 /// `argv` must hold at least `cmd_idx + 1` valid NUL-terminated C string
@@ -246,8 +258,6 @@ unsafe fn spawn_on_pty(
     rows: u16,
     cols: u16,
     reset_sigpipe: bool,
-    reset_sigwinch: bool,
-    winch_pipe: Option<[i32; 2]>,
 ) -> Result<PtyChild, Fail> {
     let master = ok("open /dev/ptmx", openat(b"/dev/ptmx\0".as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK))? as i32;
     let mut ptn = -1i32;
@@ -279,10 +289,6 @@ unsafe fn spawn_on_pty(
     if pid == 0 {
         WINCH_PIPE_W.store(-1, Ordering::Relaxed);
         let _ = close(err_pipe[0]);
-        if let Some([r, w]) = winch_pipe {
-            let _ = close(r);
-            let _ = close(w);
-        }
         let fail_child = |code: u8, err: i64| -> ! {
             let msg = [code, (err.clamp(-127, 127) as i8) as u8];
             let _ = write_raw(err_pipe[1], &msg);
@@ -291,12 +297,6 @@ unsafe fn spawn_on_pty(
             unsafe { _exit(127) }
         };
 
-        if reset_sigwinch {
-            let r = set_sigaction(SIGWINCH, &[SIG_DFL, 0, 0, 0], None);
-            if r < 0 {
-                fail_child(7, r);
-            }
-        }
         let r = sys(SYS_SETSID, [0; 6]);
         if r < 0 {
             fail_child(1, r);
@@ -360,7 +360,6 @@ unsafe fn spawn_on_pty(
             4 => "child dup2",
             5 => "child execve",
             6 => "child reset SIGPIPE",
-            7 => "child reset SIGWINCH",
             _ => "child startup",
         };
         return Err(Fail { what, got: (err_buf[1] as i8) as i64 });
@@ -668,7 +667,7 @@ unsafe fn run_script(script_path: *const u8, argv: *const *const u8, cmd_idx: us
     let script_len = read_script(script_path, &mut script_buf)?;
 
     // SAFETY: forwarded from caller's `argv` contract.
-    let child = unsafe { spawn_on_pty(argv, cmd_idx, DEFAULT_ROWS, DEFAULT_COLS, false, false, None)? };
+    let child = unsafe { spawn_on_pty(argv, cmd_idx, DEFAULT_ROWS, DEFAULT_COLS, false)? };
     let mut screen = ScreenBuf::new();
     let mut waited = false;
     let mut step = 0usize;
@@ -764,45 +763,87 @@ impl PendingBuf {
     }
 }
 
+struct RelaySetup {
+    old_sigpipe: [u64; 4],
+    ignored_sigpipe: bool,
+    winch_pipe: Option<[i32; 2]>,
+    old_sigwinch: [u64; 4],
+    installed_sigwinch: bool,
+    saved_termios: [u8; 36],
+    have_tty: bool,
+    saved_stdout_fl: Option<u64>,
+}
+
+fn undo_relay_setup(setup: &RelaySetup) {
+    if let Some(fl) = setup.saved_stdout_fl {
+        let _ = sys(SYS_FCNTL, [1, F_SETFL, fl, 0, 0, 0]);
+    }
+    if setup.have_tty {
+        let _ = ioctl(0, TCSETS, setup.saved_termios.as_ptr() as u64);
+    }
+    if setup.installed_sigwinch {
+        restore_sigaction(SIGWINCH, &setup.old_sigwinch);
+    }
+    WINCH_PIPE_W.store(-1, Ordering::Release);
+    if let Some([r, w]) = setup.winch_pipe {
+        let _ = close(r);
+        let _ = close(w);
+    }
+    if setup.ignored_sigpipe {
+        restore_sigaction(SIGPIPE, &setup.old_sigpipe);
+    }
+}
+
 /// Interactive relay mode: copy stdin's window size onto the PTY, forward
 /// `SIGWINCH` resizes from stdin (`TIOCGWINSZ`) to the PTY master
 /// (`TIOCSWINSZ`), switch stdin to raw mode if it is a tty, set `O_NONBLOCK`
-/// on stdout and ignore `SIGPIPE` in the parent (resetting `SIGPIPE` and
-/// `SIGWINCH` to `SIG_DFL` in the child before `execve`), and relay
-/// stdin/stdout <-> PTY master in a single `poll` loop so neither master nor
-/// stdout writes can block the relay. Restores stdout's flags, stdin's termios,
-/// `SIGWINCH`, and `SIGPIPE` on exit.
+/// on stdout and ignore `SIGPIPE` in the parent (resetting `SIGPIPE` to
+/// `SIG_DFL` in the child before `execve`), and relay stdin/stdout <-> PTY
+/// master in a single `poll` loop so neither master nor stdout writes can
+/// block the relay. Restores stdout's flags, stdin's termios, `SIGWINCH`, and
+/// `SIGPIPE` on exit.
 ///
 /// # Safety
 /// `argv[cmd_idx..]` must be a valid NULL-terminated array of C strings.
 unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fail> {
-    let mut old_sigpipe = [0u64; 4];
-    let ignored_sigpipe = set_sigpipe(SIG_IGN, Some(&mut old_sigpipe)) == 0;
+    let mut setup = RelaySetup {
+        old_sigpipe: [0; 4],
+        ignored_sigpipe: false,
+        winch_pipe: None,
+        old_sigwinch: [0; 4],
+        installed_sigwinch: false,
+        saved_termios: [0; 36],
+        have_tty: false,
+        saved_stdout_fl: None,
+    };
+
+    setup.ignored_sigpipe = set_sigpipe(SIG_IGN, Some(&mut setup.old_sigpipe)) == 0;
 
     let winch_pipe = match pipe(O_NONBLOCK | O_CLOEXEC) {
         Ok(p) => p,
         Err(e) => {
-            if ignored_sigpipe {
-                restore_sigaction(SIGPIPE, &old_sigpipe);
-            }
+            undo_relay_setup(&setup);
             return Err(e);
         }
     };
+    setup.winch_pipe = Some(winch_pipe);
     WINCH_PIPE_W.store(winch_pipe[1], Ordering::Release);
-    let mut old_sigwinch = [0u64; 4];
-    let installed_sigwinch = set_sigwinch(&mut old_sigwinch) == 0;
+    let winch_r = set_sigwinch(&mut setup.old_sigwinch);
+    setup.installed_sigwinch = winch_r == 0;
+    if !setup.installed_sigwinch {
+        say_err!("ptyrun: rt_sigaction SIGWINCH failed (got {winch_r}); resize forwarding disabled");
+    }
 
-    // Read stdin's window size after installing the SIGWINCH handler so a
-    // resize arriving during child startup wakes the self-pipe immediately.
+    // Read stdin's window size after installing the SIGWINCH handler so no
+    // resize is lost between startup and the relay poll loop.
     let (rows, cols) = match read_stdin_winsize() {
         Some(ws) => (ws[0], ws[1]),
         None => (DEFAULT_ROWS, DEFAULT_COLS),
     };
 
-    let mut saved_termios = [0u8; 36];
-    let have_tty = ioctl(0, TCGETS, saved_termios.as_mut_ptr() as u64) == 0;
-    if have_tty {
-        let mut raw = saved_termios;
+    setup.have_tty = ioctl(0, TCGETS, setup.saved_termios.as_mut_ptr() as u64) == 0;
+    if setup.have_tty {
+        let mut raw = setup.saved_termios;
         raw[..8].fill(0);
         raw[12..16].fill(0);
         raw[17 + 6] = 1; // VMIN = 1
@@ -811,28 +852,15 @@ unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fai
     }
 
     // SAFETY: forwarded from caller's `argv` contract.
-    let child =
-        match unsafe { spawn_on_pty(argv, cmd_idx, rows, cols, ignored_sigpipe, installed_sigwinch, Some(winch_pipe)) }
-        {
-            Ok(c) => c,
-            Err(e) => {
-                if have_tty {
-                    let _ = ioctl(0, TCSETS, saved_termios.as_ptr() as u64);
-                }
-                if installed_sigwinch {
-                    restore_sigaction(SIGWINCH, &old_sigwinch);
-                }
-                WINCH_PIPE_W.store(-1, Ordering::Release);
-                let _ = close(winch_pipe[0]);
-                let _ = close(winch_pipe[1]);
-                if ignored_sigpipe {
-                    restore_sigaction(SIGPIPE, &old_sigpipe);
-                }
-                return Err(e);
-            }
-        };
+    let child = match unsafe { spawn_on_pty(argv, cmd_idx, rows, cols, setup.ignored_sigpipe) } {
+        Ok(c) => c,
+        Err(e) => {
+            undo_relay_setup(&setup);
+            return Err(e);
+        }
+    };
 
-    let saved_stdout_fl = {
+    setup.saved_stdout_fl = {
         let fl = sys(SYS_FCNTL, [1, F_GETFL, 0, 0, 0, 0]);
         if fl >= 0 && (fl as u64 & O_NONBLOCK) == 0 {
             if sys(SYS_FCNTL, [1, F_SETFL, (fl as u64) | O_NONBLOCK, 0, 0, 0]) == 0 { Some(fl as u64) } else { None }
@@ -865,7 +893,7 @@ unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fai
             },
             PollFd { fd: if !to_stdout.is_empty() { 1 } else { -1 }, events: POLLOUT, revents: 0 },
             PollFd {
-                fd: if master_open && installed_sigwinch { winch_pipe[0] } else { -1 },
+                fd: if master_open && setup.installed_sigwinch { winch_pipe[0] } else { -1 },
                 events: POLLIN,
                 revents: 0,
             },
@@ -875,13 +903,21 @@ unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fai
             break;
         }
 
-        if master_open && installed_sigwinch && (pfds[3].revents & POLLIN) != 0 {
+        if master_open && setup.installed_sigwinch && (pfds[3].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0 {
             let mut drain = [0u8; 64];
+            let mut drain_err = None;
             loop {
                 let n = read_raw(winch_pipe[0], &mut drain);
                 if n > 0 || n == EINTR {
                     continue;
                 }
+                if n < 0 && n != EAGAIN {
+                    drain_err = Some(Fail { what: "relay read winch pipe", got: n });
+                }
+                break;
+            }
+            if let Some(err) = drain_err {
+                relay_err = Some(err);
                 break;
             }
             forward_winsize(child.master);
@@ -962,24 +998,17 @@ unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fai
     }
 
     let _ = close(child.master);
-    if let Some(fl) = saved_stdout_fl {
-        let _ = sys(SYS_FCNTL, [1, F_SETFL, fl, 0, 0, 0]);
-    }
-    if have_tty {
-        let _ = ioctl(0, TCSETS, saved_termios.as_ptr() as u64);
-    }
-    if installed_sigwinch {
-        restore_sigaction(SIGWINCH, &old_sigwinch);
-    }
-    WINCH_PIPE_W.store(-1, Ordering::Release);
-    let _ = close(winch_pipe[0]);
-    let _ = close(winch_pipe[1]);
-    if ignored_sigpipe {
-        restore_sigaction(SIGPIPE, &old_sigpipe);
+    undo_relay_setup(&setup);
+    if let Some(err) = &relay_err {
+        say_err!("FAIL ptyrun: {} (got {})", err.what, err.got);
     }
     let status = wait_child(child.pid);
-    if let Some(err) = relay_err {
-        return Err(err);
+    if relay_err.is_some() {
+        match status {
+            Ok(st) => say_err!("ptyrun: child wait status {st}"),
+            Err(w) => say_err!("ptyrun: {} (got {})", w.what, w.got),
+        }
+        return Ok(1);
     }
     let status = status?;
     if status & 0x7f != 0 { Ok(128 + (status & 0x7f)) } else { Ok((status >> 8) & 0xff) }
