@@ -8367,8 +8367,13 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `OpenGuard` it took before its last liveness check, Gate 6 above, the
     path, and the flags it checked) and `OpenFile::from_opened` takes that
     reference over (one count, never two) with those flags, which can't be
-    changed in between. `openat` must use `OpenFile::from_opened(open_inode_guarded(..)?)`
-    (`openat` does, since #254b). `OpenFile`'s access mode and `O_PATH` flag are
+    changed in between. `openat` must use `OpenFile::from_opened` on the
+    `Opened` from `open_inode_guarded` or its variant
+    `open_inode_guarded_with_truncate_error` (`openat` does, since #254b;
+    the variant since #414, through `Start::open`: when `O_TRUNC`'s truncate
+    fails, its callback gets the opened inode, still pinned, and unmaps
+    every address space's pages past the size the file has now, as
+    `truncate`/`ftruncate` do on their error path). `OpenFile`'s access mode and `O_PATH` flag are
     private (getters only). `open_inode` (its signature unchanged) returns
     the inode with that reference given back: an
     `OpenFile::new_unchecked_flags` built from it (not for `openat`: its

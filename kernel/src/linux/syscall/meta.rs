@@ -212,18 +212,35 @@ fn resize(inode: &dyn VfsInode, len: u64) -> Result<u64, u32> {
     match inode.truncate(len) {
         Ok(()) => super::unmap_past(inode, len),
         Err(e) => {
-            // A truncate can fail after it shrank the file in memory (ext4's
-            // errors=remount-ro, #349: `EIO` from a truncate the volume
-            // errored under): unmap past the size the file has now, never
-            // below it (that would drop a private mapping's copied pages of
-            // a file that didn't shrink).
-            if let Ok(meta) = inode.stat() {
-                super::unmap_past(inode, meta.size.max(len));
-            }
+            unmap_past_size_now(inode, len);
             return Err(vfs(e));
         }
     }
     Ok(0)
+}
+
+/// After a failed truncate, invalidate mappings even if ext4's
+/// `errors=remount-ro` (#349) turned an in-memory shrink into `EIO`.
+/// With the inode locks released, use its current size, never below the
+/// requested `len`: an unchanged file keeps its private copied pages.
+/// If `stat` fails, warn and fall back to `len` so an unreadable size cannot
+/// silently leave pages past a possible new EOF mapped.
+pub(super) fn unmap_past_size_now(inode: &dyn VfsInode, len: u64) {
+    unmap_past_observed_size(inode, len, inode.stat().map(|meta| meta.size));
+}
+
+/// Invalidate using a size observation, or the requested length if that
+/// observation failed.
+fn unmap_past_observed_size(inode: &dyn VfsInode, len: u64, observed: Result<u64, lumen_vfs::VfsError>) {
+    let size = match observed {
+        Ok(size) => size.max(len),
+        Err(e) => {
+            log::warn!(target: "linux", "truncate: {:?} inode {}: stat failed ({e:?}); unmapping past {len}",
+                inode.dev_id(), inode.ino());
+            len
+        }
+    };
+    super::unmap_past(inode, size);
 }
 
 fn truncate(path: UserPtr, len: u64) -> Result<u64, u32> {
@@ -818,6 +835,53 @@ mod tests {
                 kassert_eq!(sys_close(fd), 0);
                 Ok(())
             })?
+        }
+    );
+
+    crate::ktest!(
+        fn meta_failed_truncate_stat_error_warns_and_invalidates() {
+            use crate::mm::user_vm::{AddressSpace, file_vm_leaf, file_vm_open};
+            use crate::vfs::page_cache::ktest_files::Ext4Volume;
+            use lumen_vfs::VfsError;
+
+            let vol = Ext4Volume::new(418)?;
+            let f = vol.root.create(b"stat-error", 0o644).map_err(|_| "create")?;
+            kassert_eq!(f.write_at(0, &[0x5a; 8192]), Ok(8192));
+            let space = Arc::new(AddressSpace::new().map_err(|_| "space")?);
+            let va = space
+                .mmap_file(
+                    MapPlace::Hint(None),
+                    2 * P,
+                    Prot::READ | Prot::WRITE,
+                    file_vm_open(&f)?,
+                    0,
+                    Sharing::Private,
+                )
+                .map_err(|_| "map")?;
+            for off in [0, P] {
+                kassert_eq!(space.handle_page_fault(va + off, 1 << 1), FaultResult::Resolved);
+            }
+            let first = file_vm_leaf(&space, va).ok_or("first leaf")?.phys;
+            let second = file_vm_leaf(&space, va + P).ok_or("second leaf")?.phys;
+            // A known current size above len preserves both copied pages.
+            unmap_past_observed_size(&*f, P, Ok(2 * P));
+            kassert_eq!(file_vm_leaf(&space, va + P).map(|leaf| leaf.phys), Some(second));
+            let line = alloc::format!(
+                "WARN  linux: truncate: {:?} inode {}: stat failed (Io); unmapping past {P}",
+                f.dev_id(),
+                f.ino()
+            );
+            let before = crate::desktop::logged(&line)?;
+            // A failed observation cannot silently skip invalidation, nor
+            // may it invalidate below len: page 0's private copy survives.
+            unmap_past_observed_size(&*f, P, Err(VfsError::Io));
+            kassert!(file_vm_leaf(&space, va + P).is_none());
+            kassert_eq!(file_vm_leaf(&space, va).map(|leaf| leaf.phys), Some(first));
+            kassert_eq!(crate::desktop::logged(&line)?, before + 1);
+            unmap_past_observed_size(&*f, P, Ok(0));
+            kassert_eq!(file_vm_leaf(&space, va).map(|leaf| leaf.phys), Some(first));
+            space.teardown();
+            Ok(())
         }
     );
 

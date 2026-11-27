@@ -5877,6 +5877,14 @@ pub(crate) mod ktest_util {
         inner.layout.inode_disk_offset(&inner.bcache, ino).map_err(|_| "inode offset")
     }
 
+    /// The on-disk inode's size as read through the block cache. This is
+    /// the cache image, not evidence that the inode reached the device.
+    pub fn disk_inode_size(fs: &Ext4FileSystem, ino: u32) -> Result<u64, &'static str> {
+        let inner = fs.shared.state.lock();
+        let ino = core::num::NonZeroU32::new(ino).ok_or("zero ino")?;
+        super::Inode::read(&inner.ext4, ino).map(|i| i.size_in_bytes()).map_err(|_| "disk inode")
+    }
+
     /// Where group 0's block bitmap is on `fs`'s device.
     pub fn block_bitmap_offset(fs: &Ext4FileSystem) -> Result<u64, &'static str> {
         let inner = fs.shared.state.lock();

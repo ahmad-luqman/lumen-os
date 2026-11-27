@@ -213,6 +213,12 @@ pub trait VfsInode: Send + Sync {
     /// while open (detached) lists as empty; a `/proc/<pid>` whose process
     /// has ended says `ENOENT`.
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError>;
+    /// Resize the file to `size`. On `Err`, the in-memory size is either
+    /// unchanged or the requested size; [`Self::stat`] reports which (in
+    /// the absence of a concurrent resize). A failure need not undo a
+    /// completed in-memory shrink: ext4's `errors=remount-ro` (#349) can
+    /// report `EIO` after it. Callers must invalidate mappings past the
+    /// reported size on failure too, after this call releases inode locks.
     fn truncate(&self, size: u64) -> Result<(), VfsError>;
     fn set_mode(&self, mode: u16) -> Result<(), VfsError>;
     /// Set the owner and group (`None` leaves either as it is), update

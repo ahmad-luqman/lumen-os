@@ -31,8 +31,8 @@ use alloc::vec::Vec;
 
 use lumen_vfs::{
     AccessMask, AtFlags, DevId, InodeType, Metadata, OpenFlags, Opened, RenameFlags, ResolveFlags, ResolvedPath,
-    Timespec, VfsError, VfsInode, link_at, mkdir_at, mknod_at, open_inode_guarded, readlink_at, rename_at2,
-    resolve_path, symlink_at, unlink_at,
+    Timespec, VfsError, VfsInode, link_at, mkdir_at, mknod_at, open_inode_guarded_with_truncate_error, readlink_at,
+    rename_at2, resolve_path, symlink_at, unlink_at,
 };
 
 use crate::vfs::tables;
@@ -263,11 +263,21 @@ impl Start {
         self.dir.as_ref()
     }
 
-    /// `open_inode_guarded` from this start (`openat`): `mode`'s permission
-    /// bits, less the process's umask, for a file it creates.
+    /// Open from this start with the process's umask. A failed `O_TRUNC`
+    /// invalidates mappings past the size the opened inode now reports,
+    /// even when ext4's #349 policy returns `EIO` after shrinking in memory.
     pub(super) fn open(&self, path: &UserPath, flags: OpenFlags, mode: Mode) -> Result<Opened, u32> {
         let umask = process::current_umask();
-        open_inode_guarded(tables(), self.dir(), path.as_bytes(), flags, mode.perm(), umask).map_err(VfsError::to_errno)
+        open_inode_guarded_with_truncate_error(
+            tables(),
+            self.dir(),
+            path.as_bytes(),
+            flags,
+            mode.perm(),
+            umask,
+            &mut |inode| super::meta::unmap_past_size_now(inode, 0),
+        )
+        .map_err(VfsError::to_errno)
     }
 
     /// `resolve_path` from this start (the `stat` family, `access`).

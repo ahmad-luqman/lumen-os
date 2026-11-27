@@ -8751,6 +8751,65 @@ fn failed_opens_give_their_reference_back() {
 }
 
 #[test]
+fn truncate_error_callback_runs_once_on_the_pinned_file_only() {
+    let g = gate_vfs(&["trunc"]);
+    let f = &g.files[0];
+    f.arm(|h| h.truncate_error = Some(VfsError::Io));
+    let trunc = OpenFlags(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC);
+    let mut calls = 0;
+    let error = open_inode_guarded_with_truncate_error(&g.env, None, b"/trunc", trunc, 0, 0, &mut |inode| {
+        calls += 1;
+        assert!(core::ptr::addr_eq(inode, &**f as &dyn VfsInode));
+        assert_eq!(inode.open_count(), 1, "the callback still holds the open reference");
+        assert!(f.state.try_lock().is_ok(), "no inode lock held by truncate");
+        assert!(g.rename_lock.try_lock().is_ok(), "no rename lock held by open");
+        // Unlink here: the callback's guard must preserve the data until
+        // the failed open returns, just as a racing last-link unlink does.
+        g.root.unlink(b"trunc").unwrap();
+        assert!(inode.is_detached());
+        assert_eq!(inode.stat().unwrap().size, GATE_DATA.len() as u64);
+    })
+    .err();
+    assert_eq!(error, Some(VfsError::Io));
+    assert_eq!(calls, 1);
+    assert_eq!(f.open_count(), 0, "the failed open releases the reference");
+
+    // Every other open outcome leaves the callback alone, even when the
+    // fake inode's truncate would fail if it were called.
+    let g = gate_vfs(&["trunc", "stat", "ok"]);
+    for f in &g.files[..2] {
+        f.arm(|h| h.truncate_error = Some(VfsError::Io));
+    }
+    let special = GateInode::new(&g.root.next_ino, InodeType::CharDevice, 1, None);
+    special.arm(|h| h.truncate_error = Some(VfsError::Io));
+    g.root.state.lock().unwrap().children.insert(b"special".to_vec(), special);
+    let mut unexpected = |_: &dyn VfsInode| panic!("callback without an O_TRUNC truncate error");
+    for (path, flags) in [
+        (&b"/trunc"[..], RDONLY),
+        (b"/trunc", OpenFlags(OpenFlags::O_PATH | OpenFlags::O_TRUNC)),
+        (b"/special", trunc),
+        (b"/ok", trunc),
+    ] {
+        let opened = open_inode_guarded_with_truncate_error(&g.env, None, path, flags, 0, 0, &mut unexpected)
+            .expect("open without a truncate error");
+        assert_eq!(opened.inode().open_count(), 1);
+        drop(opened);
+    }
+    for (path, expected) in [(&b"/missing"[..], VfsError::NoEnt), (b"/", VfsError::IsDir)] {
+        assert_eq!(
+            open_inode_guarded_with_truncate_error(&g.env, None, path, trunc, 0, 0, &mut unexpected).err(),
+            Some(expected),
+        );
+    }
+    g.files[1].arm(|h| h.stat_error = Some(VfsError::Io));
+    assert_eq!(
+        open_inode_guarded_with_truncate_error(&g.env, None, b"/stat", trunc, 0, 0, &mut unexpected).err(),
+        Some(VfsError::Io),
+    );
+    assert!(g.files.iter().all(|f| f.open_count() == 0));
+}
+
+#[test]
 fn o_creat_retries_only_a_freed_file_and_stops_with_eexist() {
     // `stat()` failing with `ENOENT` (a vanished procfs entry, say) is not a
     // lost race: passed through at once, not retried (a retry would find

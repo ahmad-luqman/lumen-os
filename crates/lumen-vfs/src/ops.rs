@@ -331,8 +331,26 @@ pub fn open_inode_guarded(
     mode: u16,
     umask: u16,
 ) -> Result<Opened, VfsError> {
+    open_inode_guarded_with_truncate_error(env, start_dir, path, flags, mode, umask, &mut |_| {})
+}
+
+/// Like [`open_inode_guarded`], notifying `on_error` if the opened inode's
+/// `O_TRUNC` fails. The callback runs after `truncate` releases its locks,
+/// while the open reference still pins that exact inode, before returning
+/// the original error. This lets a syscall invalidate mappings even when
+/// a failed truncate changed the in-memory size. Other open errors and
+/// `O_PATH` opens never call it.
+pub fn open_inode_guarded_with_truncate_error(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    flags: OpenFlags,
+    mode: u16,
+    umask: u16,
+    on_error: &mut dyn FnMut(&dyn VfsInode),
+) -> Result<Opened, VfsError> {
     for _ in 0..=MAX_CREAT_RACE_RETRIES {
-        if let Some((guard, path)) = open_once(env, start_dir, path, flags, mode, umask)? {
+        if let Some((guard, path)) = open_once(env, start_dir, path, flags, mode, umask, on_error)? {
             return Ok(Opened { guard, path, flags });
         }
     }
@@ -351,6 +369,7 @@ fn open_once(
     flags: OpenFlags,
     mode: u16,
     umask: u16,
+    on_error: &mut dyn FnMut(&dyn VfsInode),
 ) -> Result<Option<OpenedOnce>, VfsError> {
     if flags.has_tmpfile() {
         return Err(VfsError::OpNotSupp);
@@ -597,8 +616,12 @@ fn open_once(
         Err(Refused::Freed) if flags.has_creat() => return Ok(None),
         Err(r) => return Err(r.into()),
     };
-    if flags.has_trunc() && guard.inode().inode_type() == InodeType::File {
-        guard.inode().truncate(0)?;
+    if flags.has_trunc()
+        && guard.inode().inode_type() == InodeType::File
+        && let Err(e) = guard.inode().truncate(0)
+    {
+        on_error(&**guard.inode());
+        return Err(e);
     }
 
     Ok(Some((guard, path_str)))
