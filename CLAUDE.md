@@ -520,15 +520,17 @@ one is its own PR that updates that doc first.
   by tid, `WaitResult`, `link_init`/`link_root`/`link_thread`/
   `unlink_thread`/`exit_in_tree`/`wait`/`setsid`/`setpgid`/`getpgid`/
   `getsid`/`priority`/`process_time`, `check_nproc` (fork and thread
-  clone against `RLIMIT_NPROC` over `nproc_task_count`, root not exempt,
-  #435), `check` cross-checking them in the ktests), `process/files.rs` (`Files`: the 1024-slot FD table of
+  clone against `RLIMIT_NPROC` through lumen-proc's `allows_new_task`,
+  after `check_clone`; root not exempt; `nproc_task_count` the ktests'
+  count, #435), `check` cross-checking them in the ktests), `process/files.rs` (`Files`: the 1024-slot FD table of
   `KernelFile`s, shared/exclusive `FilesAccess` leases, `ReservedFd`,
   `fork_copy`, `prepare_exec`/`copy_exec_into`; `FsState`/`FsInner` for
   `Cwd` and umask, #379, #380, #381), `process/signal.rs` (`SignalState`,
   `ThreadSignals`, `Delivery`, `HandlerDelivery`, group exit/stop/cont,
-  `wait_signal`, `sigaltstack`, `ctty`, #384, #385, #388; `Rlimits`, the
-  process's stack, `NOFILE` and `NPROC` limits behind one accessor, the
-  live `NOFILE` soft limit bounding fd allocation and `poll`'s `nfds`, #435),
+  `wait_signal`, `sigaltstack`, `ctty`, #384, #385, #388; `Rlimits` (stack,
+  `NOFILE`, `NPROC`) read and replaced through `Process::rlimit`
+  (`Rlimit`, `RlimitKind`); `Process::nofile_soft`, the live soft limit
+  bounding fd allocation and `poll`'s `nfds`, #435),
   `lookup`/`lookup_thread`, `fork_current`, `de_thread` (#381, #382),
   `register_current` and `take_current` (a run's takedown in the design's
   exit order: detach, unlink, release `mm`/`files`/`fs`, then the tree, its
@@ -570,7 +572,8 @@ one is its own PR that updates that doc first.
   `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` they
   make up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
   (ARCHITECTURE section 8, "Stays `-ENOSYS` in M8")), `unmap_past`
-  (#378) and the shared copy helpers, `time.rs` (`RawTimespec`,
+  (#378; `meta.rs`'s `unmap_past_size_now`, a failed `O_TRUNC`'s unmap,
+  #414) and the shared copy helpers, `time.rs` (`RawTimespec`,
   `read_timespec`, `write_timespec`, `ERESTARTNOHAND`, #383, shared by `futex`,
   `poll` and `signal` (`rt_sigtimedwait`)), and a module per cluster holding its handlers (`fd`,
   `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, with #255's
@@ -776,7 +779,7 @@ one is its own PR that updates that doc first.
   `reserve_below`, `insert_at_below`, what syscalls use under
   `RLIMIT_NOFILE`, #435),
   `poll` (`PollMask`, `PollWaker`, `Pollable`, `PollGuard`, `PollHead`,
-  #374), the namespace operations (`open_inode`, `mkdir_at`, `mknod_at` (#386),
+  #374), the namespace operations (`open_inode`, `open_inode_guarded_with_truncate_error` (#414), `mkdir_at`, `mknod_at` (#386),
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
   call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,
   whose `WouldBlock` alone names the holder; `PosixWaitGraph`, who waits
@@ -859,7 +862,8 @@ one is its own PR that updates that doc first.
   `Tcsetpgrp`, `PidRef`/`retain_pid` (#388), `pgrp_members`,
   `is_orphaned_pgrp`; a process's threads,
   `add_thread`/`remove_thread`/`threads`, their tids busy, #372;
-  `nproc_task_count`, the tasks `RLIMIT_NPROC` counts, #435;
+  `nproc_task_count`, the tasks `RLIMIT_NPROC` counts, and
+  `allows_new_task`, the soft-limit check, #435;
   `check_invariants` behind `test-util`), `WaitStatus` (`word`,
   `siginfo`), `ExitStatus`, `RusageSlot`/`SlotRef`, `Errno`/`Bug`/`Error`
   (host-tested, incl. a model, `tests/alloc.rs`: what each operation
@@ -1134,8 +1138,8 @@ one is its own PR that updates that doc first.
   `m8_proc` (`fork-wait`, plus submodules `exec.rs` (#381), `signals.rs`
   (#384), `signal_waits.rs` (#385), `futex.rs` (#383, #390), `threads.rs`
   (#382, #390), `sessions.rs` (#387), `timers.rs` (#392), `small.rs`
-  (#391); `posix-shm`/`posix-shm-fail`, `shm_open` and named semaphores
-  on `/dev/shm`, #433), `m8_io` (`console-poll`, #374, #389; `pipes`, #386), `m8_vm`
+  (#391); and `posix-shm`/`posix-shm-fail`, its inline `posix_shm`:
+  `shm_open` and named semaphores on `/dev/shm`, #433), `m8_io` (`console-poll`, #374, #389; `pipes`, #386), `m8_vm`
   (`shootdown`, #390), `m8_pty` (PTY integration checks, #388;
   `ptyrun-relay`/`ptyrun-child`, the relay's backpressure, partial writes
   and `SIGWINCH`, #437), and
@@ -1145,13 +1149,15 @@ one is its own PR that updates that doc first.
   entry, faults, ABI, busybox and `dlopen`), `test_linux_proc.py`
   (processes, `fork`/`exec`/shebangs, signals/`sigaltstack`, signal waits,
   `futex`/nanosleep, pthreads, sessions/groups, interval/POSIX timers, small
-  syscalls, MT stress), `test_linux_io.py` (`poll`/`select` on console,
+  syscalls, MT stress, POSIX shared memory and semaphores on `/dev/shm`
+  #433), `test_linux_io.py` (`poll`/`select` on console,
   pipes/FIFOs, PTY termios/job control, `ash -i` console job control,
   `ptyrun`'s console relay, #437),
   `test_linux_vm.py` (cross-CPU `munmap`/`mprotect` TLB shootdowns),
   `test_alpine.py` (Alpine minirootfs coreutils plus M8's D1 `ash` #393,
   D2 `gcc`/`g++`/`make` #394, D3 `git`/`sqlite3` and `vim` over `ptyrun`
-  #395 gates), `test_conformance.py` (D4 musl `libc-test` core against
+  #395 gates, and #355's allocation check on both images, no leaked
+  blocks), `test_conformance.py` (D4 musl `libc-test` core against
   `tests/conformance/libc-test-xfail.txt`, #396), and `test_smp.py`
   (incl. MT stress, #390). `tests/harness/`: harness self-tests
   (incl. `test_rootfs.py`, `test_rootfs_dev.py`, `test_libctest.py`,
