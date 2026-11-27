@@ -544,6 +544,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-sockabi"
+version = "0.0.1"
+dependencies = [
+ "linux-raw-sys",
+]
+
+[[package]]
 name = "lumen-synth"
 version = "0.0.1"
 
