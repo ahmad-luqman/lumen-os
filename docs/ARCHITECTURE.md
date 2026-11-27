@@ -4186,10 +4186,9 @@ Lumen runs two kinds of user code:
   registers of the syscall's Linux signature, in order, to a handler in its
   cluster's module (`fd`, `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's
   `mem` and `proc`; M8's `task`, `signal`, `futex`, `poll`, `pipe`, `timer`
-  and `sys`, listed under "B0's stubs" below, #371). An M8 syscall not yet
-  implemented is a typed stub (its doc saying "M8 stub" and naming the
-  issues that replace it) logging like an unknown one (with its name) and
-  returning `-ENOSYS`; every M7 syscall is implemented. M7's and M8's
+  and `sys`, plus `time.rs` shared by blocking syscalls, listed under "B0's
+  stubs" below, #371). Every M7 and M8 syscall is implemented (the M8 stubs
+  are gone; only `sendfile` and `membarrier` stay `-ENOSYS` by decision). M7's and M8's
   handlers follow three rules:
   1. **Decode first.** An M7 or M8 arm decodes each register with
      `syscall/at.rs`'s `reg` into the handler's parameter type, as Linux
@@ -10836,12 +10835,12 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
 
 **M8's tests (designed in #336).**
 
-- **Scenario files.** B0 adds `tests/scenarios/test_linux_proc.py`
+- **Scenario files.** `tests/scenarios/test_linux_proc.py`
   (processes, threads, signals, `futex`, timers, sessions, the small
   syscalls), `test_linux_io.py` (pipes, FIFOs, readiness, PTYs, the
   console as a tty), `test_linux_vm.py` (cross-CPU shootdowns) and
-  `test_conformance.py` (libc-test), each empty until its issue's first
-  test; the gates extend `test_alpine.py`, and C11 extends `test_smp.py`.
+  `test_conformance.py` (libc-test); the gates extend `test_alpine.py`, and
+  C11 extends `test_smp.py`.
 - **Feature files.** Each feature goes in its area's file:
   `process.toml` (B1, C1, C2, C3, C8, C12), `signal.toml` (C5, C6, C13),
   `futex.toml` (C4), `pipe.toml` (B3, C7), `tty.toml` (C9, C10; these five
@@ -10849,10 +10848,10 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
   `smp.toml` (C11), `elf.toml` (C2's lumen-elf changes), `fs.toml` (B8,
   `mknod`), `user.toml` (B0's ABI and census tests, and the gates beside
   M7's `test_alpine` rows).
-- **`tools/linux-m8/` test programs** (B0's skeleton): `m8_proc`
+- **`tools/linux-m8/` test programs**: `m8_proc`
   (processes, threads, signals, faults, `futex`, timers, sessions, the
-  small calls), `m8_io` (pipes, FIFOs, `poll`/`select`, PTYs), `m8_vm`
-  (shootdowns) and `ptyrun` (D3: opens `/dev/ptmx`, starts its argument
+  small calls), `m8_io` (pipes, FIFOs, `poll`/`select`, console readiness),
+  `m8_pty` (PTYs), `m8_vm` (shootdowns) and `ptyrun` (D3: opens `/dev/ptmx`, starts its argument
   on the slave as a session leader with it as its controlling terminal;
   `--script <file> -- <program> [args...]` drives the program directly
   over the PTY master, used by D3's vim scenario, while the interactive
