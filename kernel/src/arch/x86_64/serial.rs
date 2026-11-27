@@ -123,6 +123,25 @@ pub(crate) fn burst_bytes(bytes: &[u8]) -> usize {
     write_to(&mut com1(), mode(), bytes)
 }
 
+/// Write bytes already processed by a tty's OPOST, with the log line lock held.
+/// No additional newline translation is applied.
+pub(crate) fn tty_bytes(bytes: &[u8]) {
+    let burst = match mode() {
+        Mode::Absent => return,
+        Mode::Bytes => 1,
+        Mode::Fifo => lumen_uart::BURST,
+    };
+    let mut com = com1();
+    for chunk in bytes.chunks(burst) {
+        while com.read(lumen_uart::reg::LINE_STATUS) & lumen_uart::LSR_THR_EMPTY == 0 {
+            core::hint::spin_loop();
+        }
+        for &byte in chunk {
+            com.write(lumen_uart::reg::DATA, byte);
+        }
+    }
+}
+
 /// Take COM1 out of loopback (a ktest may have left it there when another
 /// CPU's crash stopped it), so the crash report reaches the host. Lock-free;
 /// the crash reporter calls it before its first line and again once the
@@ -221,17 +240,22 @@ fn loop_back(write: impl FnOnce() -> usize, expect: usize, back: &mut [u8]) -> (
     let deadline = crate::time::now_ns() + 100_000_000;
     let (mut got, mut quiet) = (0, 0);
     for _ in 0..10_000_000 {
-        if quiet >= QUIET_READS || crate::time::now_ns() > deadline {
-            break;
-        }
+        // Drain available bytes first: a host pause may cross the deadline
+        // with the entire reply already queued in the receive FIFO.
         match lumen_uart::try_read(&mut com, mode) {
             Some(b) if got < back.len() => {
                 back[got] = b;
                 got += 1;
             }
             Some(_) => {}
-            None if got >= expect => quiet += 1,
-            None => {}
+            None => {
+                if got >= expect {
+                    quiet += 1;
+                }
+                if quiet >= QUIET_READS || crate::time::now_ns() > deadline {
+                    break;
+                }
+            }
         }
     }
     com.write(reg::MODEM_CTRL, mcr);
@@ -350,6 +374,32 @@ crate::ktest!(
             [Mode::Absent, Mode::Bytes, Mode::Fifo].map(unserialized),
             [Mode::Absent, Mode::Bytes, Mode::Bytes]
         );
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tty_output_preserves_processed_bytes() {
+        use crate::{kassert, kassert_eq};
+        // Both an already-expanded newline and raw LF must survive exactly.
+        // Through ConsoleOutput's production dispatch, not tty_bytes directly:
+        // restoring the logger's writer here must fail on duplicate CRs.
+        const SENT: &[u8] = b"a\r\nb\nc";
+        let mut received = [0; 16];
+        let (idle, count) = crate::klog::with_line_lock(|| {
+            let idle = wait_tx_idle(&mut com1());
+            let (_, count) = loop_back(
+                || {
+                    crate::tty::serial_output_held_for_test(SENT);
+                    0
+                },
+                SENT.len(),
+                &mut received,
+            );
+            (idle, count)
+        });
+        kassert!(idle);
+        kassert_eq!(&received[..count], SENT);
         Ok(())
     }
 );

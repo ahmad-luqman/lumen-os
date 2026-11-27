@@ -347,7 +347,10 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
 
     let io = match ctx.out.place() {
         Place::Anywhere => ConsoleIo::Serial,
-        Place::Vt(vt) => ConsoleIo::Vt(vt),
+        Place::Vt(vt) => match process::VtId::new(vt) {
+            Some(vt) => ConsoleIo::Vt(vt),
+            None => return ctx.fail("linux: invalid virtual terminal"),
+        },
         Place::Window(_) => return ctx.fail("linux: run from serial or a virtual terminal"),
     };
 

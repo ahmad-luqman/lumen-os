@@ -714,6 +714,14 @@ fn poll_readiness_never_treats_empty_raw_input_as_eof() {
 }
 
 #[test]
+fn onlcr_without_opost_preserves_lf() {
+    let mut t = raw();
+    t.c_oflag = ONLCR;
+    let mut d = tty(t);
+    assert_eq!(write(&mut d, b"\n"), b"\n");
+}
+
+#[test]
 fn output_flags_and_column_tracking() {
     for (flags, input, expected) in [
         (ONLCR | OCRNL | ONOCR | ONLRET, &b"\r\n\t\x08x"[..], &b"\r\n\t\x08x"[..]),

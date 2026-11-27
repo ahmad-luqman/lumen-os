@@ -539,6 +539,10 @@ pub use pc_keyboard::KeyCode;
 /// character; Alt is reported only with keys that make none.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
+    /// Physical Enter (main or keypad), distinct from Ctrl-J's character.
+    Enter,
+    /// Physical Backspace, distinct from Ctrl-H's character.
+    Backspace,
     /// A key making a character, in the layout.
     Char(char),
     /// Any other key pressed (an arrow, PageUp, F1, a modifier), with the
@@ -628,7 +632,11 @@ fn decode(
         let (dropped, queued) = (QUEUE.dropped(), QUEUE.len());
         let Some(byte) = next() else { break };
         drops.pop(dropped, queued);
+        let mut physical = None;
         let marked = |mut event: lumen_input::KeyEvent| {
+            if matches!(event.action, lumen_input::KeyAction::Press { .. }) {
+                physical = Some(event.code);
+            }
             event.after_drop = drops.mark();
             push(event);
         };
@@ -637,7 +645,13 @@ fn decode(
         // nothing is mid-decode then).
         DECODED.fetch_add(1, Ordering::Relaxed);
         match decoded {
-            Ok(Some(DecodedKey::Unicode(c))) => return Some(Key::Char(c)),
+            Ok(Some(DecodedKey::Unicode(c))) => {
+                return Some(match physical {
+                    Some(KeyCode::Return | KeyCode::NumpadEnter) => Key::Enter,
+                    Some(KeyCode::Backspace) => Key::Backspace,
+                    _ => Key::Char(c),
+                });
+            }
             Ok(Some(DecodedKey::RawKey(code))) => {
                 return Some(Key::Raw { code, mods: Mods::from(decoder.modifiers()) });
             }
@@ -793,6 +807,8 @@ fn decode_all(name: &str, bytes: &[u8]) -> alloc::string::String {
     let mut it = bytes.iter().copied();
     core::iter::from_fn(|| decode(&mut decoder, || it.next(), &mut AfterDrop::new(QUEUE.dropped()), |_| {}))
         .filter_map(|k| match k {
+            Key::Enter => Some('\n'),
+            Key::Backspace => Some('\x08'),
             Key::Char(c) => Some(c),
             Key::Raw { .. } => None,
         })

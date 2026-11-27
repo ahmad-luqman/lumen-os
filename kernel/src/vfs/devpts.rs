@@ -99,12 +99,21 @@ pub(crate) fn open(file: KernelFile, flags: OpenFlags) -> Result<KernelFile, u32
         }
         Some(super::devfs::TerminalOpen::Alias) => {
             let tty = process::current_process().controlling_tty().ok_or(errno::ENXIO)?;
+            if tty.is_console() {
+                return console_file(file, tty);
+            }
             let inode = SLAVES.lock()[tty.number as usize]
                 .as_ref()
                 .filter(|node| node.tty.as_ref().is_some_and(|held| Arc::ptr_eq(held, &tty)))
                 .cloned()
                 .ok_or(errno::ENXIO)?;
             (inode, tty, false)
+        }
+        Some(super::devfs::TerminalOpen::Console) => {
+            let Some(tty) = process::try_current_io().and_then(crate::tty::console) else {
+                return Ok(file);
+            };
+            return console_file(file, tty);
         }
         None => {
             let Some(node) = file.inode().as_any().and_then(|any| any.downcast_ref::<PtyInode>()) else {
@@ -126,6 +135,15 @@ pub(crate) fn open(file: KernelFile, flags: OpenFlags) -> Result<KernelFile, u32
     }
     let end = TtyEnd::new(tty, master);
     KernelFile::new_tty_end(inode, Arc::clone(&file.path), flags, end).map_err(|error| error.to_errno())
+}
+
+/// Bind a console description to its terminal without acquiring a controlling tty.
+pub(crate) fn console_file(file: KernelFile, tty: Arc<Tty>) -> Result<KernelFile, u32> {
+    tty.open_slave(false)?;
+    let flags = OpenFlags::from_bits(file.get_fl());
+    let end = TtyEnd::new(tty, false);
+    KernelFile::new_tty_end(Arc::clone(file.inode()), Arc::clone(&file.path), flags, end)
+        .map_err(|error| error.to_errno())
 }
 
 fn allocate_master() -> Result<(Arc<PtyInode>, Arc<Tty>), u32> {

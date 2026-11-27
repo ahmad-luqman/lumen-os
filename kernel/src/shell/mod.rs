@@ -677,6 +677,8 @@ impl Console for Captured {
 fn screen_key(key: keyboard::Key) -> Option<Key> {
     use keyboard::Key as K;
     match key {
+        K::Enter => Some(Key::Enter),
+        K::Backspace => Some(Key::Backspace),
         K::Char(c) => Key::from_press(Some(c), None, lumen_input::Mods::NONE),
         K::Raw { code, mods } => Key::from_press(None, Some(code), mods),
     }
@@ -688,6 +690,8 @@ crate::ktest!(
         use keyboard::Key as K;
         let raw = |code| K::Raw { code, mods: lumen_input::Mods::NONE };
         let cases = [
+            (K::Enter, Some(Key::Enter)),
+            (K::Backspace, Some(Key::Backspace)),
             (K::Char('a'), Some(Key::Char('a'))),
             (K::Char('é'), Some(Key::Char('é'))),
             (K::Char('\n'), Some(Key::Enter)),

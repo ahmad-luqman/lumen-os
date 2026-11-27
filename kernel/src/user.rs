@@ -862,12 +862,16 @@ fn spawn_ring3_on(
     exe_path: Option<Arc<[u8]>>,
 ) -> Result<(sched::JoinHandle, ResultSlot), &'static str> {
     // Stdio first: a process never starts without fds 0, 1 and 2 (logged).
-    let stdio = Stdio::open().map_err(|_| "cannot open the process's stdio")?;
+    let console = crate::tty::ConsoleSession::prepare(io)?;
+    let stdio = Stdio::open_console(io).map_err(|_| "cannot open the process's stdio")?;
     let result_slot: ResultSlot = Arc::new(SpinLock::new(None));
     let out = result_slot.clone();
     let pinned = allow_test_syscalls || dr0_target.is_some();
     let run = move || {
         let _pid = register_current(io, allow_test_syscalls, stdin, exe_path, stdio);
+        if let Some(console) = &console {
+            console.activate();
+        }
 
         let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
         let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
@@ -884,6 +888,7 @@ fn spawn_ring3_on(
             let exit = proc.exit.expect("ring-3 exited without recording UserExit");
             (exit, proc.stdout)
         };
+        drop(console);
         *out.lock() = Some(RunResult {
             exit,
             stdout,

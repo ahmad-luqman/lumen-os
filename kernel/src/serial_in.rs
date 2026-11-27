@@ -117,7 +117,8 @@ static AT_DEADLINE: AtomicU64 = AtomicU64::new(0);
 /// `poll`/`select` waits on `/dev/console` that found queued input on the
 /// 100 ms safety step without an IRQ 4 `PollHead::notify` wake.
 static POLL_AT_SAFETY_STEP: AtomicU64 = AtomicU64::new(0);
-/// `poll`/`select` waits on `/dev/console` woken by IRQ 4's `PollHead::notify`.
+/// Readiness notifications delivered to console tty subscribers, plus wakes
+/// of the legacy console bridge used by kernel fixtures.
 static POLL_WOKEN: AtomicU64 = AtomicU64::new(0);
 /// Sequence bracketing [`queue_waiting`]'s drain-to-notify section (odd while
 /// the boot-CPU handler is between pushing into [`QUEUE`] and completing
@@ -249,10 +250,10 @@ pub fn by_interrupt() -> bool {
     BY_INTERRUPT.load(Ordering::Acquire)
 }
 
-/// Number of active `PollHead` subscribers on serial input.
+/// Active subscriptions on serial input and its console tty.
 pub fn poll_subscribers() -> usize {
     let head = POLL_HEAD.lock().clone();
-    head.map_or(0, |h| h.subscriber_count())
+    head.map_or(0, |h| h.subscriber_count()) + crate::tty::serial_subscribers()
 }
 
 /// Whether a byte waits, serialized with the handler's drain and other
@@ -269,6 +270,24 @@ pub fn read_byte() -> Option<u8> {
     let _receive = RECEIVE.lock();
     let popped = QUEUE.pop();
     arch::serial::read_next(popped)
+}
+
+/// Discard the receive queue and the UART's current FIFO at a terminal flush.
+pub(crate) fn discard_input() {
+    let _receive = RECEIVE.lock();
+    while QUEUE.pop().is_some() {}
+    let _ = arch::serial::drain(16, |_| {});
+}
+
+/// Wake a console input thread after its owner requests shutdown.
+pub(crate) fn wake_reader() {
+    WAITING.wake_all();
+}
+
+/// Wait for input or ownership cancellation, retaining the UART safety recheck.
+pub(crate) fn wait_or(stop: impl Fn() -> bool) {
+    let deadline = crate::time::now_ns() + if by_interrupt() { WAIT_NS } else { 5_000_000 };
+    let _ = WAITING.wait_until_or_deadline(deadline, || stop() || available());
 }
 
 /// Supply a received byte to a kernel test, using the real queue and wakes.
@@ -362,15 +381,16 @@ pub fn note_poll_safety_step(fired: impl Fn() -> bool) {
     }
 }
 
-/// Record a `/dev/console` `poll`/`select` wait woken by IRQ 4's
-/// `PollHead::notify`.
+/// Record a console readiness notification (or a legacy bridge wait's wake).
 pub fn note_poll_woken() {
     POLL_WOKEN.fetch_add(1, Ordering::Relaxed);
 }
 
 /// `serial [poll]`: how COM1's input comes, and how the serial shell's waits
 /// for it ended (`serial poll` reports `poll`/`select` safety-step hits,
-/// IRQ-woken waits, and active `PollHead` subscribers).
+/// tty notifications / legacy bridge wakes, and active subscribers). A tty
+/// notification proves a subscriber was notified, not that IRQ 4 woke the
+/// input thread: its deadline recheck can find input and notify the tty too.
 pub fn serial_command(ctx: &mut Ctx<'_>, args: &[String]) {
     if args.len() == 1 && args[0] == "poll" {
         let mut t = String::new();

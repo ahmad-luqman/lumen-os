@@ -1024,6 +1024,32 @@ pub fn write_str_to(vt: usize, s: &str) -> bool {
     write_fmt_to(vt, format_args!("{s}"))
 }
 
+/// Write tty output verbatim: termios has already processed these bytes.
+/// The terminal parser preserves UTF-8 and escape sequences across calls.
+pub(crate) fn write_bytes_to(vt: usize, bytes: &[u8]) -> bool {
+    assert!(vt < VTS, "no virtual terminal {vt}");
+    with_screen(|screen| {
+        screen.terms[vt].write(bytes);
+        if vt == screen.shown {
+            screen.show_cursor();
+            screen.render();
+            #[cfg(feature = "ktest")]
+            TTY_RENDERS[vt].fetch_add(1, Ordering::Relaxed);
+        }
+    })
+    .is_some()
+}
+
+// Count the tty writer's render calls alone: cursor blinking and kernel logs
+// must not make a batching assertion depend on how long the host pauses.
+#[cfg(feature = "ktest")]
+static TTY_RENDERS: [core::sync::atomic::AtomicU64; VTS] = [const { core::sync::atomic::AtomicU64::new(0) }; VTS];
+
+#[cfg(feature = "ktest")]
+pub(crate) fn tty_renders(vt: usize) -> u64 {
+    TTY_RENDERS[vt].load(Ordering::Relaxed)
+}
+
 /// Write formatted text (`\n` as CR LF) to virtual terminal `vt` and draw
 /// it if that one is shown, all under one lock: a log line from another
 /// CPU can't land inside an escape sequence written in this one call.
