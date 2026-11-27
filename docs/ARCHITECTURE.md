@@ -7110,8 +7110,9 @@ blocks, extent trees, and file data writeback):
   dirty for the next writeback, above) makes the first failed device write
   or flush stop writeback inside the call that met it, so nothing else
   reaches the device after it. `freeze` also refuses writes into the cache
-  (`write_at` and `pin_mut` return `ReadOnly`). `thaw` (and
-  `stop_writeback` by hand) exist only with the `test-util` feature, which
+  (`write_at` and `pin_mut` return `ReadOnly`). `stop_writeback` stops
+  writeback by hand, never unfreezing (#350's corruption trigger, below).
+  `thaw` exists only with the `test-util` feature, which
   the kernel's ktest build turns on: for the ktests that read back what
   such a cache holds; the kernel can't thaw. The state is one `Writeback`
   (`Running`, `Stopped`, `Frozen`), so frozen implies stopped.
@@ -7121,7 +7122,8 @@ blocks, extent trees, and file data writeback):
   durable), and `first_failure` is set at the first of them: the one
   signal that a device write failed, since a call's error alone can't
   say. `ext4`'s `errors=remount-ro` (below) turns
-  `stop_writeback_on_failure` on at mount, watches `first_failure`, and
+  `stop_writeback_on_failure` on at mount, watches `first_failure`, calls
+  `stop_writeback` when an allocator reports corruption (#350), and
   freezes the cache when the last write-type operation running at the
   failure ends (`LatchableCache`'s methods).
 - **Host tests (`cargo:lumen-bcache`):** verified against an in-memory
@@ -7737,16 +7739,18 @@ call order (#355's comments).
       (`ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio`,
       by the `FaultCache`). `e2fsck` recomputes the counts (read, not
       tested).
-    - `ext4plus`'s `Extent::allocate` (`extent.rs`) retries any failed
-      `alloc_contiguous_blocks(n)` with one block fewer and gives `NoSpace`
-      at 0. It runs for every new block a write needs: page writeback
+    - `ext4plus`'s `Extent::allocate` (`extent.rs`) retries an
+      `alloc_contiguous_blocks(n)` that found no room (`NoSpace`) with one
+      block fewer and gives `NoSpace` at 0; since #350 any other error (a
+      failed write, a read-only or full cache, corruption) passes through,
+      not retried. It runs for every new block a write needs: page writeback
       (`fsync`, `fdatasync`, `msync`, `sync`, reclaim), long symlink
       targets, truncate's tail zeroing. `alloc_contiguous_blocks` writes the
       bitmap bits, then the descriptor's checksum, then lowers the group's
       count in memory and writes it, then the superblock's, and puts nothing
-      back. On 4 KiB blocks a page needs 1 block, so nothing is retried: a
-      failed allocation write comes back as `NoSpc`, not `Io`, and once the
-      bit has landed it leaks (owned by no extent). If the checksum write
+      back. A failed allocation write comes back as `Io` (before #350 the
+      retry turned it into `NoSpc`), and once the bit has landed it leaks
+      (owned by no extent). If the checksum write
       failed, neither count was lowered, so both stay one above the bitmap
       for good, every later write storing them so; if the count's write
       failed, the superblock's stays one above for good (the group's is put
@@ -7754,14 +7758,12 @@ call order (#355's comments).
       the next one. Since #349 those later writes land only in a block cache
       that never writes back (the volume read-only), so on the device the
       state the failure left stays
-      (`ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc`). On
-      a 1 KiB-block extent volume, where a page needs 4 blocks, a host probe
-      in #351's review (not a test; 2 KiB reaches the same code, not probed)
-      saw the shorter retry succeed: `ext4plus`'s write returns `Ok` (the
-      writeback then `EIO`, the volume errored, #349), with up to 4
-      bits leaked (a failed bitmap write after the first leaves the earlier
-      bits and both counts above the bitmap for good), and a count lowered
-      twice when its own write failed.
+      (`ext4_a_failed_write_in_a_block_allocation_preserves_eio`). On a
+      1 KiB-block extent volume, where a page needs 4 blocks, a failed write
+      is no longer retried shorter either (#351's host probe saw that retry
+      succeed before #350, with up to 4 bits leaked); the bits set before
+      the failure still leak, and the counts stay as the failed write left
+      them.
     - Under the real block cache only a miss can fail. The bitmap is read
       just before its bits are written, and the count's descriptor write
       follows the checksum's, so those are hits; the writes that can fail
@@ -7774,16 +7776,17 @@ call order (#355's comments).
       over-count. The likeliest route, though, is the bitmap's own read
       missing and its eviction of another dirty block failing: the free's
       retry turns that into `ext4plus`'s `Ok` (the operation's `EIO` since
-      #349), the allocation's into `NoSpc` (nothing
+      #349), and the allocation reports it as `Io` since #350 (nothing
       doubled or leaked; the victim stays dirty).
     - A group whose count promises more than its bitmap has: any
       allocation whose checksum write fails after its bit landed leaves
       one (it reports `Io`), and so does the free's double count. Before
-      #350 `ext4plus`'s allocators looped forever on such a group; since
-      #350 an allocation that meets one returns `EIO` and makes the volume
-      read-only (the second trigger below), and a group with free bits but
-      no run of `n` for `alloc_contiguous_blocks(n)` is skipped as
-      fragmentation.
+      #350 `ext4plus`'s allocators looped forever on such a group once its
+      bitmap ran out. Since #350 allocation goes on from the bits it still
+      has, and the allocation that finds no free bit in a group whose count
+      is still positive returns `EIO` and makes the volume read-only (the
+      second trigger below); a group with free bits but no run of `n` for
+      `alloc_contiguous_blocks(n)` is skipped as fragmentation.
     - Two narrow paths drop an error before any of these (read from the
       source, not probed): `ext4plus`'s duplicate-name check in
       `add_dir_entry` (`dir.rs`) takes a failed lookup (an eviction's write
@@ -7805,8 +7808,8 @@ call order (#355's comments).
       parent's count (pinned); a failed device write among them makes it
       `EIO` since #349 (`WriteOp::end`).
 
-    So a write error can't be told from `ext4plus`'s results (an `Ok` or a
-    `NoSpc` may follow one), nor from the block cache's: a failed `write_at`
+    So a write error can't be told from `ext4plus`'s results (an `Ok` may
+    follow one, from the range-free retry), nor from the block cache's: a failed `write_at`
     may be a failed pre-read or another block's eviction, a failed `sync` a
     failed flush or a pinned block, and an eviction's write error reaches a
     read as an ordinary `Io`. #349 reads one signal inside `BlockCache`
@@ -7825,8 +7828,8 @@ call order (#355's comments).
       (`LatchableCache::first_failure`, over `BlockCache::first_failure`,
       above), which `LatchedCache` (the seam the mount wraps the volume's
       cache in, which every call goes through; the volume holds it as an
-      `Arc<LatchedCache>`, and the cache's controls, `freeze` and
-      `stop_writeback_on_failure`, are on `LatchableCache`, a supertrait only
+      `Arc<LatchedCache>`, and the cache's controls, `freeze`,
+      `stop_writeback_on_failure` and `stop_writeback`, are on `LatchableCache`, a supertrait only
       the caches below the latch implement) checks after each call while
       healthy: a block written back by a `sync` (`fsync`, the filesystem's
       sync) or by the eviction of whichever `write_at` (`ext4plus`'s, for
@@ -7835,10 +7838,8 @@ call order (#355's comments).
       inline-symlink bytes) or `read_at` missed. A call's result alone
       decides nothing: a `write_at` can fail on a pre-read or a full cache
       with no write failing (it then errors the operation, not the volume),
-      and `ext4plus` can return `ENOSPC` (its allocation retry, which the
-      operation returns as its own error) or `Ok` (its range-free retry,
-      above; the operation then returns `EIO`, `WriteOp::end`) after one
-      did. A data block's
+      and `ext4plus` can return `Ok` (its range-free retry, above; the
+      operation then returns `EIO`, `WriteOp::end`) after one did. A data block's
       failed write counts too: the cache can't tell data from metadata, and
       a file's writeback allocates blocks and writes its map in the same
       call. Read errors, `NoSpc` and `NoMem` that no failed write caused,
