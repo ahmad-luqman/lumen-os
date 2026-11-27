@@ -32,9 +32,7 @@ pub struct SpinLock<T> {
     /// its own last store (coherence), so it reads its own id exactly while
     /// it holds the lock, even with `Relaxed` loads.
     owner: AtomicU32,
-    /// Contended [`lock`](Self::lock) calls that have recorded their wait's
-    /// start TSC and entered the spin loop (ktest seam for deterministic
-    /// lock-wait tests).
+    /// See [`waits_started`](Self::waits_started).
     #[cfg(feature = "ktest")]
     waits_started: AtomicU32,
     value: UnsafeCell<T>,
@@ -89,8 +87,12 @@ impl<T> SpinLock<T> {
                     while owner != FREE {
                         if spins == 0 {
                             since = arch::rdtsc();
+                            // `rdtsc` isn't ordered by atomics, so another CPU
+                            // may see this bump a few cycles before `since` is
+                            // read; the ktest's hold covers that window.
+                            // Nothing is published through `waits_started`.
                             #[cfg(feature = "ktest")]
-                            self.waits_started.fetch_add(1, Ordering::Release);
+                            self.waits_started.fetch_add(1, Ordering::Relaxed);
                         }
                         spins += 1;
                         core::hint::spin_loop();
@@ -144,11 +146,11 @@ impl<T> SpinLock<T> {
         self.owner.load(Ordering::Relaxed) == owner_id()
     }
 
-    /// How many contended [`lock`](Self::lock) calls have recorded their
-    /// wait's start TSC and entered the spin loop (for the ktests).
+    /// How many contended [`lock`](Self::lock) calls have read their wait's
+    /// start TSC and entered the spin loop (for the ktests).
     #[cfg(feature = "ktest")]
     pub(crate) fn waits_started(&self) -> u32 {
-        self.waits_started.load(Ordering::Acquire)
+        self.waits_started.load(Ordering::Relaxed)
     }
 
     /// Access the value even if the lock is held.
