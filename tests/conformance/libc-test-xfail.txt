@@ -28,16 +28,16 @@
 
 src/functional/pthread_mutex_pi-static.exe # PI futex operations remain ENOSYS #397
 src/functional/pthread_mutex_pi.exe # PI futex operations remain ENOSYS #397
-src/functional/mntent-static.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/functional/mntent.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/functional/strptime-static.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/functional/strptime.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/functional/wordexp-static.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/functional/wordexp.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/regression/regex-backref-oob-static.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/regression/regex-backref-oob.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/regression/regexec-backref-static.exe # also fails natively; requires musl newer than 1.2.5 #398
-src/regression/regexec-backref.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/functional/mntent-static.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/functional/mntent.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/functional/strptime-static.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/functional/strptime.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/functional/wordexp-static.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/functional/wordexp.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/regression/regex-backref-oob-static.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/regression/regex-backref-oob.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/regression/regexec-backref-static.exe # fails natively too; likely fixed in musl after 1.2.5 #398
+src/regression/regexec-backref.exe # fails natively too; likely fixed in musl after 1.2.5 #398
 
 # Additional D4 findings, each with its follow-up issue: these interfaces are
 # absent, not runner errors. BSD sockets belong to M9 and non-stack rlimit

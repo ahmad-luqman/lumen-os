@@ -230,6 +230,12 @@ class Xfail:
     line: int
     kind: str = "fail"
 
+    def __post_init__(self) -> None:
+        if self.kind not in ("fail", "flaky"):
+            raise XfailError(
+                f"invalid expected-failure kind {self.kind!r}: expected 'fail' or 'flaky'"
+            )
+
 
 class XfailError(ValueError):
     pass

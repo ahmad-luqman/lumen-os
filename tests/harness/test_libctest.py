@@ -328,6 +328,16 @@ def test_the_checked_in_xfail_list_is_well_formed():
     libctest.load_xfail()
 
 
+def test_xfail_kind_is_validated_at_construction():
+    test = "src/functional/a-static.exe"
+    assert libctest.Xfail(test, "known", 396, 1).kind == "fail"
+    for kind in ("fail", "flaky"):
+        assert libctest.Xfail(test, "known", 396, 1, kind=kind).kind == kind
+    for kind in ("flakey", "FAIL", "", None, 0):
+        with pytest.raises(libctest.XfailError, match="invalid expected-failure kind"):
+            libctest.Xfail(test, "known", 396, 1, kind=kind)
+
+
 # A run judged against the list.
 
 A = "src/functional/a-static.exe"
