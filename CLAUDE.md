@@ -403,7 +403,8 @@ one is its own PR that updates that doc first.
   tables (`KernelVfsTables`: lumen-vfs's `VfsTables` on `SleepMutex`;
   `KernelLocks`/`KernelLeafLock` and `KernelPollHead`, #374), `init` (the
   first ext4 virtio-blk volume at `/`, else a tmpfs root; `/tmp`, `/dev`,
-  `/dev/pts` (#388), `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
+  `/dev/pts` (#388), `/dev/shm` (a 1777 tmpfs on `DevId::DEV_SHM`, #433),
+  `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
   and the `mount`, `sync` and `vfstest` commands (`mount`'s `used`/`limit`:
   a tmpfs mount's quota, through `mounts_with_fs` and `tmpfs::quota_use`,
   #324; an errored ext4 volume's mode `ro,errors`, #349; `vfstest`: file
@@ -462,14 +463,21 @@ one is its own PR that updates that doc first.
   share: `FaultCache` (writes failed by number, pair or from one on,
   reads by range or after a write fault), `Mnt`, `mount`, `remount_ro`,
   `set_clock`, the ktests' clock, `Ext4Shared::now`; `mknod` FIFOs, #386,
-  and `statfs`, #391);
+  and `statfs`, #391; #355: a writable mount runs lumen-vfs's
+  `check_allocation` through the block cache first, an inconsistency or a
+  volume it can't check mounting read-only with one warning, leaks counted
+  at `debug`; the fast-symlink/device/blocks rule from `i_block_kind_raw`;
+  #350: a count/bitmap mismatch `ext4plus` reports makes the volume
+  read-only);
   `vfs/tmpfs.rs` (its quota charging inodes, directory entries and symlink
   targets besides pages, #267: `charge`, the cost model, `InodeCharge`,
   `EntryCharge` and `Children`, the only code reserving or giving one back;
   `quota_use`, a mount's `QuotaUse` for `mount`, #324; `mknod` FIFOs with
   a boxed `FifoSlot` (`Option<Box<FifoSlot>>`), #386, and `statfs`, #391),
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`,
-  `ptmx` with `TerminalOpen::{Ptmx, Alias, Console}` and `terminal_open`, #388, #389),
+  `ptmx` with `TerminalOpen::{Ptmx, Alias, Console}` and `terminal_open`, #388, #389;
+  `DevKind::MountDir`, the fixed `pts` and `shm` directories other
+  filesystems mount over, #433),
   `vfs/devpts.rs` (M8, #388, #389: `/dev/pts` filesystem `Devpts` on dev
   0:5, `PTY_MAX` = 256, `TtyEnd` open-description lifetime, `open`
   allocating PTY pairs on `/dev/ptmx` and resolving `/dev/tty` and
@@ -511,13 +519,16 @@ one is its own PR that updates that doc first.
   (`ProcTable` behind `PROCS`: lumen-proc's tree, processes by pid, threads
   by tid, `WaitResult`, `link_init`/`link_root`/`link_thread`/
   `unlink_thread`/`exit_in_tree`/`wait`/`setsid`/`setpgid`/`getpgid`/
-  `getsid`/`priority`/`process_time`, `check` cross-checking them in the
-  ktests), `process/files.rs` (`Files`: the 1024-slot FD table of
+  `getsid`/`priority`/`process_time`, `check_nproc` (fork and thread
+  clone against `RLIMIT_NPROC` over `nproc_task_count`, root not exempt,
+  #435), `check` cross-checking them in the ktests), `process/files.rs` (`Files`: the 1024-slot FD table of
   `KernelFile`s, shared/exclusive `FilesAccess` leases, `ReservedFd`,
   `fork_copy`, `prepare_exec`/`copy_exec_into`; `FsState`/`FsInner` for
   `Cwd` and umask, #379, #380, #381), `process/signal.rs` (`SignalState`,
   `ThreadSignals`, `Delivery`, `HandlerDelivery`, group exit/stop/cont,
-  `wait_signal`, `sigaltstack`, `rlimit_stack`, `ctty`, #384, #385, #388),
+  `wait_signal`, `sigaltstack`, `ctty`, #384, #385, #388; `Rlimits`, the
+  process's stack, `NOFILE` and `NPROC` limits behind one accessor, the
+  live `NOFILE` soft limit bounding fd allocation and `poll`'s `nfds`, #435),
   `lookup`/`lookup_thread`, `fork_current`, `de_thread` (#381, #382),
   `register_current` and `take_current` (a run's takedown in the design's
   exit order: detach, unlink, release `mm`/`files`/`fs`, then the tree, its
@@ -760,7 +771,10 @@ one is its own PR that updates that doc first.
   #318), `OpenFile` (its inode,
   `inode()`, read from its `OpenGuard`, #264; M7's `inc_fd_ref`/`dec_fd_ref`)
   and the `FdTable` (`MAX_FDS` fds; `reserve`/`install`/`cancel`,
-  `FdReservation`, `try_preallocated`, `src/tests/hazards.rs`, #379, #381),
+  `FdReservation`, `try_preallocated`, `src/tests/hazards.rs`, #379, #381;
+  the limit-taking family `alloc_below`, `alloc_from_below`,
+  `reserve_below`, `insert_at_below`, what syscalls use under
+  `RLIMIT_NOFILE`, #435),
   `poll` (`PollMask`, `PollWaker`, `Pollable`, `PollGuard`, `PollHead`,
   #374), the namespace operations (`open_inode`, `mkdir_at`, `mknod_at` (#386),
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
@@ -776,7 +790,15 @@ one is its own PR that updates that doc first.
   with their epoch bits, clamped as `timestamp_truncate` does; #330: the
   first block `ext4plus`'s `delete_file` frees, `first_block_freed`, and
   `Geometry`, a block's byte and its bitmap bit, `block_byte`,
-  `bitmap_bit`), `nlink`
+  `bitmap_bit`; #355: `check_allocation`, a volume's allocation state
+  checked over a reader (counts against bitmaps, every in-use inode's
+  blocks and the fixed metadata owned once, live slots and directory
+  entries against the inode bitmap, shared xattr refcounts) into an
+  `AllocationReport` or an `AllocationError` (`Inconsistent`, or why it
+  can't check), memory budgeted; `visit_inode_blocks`, `i_block_kind`/
+  `i_block_kind_raw`, Linux's rule for what `i_block` holds, `has_super`;
+  `testdata/allocation.ext4.zz`, made by `tools/ext4-allocation-image.py`),
+  `nlink`
   (#265: `NlinkBounds`, ext4's in-memory link-count corrections: a floor
   and maybe a ceiling per inode, never trivial, the floor never above the
   ceiling; `raised_to`, after a raise on disk landed or failed), and `page`
@@ -837,6 +859,7 @@ one is its own PR that updates that doc first.
   `Tcsetpgrp`, `PidRef`/`retain_pid` (#388), `pgrp_members`,
   `is_orphaned_pgrp`; a process's threads,
   `add_thread`/`remove_thread`/`threads`, their tids busy, #372;
+  `nproc_task_count`, the tasks `RLIMIT_NPROC` counts, #435;
   `check_invariants` behind `test-util`), `WaitStatus` (`word`,
   `siginfo`), `ExitStatus`, `RusageSlot`/`SlotRef`, `Errno`/`Bug`/`Error`
   (host-tested, incl. a model, `tests/alloc.rs`: what each operation
@@ -989,7 +1012,9 @@ one is its own PR that updates that doc first.
 - `vendor/ext4plus`: ext4plus 0.1.0-rc.2's crate file with Lumen's fixes
   on top, each its own commit, its code marked `Lumen (#n)`
   (`[patch.crates-io]`, out of the workspace; #313: the htree hash's
-  signedness from `s_flags`).
+  signedness from `s_flags`; #350: the allocators' search bounded to one
+  pass over the groups, only `NoSpace` retried shorter, a count/bitmap
+  mismatch reported as its own error).
 - `apps/`: the WASM apps (M5), their own cargo workspace (out of the root
   one; every directory but dot ones a member, named after its crate; output
   in `target-apps/`) for `wasm32-unknown-unknown`, `no_std`
@@ -1109,16 +1134,20 @@ one is its own PR that updates that doc first.
   `m8_proc` (`fork-wait`, plus submodules `exec.rs` (#381), `signals.rs`
   (#384), `signal_waits.rs` (#385), `futex.rs` (#383, #390), `threads.rs`
   (#382, #390), `sessions.rs` (#387), `timers.rs` (#392), `small.rs`
-  (#391)), `m8_io` (`console-poll`, #374, #389; `pipes`, #386), `m8_vm`
-  (`shootdown`, #390), `m8_pty` (PTY integration checks, #388), and
+  (#391); `posix-shm`/`posix-shm-fail`, `shm_open` and named semaphores
+  on `/dev/shm`, #433), `m8_io` (`console-poll`, #374, #389; `pipes`, #386), `m8_vm`
+  (`shootdown`, #390), `m8_pty` (PTY integration checks, #388;
+  `ptyrun-relay`/`ptyrun-child`, the relay's backpressure, partial writes
+  and `SIGWINCH`, #437), and
   `ptyrun` (D3's PTY runner: `--script <file> -- <program>` scripted PTY
-  master and interactive console-to-PTY relay, #395).
+  master and interactive console-to-PTY relay forwarding `SIGWINCH`, #395, #437).
 - `tests/scenarios/`: QEMU tests, incl. `test_linux_user.py` (M6/M7 ring-3
   entry, faults, ABI, busybox and `dlopen`), `test_linux_proc.py`
   (processes, `fork`/`exec`/shebangs, signals/`sigaltstack`, signal waits,
   `futex`/nanosleep, pthreads, sessions/groups, interval/POSIX timers, small
   syscalls, MT stress), `test_linux_io.py` (`poll`/`select` on console,
-  pipes/FIFOs, PTY termios/job control, `ash -i` console job control),
+  pipes/FIFOs, PTY termios/job control, `ash -i` console job control,
+  `ptyrun`'s console relay, #437),
   `test_linux_vm.py` (cross-CPU `munmap`/`mprotect` TLB shootdowns),
   `test_alpine.py` (Alpine minirootfs coreutils plus M8's D1 `ash` #393,
   D2 `gcc`/`g++`/`make` #394, D3 `git`/`sqlite3` and `vim` over `ptyrun`
