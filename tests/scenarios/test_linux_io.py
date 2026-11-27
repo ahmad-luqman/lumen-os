@@ -265,3 +265,66 @@ def test_console_ash_job_control(boot, tmp_path):
     expect_screen(m, r"^vt-returned$")
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_ptyrun_console_relay(boot, tmp_path):
+    """#437: deterministic regression tests for `ptyrun`'s console relay mode.
+
+    Runs `m8_pty ptyrun-relay` (bounded two-way backpressure while output is
+    undrained, partial writes to stdout and master, failed stdout write
+    reported after termios/flag cleanup rather than the child's status,
+    `SIGPIPE` on a closed stdout reaching cleanup with child `SIGPIPE` reset to
+    `SIG_DFL`, `SIGWINCH` resize forwarding from stdin's `TIOCGWINSZ` to
+    master's `TIOCSWINSZ`, and exit-status/EOF forwarding), then runs `ptyrun`
+    directly on the serial console and compares the console tty's `TCGETS`
+    termios before and after to confirm restoration.
+    """
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+    start = len(m.output)
+    program = "/usr/local/bin/m8_pty"
+    m.send_line(f"linux {program} ptyrun-relay")
+    for check in (
+        "ptyrun_relay_two_way_backpressure",
+        "ptyrun_relay_partial_writes",
+        "ptyrun_relay_stdout_write_error_cleanup",
+        "ptyrun_relay_sigpipe_reaches_cleanup",
+        "ptyrun_relay_sigwinch_forwards_resize",
+        "ptyrun_relay_exit_status_and_eof",
+    ):
+        match = m.expect(re.compile(rf"^(ok|FAIL) {check}[^\r\n]*\r?\n", re.MULTILINE), 60)
+        assert match.group(1) == "ok", f"{match.group(0).strip()}\n{m.output[start:]}"
+    m.expect(rf"linux: {re.escape(program)} exit=0 leaked_frames=-?\d+\n", 30)
+    m.expect(r"lumen> ", 10)
+
+    def read_console_termios() -> str:
+        m.send_line(f"linux {program} termios")
+        found = m.expect(
+            re.compile(r"^(TERMIOS:[0-9a-f]{72}|FAIL termios[^\r\n]*)\r?\n", re.MULTILINE), 20
+        )
+        line = found.group(1)
+        assert line.startswith("TERMIOS:"), line
+        m.expect(rf"linux: {re.escape(program)} exit=0 leaked_frames=-?\d+\n", 20)
+        m.expect(r"lumen> ", 10)
+        return line.removeprefix("TERMIOS:")
+
+    termios_before = read_console_termios()
+    # Bytes 12..16 hold c_lflag; console must start cooked (non-zero) so raw=0 is observable.
+    assert termios_before[24:32] != "00000000", termios_before
+
+    # Interactive serial-console relay: console enters raw mode during the
+    # relay, input reaches child over PTY, output returns over serial, non-zero
+    # exit code propagates, and console tty termios is restored.
+    m.send_line(f"linux /usr/local/bin/ptyrun {program} ptyrun-child console-echo")
+    lflag_match = m.expect(re.compile(r"^RELAY_CONSOLE_LFLAG:(\d+)\r?\n", re.MULTILINE), 30)
+    assert int(lflag_match.group(1)) == 0, lflag_match.group(0)
+    m.expect(re.compile(r"^RELAY_CONSOLE_READY\r?$", re.MULTILINE), 30)
+    m.send("hello-relay-console\n")
+    m.expect(re.compile(r"^RELAY_GOT:hello-relay-console\r?$", re.MULTILINE), 30)
+    m.expect(r"linux: /usr/local/bin/ptyrun exit=7 leaked_frames=-?\d+\n", 30)
+    m.expect(r"lumen> ", 10)
+    assert read_console_termios() == termios_before
+    assert run(m, "echo relay-console-returned") == "relay-console-returned\n"
+    assert CRASH_BEGIN not in m.output[start:]
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
