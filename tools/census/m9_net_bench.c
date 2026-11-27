@@ -1,15 +1,15 @@
 #define _GNU_SOURCE
 /*
  * M9 syscall census microbenchmark (#451): exercises AF_UNIX socketpair +
- * SCM_RIGHTS FD passing, epoll (level and edge-triggered, epoll_wait and
- * epoll_pwait), eventfd2, timerfd, and loopback TCP socket options/accept4.
+ * SCM_RIGHTS FD passing, epoll (level and edge-triggered; musl's epoll_wait()
+ * issues the epoll_pwait syscall), eventfd2, timerfd, and loopback TCP socket
+ * options/accept4.
  */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,7 +109,7 @@ static void check_scm_rights_and_epoll(void) {
     }
     close(recv_fd);
 
-    /* Exercise epoll (ET + LT), eventfd2, timerfd, epoll_wait and epoll_pwait. */
+    /* Exercise epoll (ET + LT; musl's epoll_wait() makes the epoll_pwait syscall), eventfd2 and timerfd. */
     int ep = epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) {
         die("epoll_create1");
@@ -161,17 +161,14 @@ static void check_scm_rights_and_epoll(void) {
     }
 
     int got_sv = 0, got_efd = 0, got_tfd = 0;
-    sigset_t empty;
-    sigemptyset(&empty);
     for (int round = 0; !(got_sv && got_efd && got_tfd) && round < 20; round++) {
         struct epoll_event ready[4];
-        int nfds = (round % 2 == 0) ? epoll_wait(ep, ready, 4, 1000)
-                                    : epoll_pwait(ep, ready, 4, 1000, &empty);
+        int nfds = epoll_wait(ep, ready, 4, 1000);
         if (nfds < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            die("epoll_wait/epoll_pwait");
+            die("epoll_wait");
         }
         if (nfds == 0) {
             die_msg("epoll timed out");
@@ -293,6 +290,9 @@ static void check_tcp_loopback(void) {
         die("shutdown");
     }
 
+    if (epoll_ctl(ep, EPOLL_CTL_DEL, cli, NULL) < 0) {
+        die("epoll_ctl DEL cli");
+    }
     ev.events = EPOLLIN;
     ev.data.fd = acc;
     if (epoll_ctl(ep, EPOLL_CTL_ADD, acc, &ev) < 0) {
@@ -300,6 +300,9 @@ static void check_tcp_loopback(void) {
     }
     if (epoll_wait(ep, &ready, 1, 1000) != 1) {
         die("epoll_wait recv");
+    }
+    if (ready.data.fd != acc) {
+        die_msg("unexpected ready fd");
     }
     char buf[16];
     ssize_t n = recvfrom(acc, buf, sizeof(buf), 0, NULL, NULL);

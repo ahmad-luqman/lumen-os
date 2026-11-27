@@ -1,8 +1,8 @@
 name: syscall-census
 
 # Unattended x86-64 Linux syscall census (#451): runs tools/syscall-census.sh
-# in a pinned alpine:3.21 container on ubuntu-24.04 and uploads the raw traces
-# and generated TOML as an artifact (even if a workload fails).
+# in a pinned alpine:3.21 container on ubuntu-24.04 and uploads an artifact
+# (raw traces always; generated TOML and report only on success).
 on:
   workflow_dispatch:
     inputs:
@@ -52,6 +52,7 @@ jobs:
       - name: Generate M9 census report
         if: ${{ success() && env.MILESTONE == 'm9' }}
         timeout-minutes: 2
+        shell: bash
         run: |
           python3 tools/harness/lumen_harness/syscalls.py report \
             --milestone M9 \

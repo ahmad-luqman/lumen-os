@@ -262,7 +262,7 @@ milestone = "M8"
 tests = ["harness:test_libctest::*"]
 
 [[feature]]
-name = "M9 syscall census of apk, curl, python3, ruby, busybox net tools and a socketpair/SCM_RIGHTS/epoll microbenchmark (#451): unattended ubuntu-24.04 workflow pinned to ci.yml's action refs and tools/syscall-census.sh's alpine:3.21 digest, deterministic TOML with socket families/types/protocols, sockopt levels/names, epoll/eventfd/timerfd/message flags and ioctls, and `syscalls.py report --milestone M9` flagging M10 rows, M8 ENOSYS_BY_DECISION syscalls, CPU-time clocks and #450 design probes"
+name = "M9 syscall census of apk, curl, python3, ruby, busybox net tools and a socketpair/SCM_RIGHTS/epoll microbenchmark (#451): unattended ubuntu-24.04 workflow pinned to ci.yml's action refs and tools/syscall-census.sh's alpine:3.21 digest, deterministic TOML with socket families/types/protocols, sockopt option pairs, epoll/eventfd/timerfd/message flags and ioctls, `syscalls.py report --milestone M9` flagging M10 rows, M8 ENOSYS_BY_DECISION syscalls, CPU-time clocks and #450 design probes on fixture traces, and the checked-in tests/linux/m9-census.toml from the syscall-census workflow (not rerun by these tests) checked against X86_64, the workload script and its pinned image"
 milestone = "M9"
 tests = [
     "harness:test_syscalls::test_m9_census_parses",

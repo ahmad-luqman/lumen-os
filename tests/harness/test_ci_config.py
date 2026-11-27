@@ -237,8 +237,13 @@ def test_syscall_census_workflow_is_pinned():
     assert "tools/census/**" in wf_text
     assert "tools/syscall-census.sh" in wf_text
     assert "contents: read" in wf_text
-    assert "if: always()" in wf_text
     assert re.search(r"^\s+timeout-minutes:\s+\d+$", wf_text, re.MULTILINE)
+
+    wf_steps = re.split(r"\n(?=      - )", wf_text)
+    [report_step] = [s for s in wf_steps if "| tee" in s]
+    assert re.search(r"^\s+shell:\s+bash$", report_step, re.MULTILINE), report_step
+    [upload_step] = [s for s in wf_steps if "actions/upload-artifact" in s]
+    assert re.search(r"^\s+if:\s+always\(\)$", upload_step, re.MULTILINE), upload_step
 
     # Negative checks: drifting digest, unpinned action or ci.yml mismatch fails.
     bad_digest = _ALPINE_DIGEST_RE.sub(

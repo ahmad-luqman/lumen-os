@@ -260,7 +260,7 @@ KEY_ARG_LINES = [
         {"op": "0x1", "events": "0x80000001"},
     ),
     ("eventfd2(0, 0x80800)              = 3", {"flags": "0x80800"}),
-    ("getsockopt(3, 0x1, 0x4, [0], [4]) = 0", {"level": "1", "optname": "4"}),
+    ("getsockopt(3, 0x1, 0x4, [0], [4]) = 0", {"option": "1:4"}),
     ("inotify_init1(0x80800)            = 3", {"flags": "0x80800"}),
     ('memfd_create("x", 0x1)            = 3', {"flags": "0x1"}),
     ('recvfrom(3, ""..., 64, 0x40, NULL, NULL) = 4', {"flags": "0x40"}),
@@ -269,7 +269,7 @@ KEY_ARG_LINES = [
     ("sendmmsg(3, [...], 2, 0x4000)     = 2", {"flags": "0x4000"}),
     ("sendmsg(3, {msg_name=NULL}, 0x4000) = 1", {"flags": "0x4000"}),
     ('sendto(3, ""..., 5, 0x4000, NULL, 0) = 5', {"flags": "0x4000"}),
-    ("setsockopt(3, 0x1, 0x2, [1], 4)   = 0", {"level": "1", "optname": "2"}),
+    ("setsockopt(3, 0x1, 0x2, [1], 4)   = 0", {"option": "1:2"}),
     ("shutdown(3, 0x1)                  = 0", {"how": "0x1"}),
     ("signalfd4(-1, [17], 8, 0x80800)   = 3", {"flags": "0x80800"}),
     ("timer_create(0x1, NULL, [0])      = 0", {"clock": "1"}),
@@ -861,19 +861,20 @@ M9_WORKLOADS_SH = ROOT / "tools/census/m9-workloads.sh"
 # Linux x86-64 syscall numbers and ABI constants cited from Linux 6.12:
 # - arch/x86/entry/syscalls/syscall_64.tbl: read(0), ioctl(16), mremap(25),
 #   madvise(28), sendfile(40), socket(41)..getsockopt(55), times(100),
-#   clock_gettime(228), epoll_wait(232), epoll_ctl(233), epoll_pwait(281),
-#   timerfd_create(283), timerfd_settime(286), timerfd_gettime(287),
-#   accept4(288), signalfd4(289), eventfd2(290), epoll_create1(291),
-#   recvmmsg(299), sendmmsg(307), memfd_create(319), clone3(435),
-#   epoll_pwait2(441).
+#   clock_gettime(228), clock_getres(229), epoll_wait(232), epoll_ctl(233),
+#   epoll_pwait(281), timerfd_create(283), timerfd_settime(286),
+#   timerfd_gettime(287), accept4(288), signalfd4(289), eventfd2(290),
+#   epoll_create1(291), pipe2(293), recvmmsg(299), sendmmsg(307),
+#   memfd_create(319), clone3(435), epoll_pwait2(441).
 # - include/linux/socket.h: AF_UNIX(1), AF_INET(2), AF_INET6(10),
 #   AF_NETLINK(16), AF_PACKET(17).
-# - include/uapi/linux/sockios.h: SIOCGIFCONF(0x8912), SIOCGIFFLAGS(0x8913).
+# - include/uapi/linux/sockios.h: SIOCGSTAMP(0x8906), SIOCGIFCONF(0x8912),
+#   SIOCGIFFLAGS(0x8913).
 # - include/uapi/linux/time.h: CLOCK_MONOTONIC(1), CLOCK_PROCESS_CPUTIME_ID(2),
-#   CLOCK_THREAD_CPUTIME_ID(3).
+#   CLOCK_THREAD_CPUTIME_ID(3); negative clockids are dynamic POSIX CPU clocks.
 # - include/uapi/asm-generic/socket.h & linux/in.h & linux/tcp.h:
-#   SOL_SOCKET(1), SO_REUSEADDR(2), SO_ERROR(4), IPPROTO_TCP(6),
-#   TCP_NODELAY(1), IPPROTO_IPV6(41), IPV6_V6ONLY(26).
+#   SOL_SOCKET(1), SO_REUSEADDR(2), SO_ERROR(4), SO_REUSEPORT(15),
+#   IPPROTO_TCP(6), TCP_NODELAY(1), IPPROTO_IPV6(41), IPV6_V6ONLY(26).
 M9_TRACE_NET = """\
 101   read(3, ""..., 64)                = 6
 101   socket(0x2, 0x80801, 0x6)         = 4
@@ -882,6 +883,7 @@ M9_TRACE_NET = """\
 101   socket(0x11, 0x3, htons(0x0003))  = 7
 101   socketpair(0x1, 0x80801, 0, [8, 9]) = 0
 101   setsockopt(4, 0x1, 0x2, [1], 4)   = 0
+101   setsockopt(4, 0x1, 0xf, [1], 4)   = 0
 101   setsockopt(4, 0x6, 0x1, [1], 4)   = 0
 101   setsockopt(5, 0x29, 0x1a, [1], 4) = 0
 101   getsockopt(4, 0x1, 0x4, [0], [4]) = 0
@@ -897,12 +899,14 @@ M9_TRACE_NET = """\
 101   sendmsg(8, {msg_name=NULL, msg_control=[{cmsg_level=0x1, cmsg_type=0x1}]}, 0x4000) = 1
 101   recvmsg(9, {msg_name=NULL}, 0x40000000) = 1
 101   shutdown(11, 0x1)                 = 0
+101   ioctl(4, 0x8906, 0x7ffe0000)      = 0
 101   ioctl(4, 0x8913, {ifr_name="lo"}) = 0
 101   ioctl(4, 0x8912, {ifc_len=4096})  = 0
 101   epoll_create1(0x80000)            = 12
 101   epoll_ctl(12, 0x1, 9, {events=0x80000001, data={u32=9, u64=9}}) = 0
 101   epoll_ctl(12, 0x3, 9, {events=0x5, data={u32=9, u64=9}}) = 0
 101   epoll_ctl(12, 0x2, 9, NULL)       = 0
+101   epoll_ctl(12, 0x2, 9, 0x7ffe12340000) = 0
 101   epoll_wait(12, [{events=0x1, data={u32=9, u64=9}}], 8, 100) = 1
 101   epoll_pwait(12, [{events=0x1, data={u32=9, u64=9}}], 8, 100, [], 8) = 1
 101   epoll_pwait2(12, [], 8, {tv_sec=0, tv_nsec=1000}, NULL, 8) = 0
@@ -918,6 +922,9 @@ M9_TRACE_RUNTIME = """\
 202   clock_gettime(0x1, {tv_sec=1, tv_nsec=0}) = 0
 202   clock_gettime(0x2, {tv_sec=0, tv_nsec=10}) = 0
 202   clock_gettime(0x3, {tv_sec=0, tv_nsec=5}) = 0
+202   clock_gettime(-6, {tv_sec=0, tv_nsec=2}) = 0
+202   clock_getres(0x3, {tv_sec=0, tv_nsec=1}) = 0
+202   pipe2([3, 4], 0x80000)            = 0
 202   mremap(0x7f0000, 4096, 8192, 0x1) = 0x7f1000
 202   madvise(0x7f1000, 4096, 0x4)      = 0
 202   memfd_create("jit", 0x1)          = 5
@@ -936,8 +943,9 @@ def _m9_script_workloads() -> set[str]:
 def test_m9_census_parses(tmp_path):
     """M9 census (#451): strace traces of socket/epoll/eventfd/timerfd and
     runtime syscalls parse into a deterministic TOML recording families, types,
-    protocols, sockopt levels/names, epoll ops/events, flags and ioctls; when
-    the generated tests/linux/m9-census.toml is present, it is validated too."""
+    protocols, sockopt option pairs, epoll ops/events, flags and ioctls, and
+    the checked-in tests/linux/m9-census.toml validates against X86_64, the
+    workload script and the pinned image."""
     (tmp_path / "net-bench.strace").write_text(M9_TRACE_NET)
     (tmp_path / "python-asyncio.strace").write_text(M9_TRACE_RUNTIME)
     _write_meta(tmp_path)
@@ -961,12 +969,10 @@ def test_m9_census_parses(tmp_path):
         "protocol": ["0"],
         "type": ["0x80801"],
     }
-    assert data["syscalls"]["setsockopt"]["args"] == {
-        "level": ["1", "6", "41"],
-        "optname": ["1", "2", "26"],
-    }
-    assert data["syscalls"]["getsockopt"]["args"] == {"level": ["1"], "optname": ["4"]}
-    assert data["syscalls"]["ioctl"]["args"] == {"request": ["0x8912", "0x8913"]}
+    # sockopt pairs sorted numerically by (level, optname): 1:2 before 1:15.
+    assert data["syscalls"]["setsockopt"]["args"] == {"option": ["1:2", "1:15", "6:1", "41:26"]}
+    assert data["syscalls"]["getsockopt"]["args"] == {"option": ["1:4"]}
+    assert data["syscalls"]["ioctl"]["args"] == {"request": ["0x8906", "0x8912", "0x8913"]}
     assert data["syscalls"]["epoll_ctl"]["args"] == {
         "events": ["0x5", "0x80000001"],
         "op": ["0x1", "0x2", "0x3"],
@@ -980,6 +986,13 @@ def test_m9_census_parses(tmp_path):
     assert data["syscalls"]["timerfd_create"]["args"] == {"clock": ["1"], "flags": ["0x80800"]}
     assert data["syscalls"]["connect"]["errors"] == {"EINPROGRESS": 1}
     assert data["syscalls"]["recvfrom"]["errors"] == {"EAGAIN": 1}
+
+    # EPOLL_CTL_DEL skips bare-address pointers, but a malformed decoded struct
+    # or an undecoded pointer on EPOLL_CTL_ADD still raises CensusError.
+    with pytest.raises(CensusError, match="epoll_ctl: no events= in argument 3"):
+        key_values(Call("epoll_ctl", ["12", "0x2", "9", "{data=0x1}"], "0", None))
+    with pytest.raises(CensusError, match="epoll_ctl: no events= in argument 3"):
+        key_values(Call("epoll_ctl", ["12", "0x1", "9", "0x7ffe12340000"], "0", None))
 
     # Determinism: meta keys and trace insertion order do not change output.
     seen_rev = census(
@@ -996,6 +1009,8 @@ def test_m9_census_parses(tmp_path):
         "alpine": "3.21.10",
     }
     assert render_toml(meta_rev, seen_rev, milestone="M9") == toml_a
+    with pytest.raises(CensusError, match="unknown milestone"):
+        render_toml(meta_rev, seen_rev, milestone="M10")  # type: ignore[arg-type]
 
     # The M9 workload script declares all expected gate workloads.
     assert _m9_script_workloads() == {
@@ -1013,27 +1028,29 @@ def test_m9_census_parses(tmp_path):
         "ruby-http",
     }
 
-    # Once the CI workflow artifact is checked in, validate the real file too.
-    if M9_CENSUS.exists():
-        real = tomllib.loads(M9_CENSUS.read_text())
-        meta = real["meta"]
-        assert meta["alpine"].startswith("3.21.")
-        pin = re.search(r"^IMAGE=(\S+)$", CENSUS_SH.read_text(), re.MULTILINE)
-        assert pin and meta["image"] == pin.group(1)
-        assert meta["kernel"] and meta["packages"]
-        assert set(meta["workloads"]) == _m9_script_workloads()
-        real_names = list(real["syscalls"])
-        assert real_names == sorted(real_names, key=X86_64.__getitem__)
-        for name, entry in real["syscalls"].items():
-            assert entry["nr"] == X86_64[name], name
-            assert entry["calls"] > 0, name
-            assert set(entry["workloads"]) <= set(meta["workloads"]), name
+    # Validate the checked-in tests/linux/m9-census.toml from the workflow run.
+    assert M9_CENSUS.exists(), "tests/linux/m9-census.toml missing"
+    m9_text = M9_CENSUS.read_text()
+    assert m9_text.splitlines()[0].startswith("# The M9 syscall census (#451)")
+    real = tomllib.loads(m9_text)
+    meta = real["meta"]
+    assert meta["alpine"].startswith("3.21.")
+    pin = re.search(r"^IMAGE=(\S+)$", CENSUS_SH.read_text(), re.MULTILINE)
+    assert pin and meta["image"] == pin.group(1)
+    assert meta["kernel"] and meta["packages"]
+    assert set(meta["workloads"]) == _m9_script_workloads()
+    real_names = list(real["syscalls"])
+    assert real_names == sorted(real_names, key=X86_64.__getitem__)
+    for name, entry in real["syscalls"].items():
+        assert entry["nr"] == X86_64[name], name
+        assert entry["calls"] > 0, name
+        assert set(entry["workloads"]) <= set(meta["workloads"]), name
 
 
 def test_m9_report_lists_m10_rows_the_gate_needs(tmp_path, capsys):
     """M9 census report (#451): compares the census against M6-M8 kernel tables
-    and ROADMAP's M9/M10 lists, surfacing M10 rows needed by the M9 gate, M8
-    ENOSYS_BY_DECISION calls (incl. CPU-time clocks), unplanned calls, and the
+    and ROADMAP's M9/M10 lists, surfacing M10 rows, M8 ENOSYS_BY_DECISION calls
+    (syscall count only), CPU-time clocks separately, unplanned calls, and the
     #450 design probes."""
     (tmp_path / "net-bench.strace").write_text(M9_TRACE_NET)
     (tmp_path / "ruby-fiber.strace").write_text(M9_TRACE_RUNTIME)
@@ -1059,66 +1076,83 @@ def test_m9_report_lists_m10_rows_the_gate_needs(tmp_path, capsys):
     out = capsys.readouterr().out
     sections = {s.splitlines()[0]: s for s in out.split("\n\n")}
 
-    # Priority section order.
+    # Priority section order (ENOSYS header counts syscalls only; CPU-time clocks separate).
     order = [
         "unplanned (2):",
-        "M10 rows needed by M9 gate (3):",
-        "M8 ENOSYS_BY_DECISION seen in M9 gate (5):",
+        "M10 rows seen in the M9 census (3):",
+        "M8 ENOSYS_BY_DECISION seen in the M9 census (4):",
+        "CPU-time clocks seen in the M9 census (2):",
         "M9 planned (25):",
-        "M6-M8 tables (3):",
+        "M6-M8 tables (5):",
         "M9 design probes (#450):",
     ]
     positions = [out.index(header) for header in order]
     assert positions == sorted(positions)
 
-    # M10 rows needed by the gate: exactly the three present in the trace.
-    m10 = sections["M10 rows needed by M9 gate (3):"]
+    # M10 rows seen in the census: exactly the three present in the trace.
+    m10 = sections["M10 rows seen in the M9 census (3):"]
     for name in ("mremap", "madvise", "memfd_create"):
         assert re.search(rf"^ +\d+ {name} ", m10, re.MULTILINE), m10
     assert "io_uring_setup" not in m10
     assert " read " not in m10
 
-    # M8 ENOSYS_BY_DECISION rows + CPU-time clocks from clock_gettime.
-    enosys = sections["M8 ENOSYS_BY_DECISION seen in M9 gate (5):"]
+    # M8 ENOSYS_BY_DECISION rows (4 syscalls only); CPU-time clocks on their own block.
+    enosys = sections["M8 ENOSYS_BY_DECISION seen in the M9 census (4):"]
     for name in ("sendfile", "times", "signalfd4", "clone3"):
         assert re.search(rf"^ +\d+ {name} ", enosys, re.MULTILINE), enosys
-    assert "CPU-time clocks on clock_gettime: 2, 3 (ruby-fiber)" in enosys
+    assert "CPU-time" not in enosys
+
+    clocks_sec = sections["CPU-time clocks seen in the M9 census (2):"]
+    assert "  clock_gettime: -6, 2, 3 (ruby-fiber)" in clocks_sec
+    assert "  clock_getres: 3 (ruby-fiber)" in clocks_sec
 
     # Unplanned: sendmmsg and recvmmsg (not in M6-M8, M9, M10 or ENOSYS_BY_DECISION).
     unplanned = sections["unplanned (2):"]
     assert "recvmmsg" in unplanned and "sendmmsg" in unplanned
 
-    # M6-M8 already-implemented calls (read, ioctl, clock_gettime).
-    m6_m8 = sections["M6-M8 tables (3):"]
-    for name in ("read", "ioctl", "clock_gettime"):
+    # M6-M8 tables include M6/M7 (read, ioctl, clock_gettime) and M8-only (clock_getres, pipe2).
+    m6_m8 = sections["M6-M8 tables (5):"]
+    for name in ("read", "ioctl", "clock_gettime", "clock_getres", "pipe2"):
         assert re.search(rf"^ +\d+ {name} ", m6_m8, re.MULTILINE), m6_m8
 
-    # Design probes for #450.
+    # Design probes for #450 (0x8906 SIOCGSTAMP excluded from 0x8910-0x893f).
     probes = sections["M9 design probes (#450):"]
-    assert "AF_NETLINK (domain 16): seen (net-bench)" in probes
-    assert "AF_PACKET (domain 17): seen (net-bench)" in probes
-    assert "SIOCGIF* ioctls: 0x8912, 0x8913" in probes
+    assert "  AF_NETLINK (domain 16): seen\n" in probes
+    assert "  AF_PACKET (domain 17): seen\n" in probes
+    assert "  SIOC*IF* ioctls (0x8910–0x893f): 0x8912, 0x8913\n" in probes
+    assert "0x8906" not in probes
     assert "accept: 1 calls (net-bench); accept4: 1 calls (net-bench)" in probes
     assert "sendmmsg: 1 calls (net-bench); recvmmsg: 1 calls (net-bench)" in probes
     assert "epoll_pwait2: 1 calls (net-bench)" in probes
     assert "sendfile: 1 calls (ruby-fiber)" in probes
-    assert "CPU-time clocks: clock_gettime=2,3" in probes
+    assert "CPU-time clocks: clock_gettime=-6,2,3; clock_getres=3" in probes
+
+    # Default --census for --milestone M9 reads tests/linux/m9-census.toml.
+    assert syscalls.main(["report", "--milestone", "M9"]) == 0
+    default_out = capsys.readouterr().out
+    m9_count = len(tomllib.loads(M9_CENSUS.read_text())["syscalls"])
+    assert default_out.startswith("M9 census of ")
+    assert f": {m9_count} syscalls." in default_out
 
     # Contrast: a trace with no M10, no ENOSYS_BY_DECISION, no unplanned, and
-    # only CLOCK_MONOTONIC reports none of those sections and `none` for probes.
+    # only CLOCK_MONOTONIC reports none of those sections and honest probe wording.
     clean_dir = tmp_path / "clean"
     clean_dir.mkdir()
     (clean_dir / "curl.strace").write_text(
-        "10    socket(0x2, 0x80801, 0x6) = 3\n10    clock_gettime(0x1, {tv_sec=1, tv_nsec=0}) = 0\n"
+        "10    socket(0x2, 0x80801, 0x6) = 3\n"
+        "10    ioctl(3, 0x8906, 0x7ffe0000) = 0\n"
+        "10    clock_gettime(0x1, {tv_sec=1, tv_nsec=0}) = 0\n"
     )
     _write_meta(clean_dir)
     clean_data = tomllib.loads(syscalls.build(clean_dir, clean_dir, milestone="M9"))
     tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
     clean_out = syscalls.report_m9(clean_data, tables)
-    assert "M10 rows needed by M9 gate" not in clean_out
-    assert "M8 ENOSYS_BY_DECISION seen in M9 gate" not in clean_out
+    assert "M10 rows seen in the M9 census" not in clean_out
+    assert "M8 ENOSYS_BY_DECISION seen in the M9 census" not in clean_out
+    assert "CPU-time clocks seen in the M9 census" not in clean_out
     assert "unplanned (" not in clean_out
-    assert "AF_NETLINK (domain 16): none" in clean_out
-    assert "AF_PACKET (domain 17): none" in clean_out
-    assert "SIOCGIF* ioctls: none" in clean_out
+    not_seen = "not seen (no workload runs udhcpc, getifaddrs or if_nameindex)"
+    assert f"AF_NETLINK (domain 16): {not_seen}" in clean_out
+    assert f"AF_PACKET (domain 17): {not_seen}" in clean_out
+    assert f"SIOC*IF* ioctls (0x8910–0x893f): {not_seen}" in clean_out
     assert "CPU-time clocks: none" in clean_out

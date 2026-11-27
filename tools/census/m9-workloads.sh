@@ -43,21 +43,21 @@ grep -q 'execve(' "$W/sanity.strace" || {
     exit 1
 }
 
-# Test CA + localhost server cert (SAN: localhost, 127.0.0.1, ::1).
+# Test CA + census.test server cert (SAN: census.test, localhost, 127.0.0.1, ::1).
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -keyout "$W/ca/ca.key" -out "$W/ca/ca.crt" \
     -subj "/CN=Lumen Census CA" \
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
 cat >"$W/ca/server.ext" <<'EXT'
-subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1
+subjectAltName=DNS:census.test,DNS:localhost,IP:127.0.0.1,IP:::1
 basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
 EXT
 openssl req -newkey rsa:2048 -nodes \
     -keyout "$W/ca/server.key" -out "$W/ca/server.csr" \
-    -subj "/CN=localhost" 2>/dev/null
+    -subj "/CN=census.test" 2>/dev/null
 openssl x509 -req -days 1 \
     -in "$W/ca/server.csr" -CA "$W/ca/ca.crt" -CAkey "$W/ca/ca.key" \
     -CAcreateserial -out "$W/ca/server.crt" -extfile "$W/ca/server.ext" 2>/dev/null
@@ -72,11 +72,12 @@ apk fetch -q -o "$W/srv/mirror/x86_64" patch
 apk index -q -o "$W/srv/mirror/x86_64/APKINDEX.tar.gz" "$W/srv/mirror/x86_64"/*.apk
 printf 'hello from census\n' >"$W/srv/hello.txt"
 
-# Start local HTTPS + HTTP server outside strace; wait for bound ports.
+# Start local HTTPS + HTTP + DNS (127.0.0.1:53) server outside strace; wait for bound ports.
 python3 /census/local_server.py \
     --root "$W/srv" \
     --cert "$W/ca/server.crt" \
     --key "$W/ca/server.key" \
+    --dns-port 53 \
     --ports-file "$W/ports.env" &
 SRV_PID=$!
 trap 'kill "$SRV_PID" 2>/dev/null || true' EXIT
@@ -93,14 +94,18 @@ done
 # shellcheck source=/dev/null
 . "$W/ports.env"
 
-# 1. apk: `apk add` from our local HTTPS mirror (TLS verified against the test CA).
-printf 'https://localhost:%s/mirror\n' "$HTTPS_PORT" >"$W/repos"
+# Point the container resolver at our local DNS responder so `census.test`
+# resolves over UDP/TCP port 53 rather than `/etc/hosts`.
+printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
+
+# 1. apk: `apk add` from our local HTTPS mirror (DNS + TLS verified against test CA).
+printf 'https://census.test:%s/mirror\n' "$HTTPS_PORT" >"$W/repos"
 trace apk apk add --no-cache --allow-untrusted --repositories-file "$W/repos" patch >/dev/null
 test -x /usr/bin/patch
 
 # 2. curl: `curl https://` against our local server with the test CA.
 trace curl curl -fsS --cacert "$W/ca/ca.crt" -o "$W/curl.out" \
-    "https://localhost:$HTTPS_PORT/hello.txt"
+    "https://census.test:$HTTPS_PORT/hello.txt"
 test "$(cat "$W/curl.out")" = "hello from census"
 
 # 3. python3 asyncio: TCP echo server and 3 concurrent clients on loopback.
@@ -211,8 +216,8 @@ http_res = Net::HTTP.get_response(URI(ENV.fetch("HTTP_URL")))
 raise "bad http status #{http_res.code}" unless http_res.code == "200"
 raise "bad http body #{http_res.body.inspect}" unless http_res.body.strip == "hello from census"
 RB
-HTTPS_URL="https://localhost:$HTTPS_PORT/hello.txt" \
-HTTP_URL="http://127.0.0.1:$HTTP_PORT/hello.txt" \
+HTTPS_URL="https://census.test:$HTTPS_PORT/hello.txt" \
+HTTP_URL="http://census.test:$HTTP_PORT/hello.txt" \
 CA_CERT="$W/ca/ca.crt" \
     trace ruby-http ruby "$W/rb_http.rb"
 
@@ -266,10 +271,10 @@ trace ruby-gem sh -c "
     GEM_PATH='$W/gems' ruby -rcensus_ext -e 'raise unless CensusExt.add(20, 22) == 42'
 "
 
-# 9. busybox wget (HTTP + HTTPS against local server).
+# 9. busybox wget (HTTP + HTTPS against local server via DNS).
 trace busybox-wget sh -c "
-    /bin/busybox wget -qO '$W/wget-http.out' 'http://127.0.0.1:$HTTP_PORT/hello.txt' &&
-    /bin/busybox wget -qO '$W/wget-https.out' 'https://localhost:$HTTPS_PORT/hello.txt'
+    /bin/busybox wget -qO '$W/wget-http.out' 'http://census.test:$HTTP_PORT/hello.txt' &&
+    /bin/busybox wget -qO '$W/wget-https.out' 'https://census.test:$HTTPS_PORT/hello.txt'
 "
 test "$(cat "$W/wget-http.out")" = "hello from census"
 test "$(cat "$W/wget-https.out")" = "hello from census"
@@ -283,12 +288,13 @@ trace busybox-nc sh -c "
     i=0
     while ! /bin/busybox nc -w 2 127.0.0.1 '$NC_PORT' <'$W/nc-client.in' >'$W/nc-client.out' 2>/dev/null; do
         i=\$((i + 1))
-        test \$i -lt 50
+        test \$i -lt 50 || { echo 'census(m9): busybox-nc client never connected' >&2; exit 1; }
         sleep 0.05
     done
     wait \$srv
 "
 grep -q 'ping-nc' "$W/nc-server.out"
+grep -q 'pong-nc' "$W/nc-client.out"
 
 # 11. busybox ping: two ICMP echo packets to loopback.
 trace busybox-ping /bin/busybox ping -c 2 -W 2 127.0.0.1 >/dev/null
@@ -297,11 +303,22 @@ trace busybox-ping /bin/busybox ping -c 2 -W 2 127.0.0.1 >/dev/null
 gcc -O2 -Wall -Wextra -Werror -o "$W/m9_net_bench" /census/m9_net_bench.c
 trace net-bench "$W/m9_net_bench"
 
-# Record any /proc/net/* opens seen in raw traces for #450.
-if grep -Hn '"/proc/net' "$OUT"/*.strace >"$OUT/m9-proc-net.txt" 2>/dev/null; then
-    :
-else
+# Verify DNS queries went over UDP to 127.0.0.1:53 (no silent /etc/hosts fallback).
+# Under `strace -X raw`, port 53 (0x0035) is printed as `sin_port="\x00\x35"`.
+grep -Eq '(sendto|sendmsg)\(.*sin_port=("\\x00\\x35"|htons\(53\))' \
+    "$OUT/apk.strace" "$OUT/curl.strace" "$OUT/busybox-wget.strace" "$OUT/ruby-http.strace" || {
+    echo "census(m9): no UDP sendto/sendmsg to port 53 in traces (DNS not exercised)" >&2
+    exit 1
+}
+
+# Record any /proc/net/* or /proc/<pid|self>/net/* opens seen in raw traces for #450.
+rc=0
+grep -EHn '"/proc/(net|(self|[0-9]+)/net)(/|")' "$OUT"/*.strace >"$OUT/m9-proc-net.txt" || rc=$?
+if [ "$rc" -eq 1 ]; then
     printf 'none\n' >"$OUT/m9-proc-net.txt"
+elif [ "$rc" -ne 0 ]; then
+    echo "census(m9): /proc/net grep failed (exit $rc)" >&2
+    exit "$rc"
 fi
 
 python3 /harness/syscalls.py build --milestone M9 --traces "$OUT" --meta "$OUT" -o "$OUT/m9-census.toml"
