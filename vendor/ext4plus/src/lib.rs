@@ -841,11 +841,13 @@ impl Ext4 {
 
             if free_blocks >= num_blocks.get() {
                 let block_bitmap_handle = self.get_block_bitmap_handle(bg_id);
+                // Lumen (#350): both searches use the same group boundary.
+                let blocks_in_group = self.blocks_in_group(bg_id);
                 let Some(block_num) = block_bitmap_handle
                     .find_first_n(
                         num_blocks.into(),
                         false,
-                        ..self.blocks_in_group(bg_id),
+                        ..blocks_in_group,
                         self,
                     )
                     .await?
@@ -855,11 +857,7 @@ impl Ext4 {
                     // positive count regardless of n.
                     if num_blocks.get() == 1
                         || block_bitmap_handle
-                            .find_first(
-                                false,
-                                ..self.blocks_in_group(bg_id),
-                                self,
-                            )
+                            .find_first(false, ..blocks_in_group, self)
                             .await?
                             .is_none()
                     {
