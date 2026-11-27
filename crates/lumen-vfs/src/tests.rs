@@ -1488,17 +1488,17 @@ fn fd_table_capacity_dup_and_opath_matrix() {
     // 22. FdTable 1024 slots & F_DUPFD / F_DUPFD_CLOEXEC
     let mut fds = FdTable::new();
     for i in 0..MAX_FDS {
-        let fd = fds.alloc(Arc::clone(&of_rw), i % 2 == 0).unwrap();
+        let fd = fds.alloc_below(MAX_FDS, Arc::clone(&of_rw), i % 2 == 0).unwrap();
         assert_eq!(fd, i as i32);
     }
     assert_eq!(fds.open_count(), MAX_FDS);
-    assert_eq!(fds.alloc(Arc::clone(&of_rw), false).unwrap_err(), VfsError::MFile);
-    assert_eq!(fds.alloc_from(-1, Arc::clone(&of_rw), false).unwrap_err(), VfsError::Inval);
-    assert_eq!(fds.alloc_from(MAX_FDS as i32, Arc::clone(&of_rw), false).unwrap_err(), VfsError::Inval);
+    assert_eq!(fds.alloc_below(MAX_FDS, Arc::clone(&of_rw), false).unwrap_err(), VfsError::MFile);
+    assert_eq!(fds.alloc_from_below(-1, MAX_FDS, Arc::clone(&of_rw), false).unwrap_err(), VfsError::Inval);
+    assert_eq!(fds.alloc_from_below(MAX_FDS as i32, MAX_FDS, Arc::clone(&of_rw), false).unwrap_err(), VfsError::Inval);
 
     let removed = fds.remove(500).unwrap();
     assert_eq!(removed.file.id, of_rw.id);
-    let dup = fds.alloc_from(400, Arc::clone(&of_rw), true).unwrap();
+    let dup = fds.alloc_from_below(400, MAX_FDS, Arc::clone(&of_rw), true).unwrap();
     assert_eq!(dup, 500);
     assert!(fds.get_cloexec(500).unwrap());
     fds.set_cloexec(500, false).unwrap();

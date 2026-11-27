@@ -105,9 +105,6 @@ const IO_CHUNK: usize = 512;
 /// monopolize a CPU indefinitely.
 pub(crate) const MAX_SINGLE_IO: usize = 1024 * 1024;
 
-/// Default open-file rlimit advertised by M6 `prlimit64`.
-const DEFAULT_RLIMIT_NOFILE: u64 = 1024;
-
 /// Raw Linux x86-64 `struct iovec` layout (16 bytes, zero padding).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

@@ -480,7 +480,7 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     let path = UserPath::copy_in(path, false)?;
     // Linux takes the slot right after copying the path in: a full table
     // refuses before the dirfd is looked at or anything is opened or created.
-    let slot = process::reserve_current_fd(0).map_err(vfs)?;
+    let slot = process::reserve_current_fd().map_err(vfs)?;
     let start = at::start_dir(dirfd, &path)?;
     // `O_TRUNC` without `O_PATH` truncates a regular file (`O_PATH` opens
     // without truncating).

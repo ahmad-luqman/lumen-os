@@ -103,7 +103,9 @@ fn execve(path: UserPtr, argv: UserPtr, envp: UserPtr) -> Result<crate::mm::user
     let path = super::at::UserPath::copy_in(path, false)?;
     let file = open_exec(path.as_bytes()).map_err(|e| e.to_errno())?;
     current_process().check_exec()?;
-    let stack = lumen_vm::StackSize::from_rlimit(current_process().stack_limit(None).soft());
+    let stack = lumen_vm::StackSize::from_rlimit(
+        current_process().rlimit(process::RlimitKind::Stack, None).expect("rlimit read").soft(),
+    );
     let (argv, envp, mut budget) = copy_exec_args(path.as_bytes(), argv.addr(), envp.addr(), stack.arg_limit())?;
     let (file, argv) = follow_scripts(file, path.as_bytes(), argv, &mut budget)?;
     let (prepared, program) = prepare_exec(file, argv, envp, path.as_bytes(), stack)?;

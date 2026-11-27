@@ -178,3 +178,73 @@ fn not_thread_names_both_numbers() {
     let text = alloc::format!("{}", Bug::NotThread { pid: 4, tid: 9 });
     assert_eq!(text, "9 isn't a thread 4 added");
 }
+
+#[test]
+fn nproc_task_count_tracks_processes_threads_and_zombies_without_init() {
+    use super::{exit_full, reaped, wait4, waitid};
+    use crate::{ExitStatus, P_PID, Report, WEXITED, WNOWAIT, WaitReady};
+
+    let mut t = ProcTree::new(1000);
+    assert_eq!(t.nproc_task_count(), 0);
+    assert!(!t.allows_new_task(0));
+    assert!(t.allows_new_task(1));
+
+    // Pid 1 (init) is kernel-owned and excluded from NPROC accounting.
+    t.spawn_init(slot(0)).unwrap();
+    assert_eq!(t.nproc_task_count(), 0);
+    assert!(!t.allows_new_task(0));
+    assert!(t.allows_new_task(1));
+
+    // Root process counts as 1 task.
+    let root = t.spawn_root(slot(0)).unwrap();
+    assert_eq!(t.nproc_task_count(), 1);
+    assert!(!t.allows_new_task(0));
+    assert!(!t.allows_new_task(1));
+    assert!(t.allows_new_task(2));
+    assert!(t.allows_new_task(u64::MAX));
+
+    // Forked child and non-leader threads each add 1.
+    let child = fork(&mut t, root);
+    assert_eq!(t.nproc_task_count(), 2);
+    assert!(!t.allows_new_task(2));
+    assert!(t.allows_new_task(3));
+
+    let tid1 = t.add_thread(root).unwrap();
+    let tid2 = t.add_thread(child).unwrap();
+    assert_eq!(t.nproc_task_count(), 4);
+    assert!(!t.allows_new_task(4));
+    assert!(t.allows_new_task(5));
+
+    // Removing a non-leader thread drops the count immediately.
+    t.remove_thread(root, tid1).unwrap();
+    assert_eq!(t.nproc_task_count(), 3);
+
+    // Exiting child frees its extra thread, but the unreaped zombie still counts as 1.
+    let _ = exit(&mut t, child, 0);
+    assert_eq!(t.nproc_task_count(), 2);
+    assert!(!t.allows_new_task(2));
+    assert!(t.allows_new_task(3));
+    assert!(!t.is_busy(tid2));
+
+    // WNOWAIT peeks without reaping, so the count stays 2.
+    assert!(matches!(
+        waitid(&mut t, root, P_PID, child as i32, WEXITED | WNOWAIT),
+        Ok(WaitReady::Reported(Report::Zombie { .. }))
+    ));
+    assert_eq!(t.nproc_task_count(), 2);
+
+    // Reaping removes the zombie and frees its slot.
+    assert_eq!(wait4(&mut t, root, child as i32, 0), reaped(child, 0));
+    assert_eq!(t.nproc_task_count(), 1);
+    assert!(t.allows_new_task(2));
+
+    // An autoreaped child drops immediately on exit.
+    let auto = fork(&mut t, root);
+    assert_eq!(t.nproc_task_count(), 2);
+    let _ = exit_full(&mut t, auto, ExitStatus::exited(0), Some(INIT), &[root]);
+    assert_eq!(t.nproc_task_count(), 1);
+
+    // Exiting the root removes it immediately (no parent).
+    let _ = exit_full(&mut t, root, ExitStatus::exited(0), Some(INIT), &[]);
+    assert_eq!(t.nproc_task_count(), 0);
+}

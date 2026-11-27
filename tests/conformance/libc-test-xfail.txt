@@ -53,7 +53,3 @@ src/functional/pthread_robust-static.exe # robust mutex test also requests unsup
 src/functional/pthread_robust.exe # robust mutex test also requests unsupported PI futexes #397
 src/functional/socket-static.exe # BSD UDP and TCP sockets remain ENOSYS until M9 #434
 src/functional/socket.exe # BSD UDP and TCP sockets remain ENOSYS until M9 #434
-src/regression/pthread_atfork-errno-clobber-static.exe # RLIMIT_NPROC writes are ignored until M10, so fork succeeds #435
-src/regression/pthread_atfork-errno-clobber.exe # RLIMIT_NPROC writes are ignored until M10, so fork succeeds #435
-src/regression/rlimit-open-files-static.exe # RLIMIT_NOFILE writes are ignored until M10; the limit stays 1024 #435
-src/regression/rlimit-open-files.exe # RLIMIT_NOFILE writes are ignored until M10; the limit stays 1024 #435

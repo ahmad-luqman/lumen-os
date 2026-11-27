@@ -122,8 +122,8 @@ impl Files {
         f(&mut self.table.lock().fds)
     }
 
-    fn reserve(self: &Arc<Self>, lease: FilesLease, from: i32) -> Result<ReservedFd, VfsError> {
-        let reservation = self.table.lock().fds.reserve(from)?;
+    fn reserve(self: &Arc<Self>, lease: FilesLease, limit: usize) -> Result<ReservedFd, VfsError> {
+        let reservation = self.table.lock().fds.reserve_below(limit)?;
         Ok(ReservedFd { files: Arc::clone(self), _lease: lease, reservation: Some(reservation) })
     }
 
@@ -224,11 +224,13 @@ impl Drop for Files {
 }
 
 impl Process {
-    /// Reserve in this process's table while its owned lease prevents replacement.
-    pub(super) fn reserve_fd(self: Arc<Self>, from: i32) -> Result<ReservedFd, VfsError> {
+    /// Reserve the lowest free slot below this process's soft `RLIMIT_NOFILE`
+    /// while its owned lease prevents table replacement (`EMFILE` if none is free).
+    pub(super) fn reserve_fd(self: Arc<Self>) -> Result<ReservedFd, VfsError> {
         let lease = FilesLease::read(self);
+        let limit = lease.owner.nofile_soft();
         let files = lease.owner.files.lock().clone().expect("a running process has its descriptors");
-        files.reserve(lease, from)
+        files.reserve(lease, limit)
     }
 }
 
