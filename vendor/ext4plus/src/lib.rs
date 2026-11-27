@@ -550,25 +550,58 @@ impl Ext4 {
         bitmap_handle.query(block_offset, self).await
     }
 
+    // Lumen (#350): notify before returning corruption. The unused
+    // try_alloc_contiguous_blocks still discards errors; the hook lets a
+    // volume stop writeback even if such a caller hides the result.
+    fn allocation_bitmap_error(
+        &self,
+        group: BlockGroupIndex,
+        inode: bool,
+    ) -> Ext4Error {
+        let error = Ext4Error::from(CorruptKind::AllocationBitmapMismatch {
+            group,
+            inode,
+        });
+        if let (Some(writer), Ext4Error::Corrupt(corruption)) =
+            (&self.0.writer, &error)
+        {
+            writer.on_allocation_corruption(corruption);
+        }
+        error
+    }
+
+    // Lumen (#350): a bounded wrap from first; a bitmap miss either fails
+    // or moves on, never visiting a group twice.
+    fn groups_from(
+        &self,
+        first: BlockGroupIndex,
+    ) -> impl Iterator<Item = BlockGroupIndex> {
+        let count = self.0.superblock.num_block_groups();
+        let first = first.min(count);
+        (first..count).chain(0..first)
+    }
+
+    // Lumen (#350): padding is never allocatable, including the final
+    // group's partial tail. Group ids come from groups_from.
+    fn blocks_in_group(&self, group: BlockGroupIndex) -> u32 {
+        let per_group = self.0.superblock.blocks_per_group().get();
+        let first = u64::from(group) * u64::from(per_group)
+            + u64::from(self.0.superblock.first_data_block());
+        u32::try_from(
+            u64::from(per_group)
+                .min(self.0.superblock.blocks_count().saturating_sub(first)),
+        )
+        .unwrap()
+    }
+
     #[maybe_async::maybe_async]
     pub(crate) async fn alloc_inode(
         &self,
         inode_type: FileType,
     ) -> Result<InodeIndex, Ext4Error> {
-        let mut bg_id = 0;
-        let mut bg_count = self.0.superblock.num_block_groups();
-        let mut rewind = false;
-        while bg_id <= bg_count {
-            if bg_id == bg_count {
-                if rewind {
-                    break;
-                }
-                bg_count = bg_id;
-                bg_id = 0;
-                rewind = true;
-                continue;
-            }
-
+        // Lumen (#350): inode searches start at zero and visit each
+        // group at most once; a bitmap miss fails rather than retrying.
+        for bg_id in 0..self.0.superblock.num_block_groups() {
             let bg = self.get_block_group_descriptor(bg_id);
 
             let free_inodes = bg.free_inodes_count();
@@ -584,7 +617,9 @@ impl Ext4 {
                     )
                     .await?
                 else {
-                    continue;
+                    // Lumen (#350): a positive count with no free bit is
+                    // corruption, not exhaustion. Fail before allocating.
+                    return Err(self.allocation_bitmap_error(bg_id, true));
                 };
                 inode_bitmap_handle.set(inode_num, true, self).await?;
                 self.update_inode_bitmap_checksum(bg_id, inode_bitmap_handle)
@@ -649,9 +684,6 @@ impl Ext4 {
                 )
                 .unwrap());
             }
-
-            // Will never overflow
-            bg_id = bg_id.saturating_add(1);
         }
         Err(Ext4Error::NoSpace)
     }
@@ -744,21 +776,10 @@ impl Ext4 {
         &self,
         inode_index: InodeIndex,
     ) -> Result<FsBlockIndex, Ext4Error> {
-        let mut bg_id = (inode_index.get() - 1)
+        let bg_id = (inode_index.get() - 1)
             / self.0.superblock.inodes_per_block_group();
-        let mut bg_count = self.0.superblock.num_block_groups();
-        let mut rewind = false;
-        while bg_id <= bg_count {
-            if bg_id == bg_count {
-                if rewind {
-                    break;
-                }
-                bg_count = bg_id;
-                bg_id = 0;
-                rewind = true;
-                continue;
-            }
-
+        // Lumen (#350): a miss fails or moves on within one bounded wrap.
+        for bg_id in self.groups_from(bg_id) {
             let bg = self.get_block_group_descriptor(bg_id);
 
             let free_blocks = bg.free_blocks_count();
@@ -767,10 +788,13 @@ impl Ext4 {
             // Done with guard to remove unwrap
             if let Some(free_blocks) = NonZeroU32::new(free_blocks) {
                 let block_bitmap_handle = self.get_block_bitmap_handle(bg_id);
-                let Some(block_num) =
-                    block_bitmap_handle.find_first(false, .., self).await?
+                let Some(block_num) = block_bitmap_handle
+                    .find_first(false, ..self.blocks_in_group(bg_id), self)
+                    .await?
                 else {
-                    continue;
+                    // Lumen (#350): a positive count with no free bit is
+                    // corruption, not exhaustion. Fail before allocating.
+                    return Err(self.allocation_bitmap_error(bg_id, false));
                 };
                 block_bitmap_handle.set(block_num, true, self).await?;
                 self.update_block_bitmap_checksum(bg_id, block_bitmap_handle)
@@ -796,9 +820,6 @@ impl Ext4 {
 
                 return Ok(block_index);
             }
-
-            // Will never overflow
-            bg_id = bg_id.saturating_add(1);
         }
         Err(Ext4Error::NoSpace)
     }
@@ -810,21 +831,10 @@ impl Ext4 {
         inode_index: InodeIndex,
         num_blocks: NonZeroU32,
     ) -> Result<FsBlockIndex, Ext4Error> {
-        let mut bg_id = (inode_index.get() - 1)
+        let bg_id = (inode_index.get() - 1)
             / self.0.superblock.inodes_per_block_group();
-        let mut bg_count = self.0.superblock.num_block_groups();
-        let mut rewind = false;
-        while bg_id <= bg_count {
-            if bg_id == bg_count {
-                if rewind {
-                    break;
-                }
-                bg_count = bg_id;
-                bg_id = 0;
-                rewind = true;
-                continue;
-            }
-
+        // Lumen (#350): a miss fails or moves on within one bounded wrap.
+        for bg_id in self.groups_from(bg_id) {
             let bg = self.get_block_group_descriptor(bg_id);
 
             let free_blocks = bg.free_blocks_count();
@@ -832,9 +842,29 @@ impl Ext4 {
             if free_blocks >= num_blocks.get() {
                 let block_bitmap_handle = self.get_block_bitmap_handle(bg_id);
                 let Some(block_num) = block_bitmap_handle
-                    .find_first_n(num_blocks.into(), false, .., self)
+                    .find_first_n(
+                        num_blocks.into(),
+                        false,
+                        ..self.blocks_in_group(bg_id),
+                        self,
+                    )
                     .await?
                 else {
+                    // Lumen (#350): with n > 1 a missing run may be
+                    // fragmentation. No free bit at all contradicts the
+                    // positive count regardless of n.
+                    if num_blocks.get() == 1
+                        || block_bitmap_handle
+                            .find_first(
+                                false,
+                                ..self.blocks_in_group(bg_id),
+                                self,
+                            )
+                            .await?
+                            .is_none()
+                    {
+                        return Err(self.allocation_bitmap_error(bg_id, false));
+                    }
                     continue;
                 };
                 for i in 0..num_blocks.get() {
@@ -864,7 +894,6 @@ impl Ext4 {
                 .ok_or(Ext4Error::NoSpace)?;
                 return Ok(block_index);
             }
-            bg_id = bg_id.saturating_add(1);
         }
         Err(Ext4Error::NoSpace)
     }
