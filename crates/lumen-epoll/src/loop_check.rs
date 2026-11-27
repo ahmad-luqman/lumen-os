@@ -1,7 +1,12 @@
-//! Nested-epoll cycle and depth check ([`LoopCheck`], Linux `fs/eventpoll.c`
-//! `ep_loop_check` and `EP_MAX_NESTS`).
+//! Nested-epoll cycle and depth check ([`LoopCheck`], Linux v6.17+
+//! `fs/eventpoll.c` `ep_loop_check` and `EP_MAX_NESTS`).
+//!
+//! Linux v6.17+ checks both downward and upward depth in `ep_loop_check`
+//! (`depth + 1 + upwards_depth > EP_MAX_NESTS`); older Linux kernels checked
+//! only downward from the target in `ep_loop_check_proc` and relied on
+//! `reverse_path_check` for upward paths.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use crate::Errno;
 
@@ -20,15 +25,20 @@ pub const EP_MAX_NESTS: usize = 4;
 /// Each edge `(parent, child)` records that epoll instance `parent` (`epfd`)
 /// watches epoll instance `child` (`fd`). Duplicate registrations of the same
 /// target epoll instance (for example via `dup`'d file descriptors) are
-/// reference-counted so removing one descriptor retains the edge until the
-/// last one is removed.
+/// reference-counted in `outgoing` so removing one descriptor retains the edge
+/// until the last one is removed.
+///
+/// B5 must keep a 1-to-1 pairing: one [`Self::add`] per successfully added
+/// epoll-target interest and one [`Self::remove`] per teardown (undoing
+/// [`Self::add`] with [`Self::remove`] if [`crate::EpollSet::add`] subsequently
+/// fails).
 ///
 /// Invariant: the graph is always acyclic and every directed path has length
 /// at most [`EP_MAX_NESTS`] edges.
 #[derive(Clone, Debug, Default)]
 pub struct LoopCheck<Id: Ord + Copy> {
     outgoing: BTreeMap<Id, BTreeMap<Id, usize>>,
-    incoming: BTreeMap<Id, BTreeMap<Id, usize>>,
+    incoming: BTreeMap<Id, BTreeSet<Id>>,
 }
 
 impl<Id: Ord + Copy> LoopCheck<Id> {
@@ -56,21 +66,16 @@ impl<Id: Ord + Copy> LoopCheck<Id> {
     /// adding `child` to `parent`.
     ///
     /// Returns [`Errno::Loop`] (leaving the graph unchanged) if the edge would:
-    /// - create a cycle (including a self-loop `parent == child`), or
-    /// - create any directed path longer than [`EP_MAX_NESTS`] edges, regardless
-    ///   of whether the chain is constructed top-down, bottom-up, or joined in
-    ///   the middle.
+    /// - create a cycle (including a self-loop `parent == child`; note that B5
+    ///   checks `epfd == fd` -> `EINVAL` before calling `LoopCheck`), or
+    /// - create any directed path longer than [`EP_MAX_NESTS`] edges, matching
+    ///   Linux v6.17+ `ep_loop_check` (`up + 1 + down > EP_MAX_NESTS`),
+    ///   regardless of insertion order.
     pub fn add(&mut self, parent: Id, child: Id) -> Result<(), Errno> {
         // An edge already present in the graph cannot introduce a cycle or
         // lengthen any path; just bump its reference count.
         if let Some(count) = self.outgoing.get_mut(&parent).and_then(|m| m.get_mut(&child)) {
             *count = count.checked_add(1).expect("epoll nesting edge refcount overflow");
-            let rev = self
-                .incoming
-                .get_mut(&child)
-                .and_then(|m| m.get_mut(&parent))
-                .expect("outgoing/incoming edge mismatch");
-            *rev += 1;
             return Ok(());
         }
 
@@ -93,7 +98,7 @@ impl<Id: Ord + Copy> LoopCheck<Id> {
         }
 
         self.outgoing.entry(parent).or_default().insert(child, 1);
-        self.incoming.entry(child).or_default().insert(parent, 1);
+        self.incoming.entry(child).or_default().insert(parent);
         Ok(())
     }
 
@@ -111,23 +116,12 @@ impl<Id: Ord + Copy> LoopCheck<Id> {
         };
         if *count > 1 {
             *count -= 1;
-            let rev = self
-                .incoming
-                .get_mut(&child)
-                .and_then(|m| m.get_mut(&parent))
-                .expect("outgoing/incoming edge mismatch");
-            *rev -= 1;
         } else {
             children.remove(&child);
             if children.is_empty() {
                 self.outgoing.remove(&parent);
             }
-            if let Some(parents) = self.incoming.get_mut(&child) {
-                parents.remove(&parent);
-                if parents.is_empty() {
-                    self.incoming.remove(&child);
-                }
-            }
+            self.detach_incoming(child, parent);
         }
         true
     }
@@ -137,22 +131,26 @@ impl<Id: Ord + Copy> LoopCheck<Id> {
     pub fn remove_set(&mut self, id: Id) {
         if let Some(children) = self.outgoing.remove(&id) {
             for child in children.into_keys() {
-                if let Some(parents) = self.incoming.get_mut(&child) {
-                    parents.remove(&id);
-                    if parents.is_empty() {
-                        self.incoming.remove(&child);
-                    }
-                }
+                self.detach_incoming(child, id);
             }
         }
         if let Some(parents) = self.incoming.remove(&id) {
-            for parent in parents.into_keys() {
+            for parent in parents {
                 if let Some(children) = self.outgoing.get_mut(&parent) {
                     children.remove(&id);
                     if children.is_empty() {
                         self.outgoing.remove(&parent);
                     }
                 }
+            }
+        }
+    }
+
+    fn detach_incoming(&mut self, child: Id, parent: Id) {
+        if let Some(parents) = self.incoming.get_mut(&child) {
+            parents.remove(&parent);
+            if parents.is_empty() {
+                self.incoming.remove(&child);
             }
         }
     }
@@ -165,14 +163,13 @@ impl<Id: Ord + Copy> LoopCheck<Id> {
             assert!(!children.is_empty(), "empty outgoing map");
             for (&c, &cnt) in children {
                 assert!(cnt > 0);
-                assert_eq!(self.incoming.get(&c).and_then(|m| m.get(&p)), Some(&cnt));
+                assert!(self.incoming.get(&c).is_some_and(|ps| ps.contains(&p)));
             }
         }
         for (&c, parents) in &self.incoming {
             assert!(!parents.is_empty(), "empty incoming map");
-            for (&p, &cnt) in parents {
-                assert!(cnt > 0);
-                assert_eq!(self.outgoing.get(&p).and_then(|m| m.get(&c)), Some(&cnt));
+            for &p in parents {
+                assert!(self.outgoing.get(&p).and_then(|m| m.get(&c)).is_some_and(|&cnt| cnt > 0));
             }
         }
     }
@@ -203,7 +200,7 @@ fn forward_scan<Id: Ord + Copy>(
 }
 
 fn backward_scan<Id: Ord + Copy>(
-    incoming: &BTreeMap<Id, BTreeMap<Id, usize>>,
+    incoming: &BTreeMap<Id, BTreeSet<Id>>,
     node: Id,
     memo: &mut BTreeMap<Id, usize>,
 ) -> usize {
@@ -212,8 +209,7 @@ fn backward_scan<Id: Ord + Copy>(
     }
     let mut best = 0usize;
     if let Some(parents) = incoming.get(&node) {
-        for (&parent, &count) in parents {
-            debug_assert!(count > 0);
+        for &parent in parents {
             let d = backward_scan(incoming, parent, memo);
             best = best.max(1 + d);
         }

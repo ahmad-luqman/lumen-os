@@ -686,15 +686,22 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `FaultedWrite`) (host-tested, incl. no allocation outside creation and
   `set_capacity`, `tests/zero_alloc.rs`).
 - `crates/lumen-epoll`: `epoll(7)` interest sets, ready lists and nested-set
-  loop checks as logic (M9, #455; ARCHITECTURE sections 9 and 10):
-  `EpollSet<K>` (`add`, `modify`, `remove`, zero-alloc `wake` and `collect`
-  over pre-allocated slab slots with intrusive ready-list links; LT tail
-  requeue with unprocessed-remainder splice-to-front fairness, ET drop,
-  `EPOLLONESHOT` disarm/re-arm, `EPOLLEXCLUSIVE` flag rules, implicit
-  `EPOLLERR`/`EPOLLHUP`, ignored `EPOLLWAKEUP`), `LoopCheck<Id>` (cycle and
-  `EP_MAX_NESTS` = 4 depth check with refcounted duplicate edges) and `Errno`
-  / `EPOLL*` constants from `linux-raw-sys` (host-tested, incl. randomized
-  models and `tests/zero_alloc.rs`).
+  loop checks as logic (M9, #455; ARCHITECTURE sections 9 and 10), split
+  across two locks: `EpollSet<K, T>` behind B5's sleep mutex (`ep->mtx`:
+  key-to-slot table, per-interest payload `T`, events, user `data`, slot
+  generations; `add` with fallible `try_reserve`/`Errno::NoMem` and
+  `ReadyQueue::prepare_grow` returning `Added { handle, watch_mask, growth }`,
+  zero-alloc `modify`, `remove` returning `(Handle, T)`, allocation-free
+  `remove_range` and `drain`), and `ReadyQueue` behind the level-10e leaf
+  spinlock (`ep->lock`: generational `Handle`-indexed intrusive ready list,
+  copied watch masks, `armed`/`in_scan`/`woke_during_scan` flags; zero-alloc
+  `wake -> Wake`, `set_mask`, `unlink`, `install(Storage) -> Storage` with
+  old storage dropped outside the spinlock, two-phase `begin_scan`/`Scan` +
+  `finish_scan` (`Event`) and non-consuming `finish_peek` for nested-epoll
+  `poll`, and `unreport` for copy-out rollback); plus `LoopCheck<Id>` (cycle
+  and Linux v6.17+ `EP_MAX_NESTS` = 4 bidirectional depth check with
+  refcounted edges) and `Errno`/`EPOLL*` constants from `linux-raw-sys`
+  (host-tested, incl. randomized models and `tests/zero_alloc.rs`).
 - `crates/lumen-tty`: a terminal line discipline as logic, after Linux's
   n_tty (M8, #340; ARCHITECTURE section 10): `LineDiscipline` (`receive`
   each input byte: canonical editing, echo, `ISIG`'s `JobSignal`; `read`
