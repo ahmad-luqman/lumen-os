@@ -8088,7 +8088,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `/proc/<pid>/maps` prints the raw bytes, a newline as `\012` (Linux's
     `seq_path`). Two exceptions stay text: mount paths
     (`VfsTables::mount`, `/proc/mounts`; only the kernel mounts, at `/`,
-    `/tmp`, `/dev` and `/proc`), and the paths a binary is loaded by
+    `/tmp`, `/dev`, `/dev/pts`, `/dev/shm` and `/proc`), and the paths a binary is loaded by
     (`Exec::from_path`, `ImageFile::path`, so an ELF image's maps lines,
     and `/proc/<pid>/exe`, read from `exe_path`): `linux /path` takes the
     shell's argument, and a `PT_INTERP` path that isn't UTF-8 is refused
@@ -8258,7 +8258,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `statx.stx_dev_{major,minor}`, and `/proc/self/maps` (`0:1` for root `ext4`
     or fallback `tmpfs`, `0:2` for `/tmp`, `0:3` for `/dev`, `0:4` for `/proc`;
     from M8, `0:5` for `/dev/pts` and `0:6` for the unmounted `pipefs`,
-    section 10), so `st_dev` is unique and cross-mount `rename`/`link` returns `-EXDEV`.
+    section 10; `0:7` for `/dev/shm`, #433; each a named `DevId` constant),
+    so `st_dev` is unique and cross-mount `rename`/`link` returns `-EXDEV`.
   - **`VfsTables<F: LockFamily>` (#264):** the three tables above, each
     behind its own lock (Lock 9, sub-order `MountTable -> DentryCache ->
     InodeCache`), and the one implementation of `VfsCacheOps` (the short
@@ -8489,7 +8490,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     Linux follows one blocked lock per owner. `flock` detects no
     deadlock (nor does Linux).
 
-### Pseudo-filesystems (`/tmp`, `/dev`, `/proc`)
+### Pseudo-filesystems (`/tmp`, `/dev`, `/dev/shm`, `/proc`)
 
 - **`/tmp` (`tmpfs`, `dev = 0:2`):** full in-memory writable POSIX filesystem
   (regular files backed by `PageCache` frames so `MAP_SHARED`/`MAP_PRIVATE`
@@ -8549,6 +8550,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `/dev/ptmx` (`5:2`, `0o666`) allocates a PTY; `/dev/pts/N` is its
     slave in the boot-mounted `devpts` (`0:5`), with line discipline,
     controlling-terminal and job-control behavior described in section 10.
+  - `/dev/pts` and `/dev/shm`: fixed, empty directories (mode 0755, read-only)
+    that the boot mounts cover: `devpts`, and since #433 a `tmpfs` at
+    `/dev/shm` (`0:7`, mode 1777, its own quota of the default 32 MiB; POSIX
+    shared memory and named semaphores, musl's `shm_open`/`sem_open`).
 - **`/proc` (`procfs`, `dev = 0:4`):** read-only dynamically generated views
   (`st_size == 0` on virtual regular files, matching Linux):
   - `/proc/self` → symlink to `<current_pid>`; `/proc/<pid>` resolves for the
@@ -8609,7 +8614,13 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   directories if absent on any writable root (a `tmpfs` root, or a read-write
   `ext4` root, where they persist); a mount that fails is logged at `warn`.
   From M8 (C9, designed in #336), `devpts` is mounted at `/dev/pts` after
-  `/dev` (section 10).
+  `/dev` (section 10), and since #433 an independent `tmpfs` at `/dev/shm`
+  (`0:7`, mode 1777, its own quota of the default 32 MiB) for musl's
+  `shm_open` and `sem_open`. Both mountpoints are devfs's fixed
+  directories, so they exist wherever `/dev` is mounted, on a read-only
+  root too; if the `/dev/shm` mount fails (logged at `warn`), its devfs
+  directory shows through and `shm_open(O_CREAT)` gets `EROFS` (read from
+  the code: devfs's fixed namespace operations; not tested).
 - **Shell commands:**
   - `blk`: lists bound block devices (PCI addr, capacity, read-only, flush
     support, `BlockCache` hit/miss/dirty stats).
@@ -11621,12 +11632,12 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   four outcomes: pass, fail, timeout and error. It compares them with
   `tests/conformance/libc-test-xfail.txt`, whose entries each carry a path,
   reason and issue. A runner error is never covered; a test with no `EXIT`
-  counts as not run. The list has 32 strict expected failures, leaving
-  252 tests required to pass: 10 native musl failures (#398: `mntent`,
+  counts as not run. The list has 26 strict expected failures, leaving
+  258 tests required to pass: 10 native musl failures (#398: `mntent`,
   `strptime`, `wordexp`, `regex-backref-oob`, `regexec-backref`, each static
   and dynamic; likely fixed in musl after 1.2.5), 4 PI-futex failures
   (#397: `pthread_mutex_pi` and `pthread_robust`, each linkage), 6 SysV IPC
-  failures (#432), 6 missing-`/dev/shm` failures (#433), 2 socket failures
+  failures (#432), 2 socket failures
   (#434, M9), and 4 non-stack resource-limit failures (#435, M10).
   The native reference set remains 274 passes out of 284 (`NATIVE_PASS`
   in `tests/harness/test_libctest.py`); the 10 #398 failures are not missing
