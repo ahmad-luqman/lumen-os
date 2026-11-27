@@ -11,3 +11,10 @@ binutils  # D2: as and ld (gcc depends on it too; named because D2 runs them dir
 git       # D3 (git + sqlite3 + vim over a PTY): init, add, commit, log on a local repository
 sqlite    # D3: the sqlite3 shell
 vim       # D3: vim over a PTY
+curl             # M9 D1 (#452): HTTPS against the local test server
+ca-certificates  # M9 D1: trust store and update-ca-certificates for #453's test CA
+python3          # M9 D2: asyncio, sqlite3 and ssl
+python3-dev      # M9 D2: Python.h and configuration for a C extension
+py3-setuptools   # M9 D2: build the C extension without downloading build tools
+ruby             # M9 D3: HTTP, fibers and RubyGems
+ruby-dev         # M9 D3: mkmf and headers for a native gem

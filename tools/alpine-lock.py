@@ -4,6 +4,8 @@ the image from it.
 
     uv run --frozen python tools/alpine-lock.py lock    # by hand, when bumping
     uv run --frozen python tools/alpine-lock.py stage --lock L --apk-dir D --minirootfs M DEST
+    uv run --frozen python tools/alpine-lock.py openssl  # locate and check OpenSSL >= 3
+    uv run --frozen python tools/alpine-lock.py ca-store --lock L STAGE
     uv run --frozen python tools/alpine-lock.py size STAGE
     uv run --frozen python tools/alpine-lock.py files [--lock L]
 
@@ -28,6 +30,9 @@ size and inode count from the staged content, the same on every host. `files`
 is `tools/fetch-alpine-packages.sh`'s: the lock, parsed and checked here, as
 `mirror-path file sha256` lines (the path under an Alpine-layout mirror's
 base URL), so the lock has one reader and the URL layout one writer.
+`openssl` checks the host OpenSSL prerequisite; `ca-store` builds the fresh
+CA bundle and links in configuration order, refusing subject-hash collisions
+and local certificates rather than diverging from Alpine's trigger.
 
 Standard library only, so the harness tests import it and `LUMEN_PYTHON` can
 run it without uv (the tests' stub trees).
@@ -43,6 +48,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import urllib.request
@@ -744,11 +750,49 @@ def sha256_file(path: Path) -> str:
 
 
 # Install scripts the image reproduces statically: (package, script, the
-# script's sha256) to how, printed by `stage`; tools/mkrootfs-dev.sh does the
-# reproducing. Empty: no locked package carries a script (#344). A lock bump
+# script's sha256) to how, printed by `stage`; `alpine-lock.py ca-store`
+# reproduces the CA trigger. A lock bump
 # that brings one, or changes a listed one, fails `stage` until it is worked
 # out and listed here.
-HANDLED_SCRIPTS: dict[tuple[str, str, str], str] = {}
+HANDLED_SCRIPTS: dict[tuple[str, str, str], str] = {
+    (
+        "ca-certificates",
+        ".trigger",
+        "2305936620ac8c79e6dfa9f1dec27626d99121f2ff64c7dca8bc061bacbb02c3",
+    ): "alpine-lock.py ca-store assembles the CA bundle and subject-hash links on the host (#452)",
+    (
+        "ca-certificates",
+        ".post-deinstall",
+        "9523860edc396093bd41270c6e33a569a30657e2ffd729829514ee6b6d54d652",
+    ): "no package is removed from the fresh image; no broken CA links to clean (#452)",
+    (
+        "ruby",
+        ".post-upgrade",
+        "54cc3475aeed9c363fadad8b7d6ca506c557a384f38f98e26163c947510d313d",
+    ): "only prints a notice for upgrades from Ruby <2.5; this is a fresh install (#452)",
+}
+
+
+# The trigger hash above pins only its wrapper, not the hook it invokes.
+# Refuse new hooks or a changed certhash until their effects are reproduced.
+CA_HOOK = "etc/ca-certificates/update.d/certhash"
+CA_HOOK_SHA256 = "dcdcc8690bcb948d9cf90da1f3e6c504273bd13d560edc7482f141ff17acd76a"
+
+
+def check_ca_hooks(dest: Path, *, required: bool) -> None:
+    directory = dest / "etc/ca-certificates/update.d"
+    if directory.is_symlink():
+        raise LockError("ca-certificates update.d must be a directory, not a symlink")
+    hooks = list(directory.iterdir()) if directory.exists() else []
+    if required and not hooks:
+        raise LockError(f"missing {CA_HOOK}")
+    for hook in hooks:
+        if (
+            hook != dest / CA_HOOK
+            or not stat.S_ISREG(hook.lstat().st_mode)
+            or sha256_file(hook) != CA_HOOK_SHA256
+        ):
+            raise LockError(f"unhandled CA update hook: {hook.relative_to(dest)}")
 
 
 @dataclass(frozen=True)
@@ -792,7 +836,7 @@ def stage(lock: Lock, apk_dir: Path, minirootfs: Path, dest: Path) -> Staged:
             if how is None:
                 raise LockError(
                     f"{name} carries {script} (sha256 {sha}), which the image never runs: work "
-                    "out what it does, reproduce it in tools/mkrootfs-dev.sh and list it in "
+                    "out what it does, reproduce it in alpine-lock.py ca-store and list it in "
                     "tools/alpine-lock.py's HANDLED_SCRIPTS"
                 )
             handled.append((name, script, how))
@@ -813,7 +857,113 @@ def stage(lock: Lock, apk_dir: Path, minirootfs: Path, dest: Path) -> Staged:
                 f"{rel} is in the image: busybox's trigger would act on it, which mkrootfs-dev.sh "
                 "doesn't reproduce"
             )
+    check_ca_hooks(dest, required=locks_ca_certificates(lock))
     return Staged(tuple(handled), tuple(sorted(replaced)))
+
+
+# --- Fresh-install CA store ---------------------------------------------------------
+
+OPENSSL_DIRS = ("/opt/homebrew/opt/openssl@3/bin", "/usr/local/opt/openssl@3/bin")
+
+
+def locks_ca_certificates(lock: Lock) -> bool:
+    """Whether the lock requires the CA package's trigger effects."""
+    return any(p.name == "ca-certificates" for p in lock.packages)
+
+
+def find_openssl(env: Mapping[str, str] | None = None) -> Path:
+    """Find OpenSSL >= 3, honoring an explicit LUMEN_OPENSSL before Homebrew and PATH."""
+    environ = os.environ if env is None else env
+    override = environ.get("LUMEN_OPENSSL")
+    if override:
+        candidates = [override]
+    else:
+        candidates = [
+            *(str(Path(d) / "openssl") for d in OPENSSL_DIRS),
+            *(str(Path(d) / "openssl") for d in environ.get("PATH", "").split(os.pathsep) if d),
+        ]
+    failures: list[tuple[str, str]] = []
+    for candidate in candidates:
+        try:
+            proc = subprocess.run(
+                [candidate, "version"], capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            failures.append((candidate, str(exc)))
+            continue
+        version = re.match(r"OpenSSL (\d+)\.", proc.stdout)
+        if proc.returncode == 0 and version and int(version[1]) >= 3:
+            return Path(candidate)
+        detail = proc.stderr.strip() or proc.stdout.strip() or "no version output"
+        reason = (
+            f"exit {proc.returncode}: {detail}"
+            if proc.returncode
+            else f"unsupported version: {detail}"
+        )
+        failures.append((candidate, reason))
+    raise LockError(
+        "OpenSSL >= 3 is required; install openssl@3 or set LUMEN_OPENSSL to its executable"
+        + (f" (invalid LUMEN_OPENSSL={override!r})" if override else "")
+        + "".join(f"\n  {candidate}: {reason}" for candidate, reason in failures)
+    )
+
+
+def ca_store(root: Path, lock: Lock, openssl: Path) -> None:
+    """Build Alpine's fresh CA bundle, absolute PEM links and new-style hash links.
+
+    Configured certificates stay in configuration order, including duplicates;
+    duplicate fingerprints share one hash link. Local entries and subject-hash
+    collisions are refused: Alpine's collision winner depends on directory order.
+    """
+    local = root / "usr/local/share/ca-certificates"
+    if local.exists() and (entries := sorted(local.iterdir())):
+        raise LockError(
+            "usr/local/share/ca-certificates must be empty: "
+            + ", ".join(entry.name for entry in entries)
+        )
+    conf = root / "etc/ca-certificates.conf"
+    if not conf.is_file():
+        if locks_ca_certificates(lock):
+            raise LockError("missing etc/ca-certificates.conf for locked ca-certificates")
+        return
+    sources = [
+        root / "usr/share/ca-certificates" / line
+        for raw in conf.read_text(encoding="utf-8").splitlines()
+        if (line := raw.strip()) and not line.startswith(("#", "!"))
+    ]
+    certs = root / "etc/ssl/certs"
+    bundle = bytearray()
+    fingerprints: set[str] = set()
+    hash_sources: dict[str, Path] = {}
+    for source in sources:
+        name = "ca-cert-" + source.stem.replace(" ", "_") + ".pem"
+        (certs / name).symlink_to("/" + source.relative_to(root).as_posix())
+        body = source.read_bytes()
+        # update-ca-certificates appends a newline after every source, even
+        # one that already has a trailing newline.
+        bundle.extend(body + b"\n")
+        proc = subprocess.run(
+            [str(openssl), "x509", "-in", str(source), "-noout", "-subject_hash", "-fingerprint"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        lines = proc.stdout.splitlines()
+        if proc.returncode or len(lines) != 2 or not re.fullmatch(r"[0-9a-f]{8}", lines[0]):
+            raise LockError(f"OpenSSL could not hash {source}: {proc.stderr or proc.stdout}")
+        value, fingerprint = lines
+        if fingerprint not in fingerprints:
+            if value in hash_sources:
+                raise LockError(
+                    f"CA subject-hash collision {value}: "
+                    f"{hash_sources[value].relative_to(root)} and {source.relative_to(root)}"
+                )
+            (certs / f"{value}.0").symlink_to(name)
+            hash_sources[value] = source
+            fingerprints.add(fingerprint)
+    if not bundle:
+        raise LockError("no configured CA certificates")
+    (certs / "ca-certificates.crt").write_bytes(bundle)
 
 
 # --- Image size --------------------------------------------------------------------
@@ -958,6 +1108,16 @@ def cmd_stage(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_openssl(a: argparse.Namespace) -> int:
+    print(find_openssl())
+    return 0
+
+
+def cmd_ca_store(a: argparse.Namespace) -> int:
+    ca_store(a.stage, parse_lock(a.lock.read_text()), find_openssl())
+    return 0
+
+
 def cmd_size(a: argparse.Namespace) -> int:
     s = image_size(a.stage)
     for key in ("size_mib", "inodes", "content", "inodes_used"):
@@ -988,6 +1148,12 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--minirootfs", type=Path, required=True)
     st.add_argument("dest", type=Path)
     st.set_defaults(fn=cmd_stage)
+    ossl = sub.add_parser("openssl", help="check for OpenSSL >= 3 and print its path")
+    ossl.set_defaults(fn=cmd_openssl)
+    ca = sub.add_parser("ca-store", help="assemble the fresh-install CA trust store")
+    ca.add_argument("--lock", type=Path, required=True)
+    ca.add_argument("stage", type=Path)
+    ca.set_defaults(fn=cmd_ca_store)
     sz = sub.add_parser(
         "size", help="print size_mib=, inodes=, content= and inodes_used= lines for STAGE"
     )

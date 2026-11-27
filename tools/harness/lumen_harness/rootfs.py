@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -261,15 +261,17 @@ def _resolve_in_rootfs(rootfs_dir: Path, rootfs_path: str, *, max_hops: int = 40
     return None
 
 
-def _resolves_in_rootfs(rootfs_dir: Path, soname: str) -> bool:
+def resolve_soname(rootfs_dir: Path, soname: str) -> Path | None:
+    """Resolve a library name through the guest's library directories, never the host's."""
     if not soname:
-        return False
+        return None
     if soname.startswith("/"):
-        return _resolve_in_rootfs(rootfs_dir, soname) is not None
+        return _resolve_in_rootfs(rootfs_dir, soname)
     for rel_dir in ROOTFS_LIB_DIRS:
-        if _resolve_in_rootfs(rootfs_dir, f"{rel_dir}/{soname}") is not None:
-            return True
-    return False
+        resolved = _resolve_in_rootfs(rootfs_dir, f"{rel_dir}/{soname}")
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def validate_dynamic_elf(
@@ -278,9 +280,14 @@ def validate_dynamic_elf(
     *,
     expect_interp: bool = True,
     expected_interp: str = DEFAULT_INTERP,
+    forbidden_needed: Collection[str] = FORBIDDEN_NEEDED,
     readobj: str | None = None,
 ) -> tuple[str | None, tuple[str, ...]]:
-    """Validate `PT_INTERP` and `DT_NEEDED` resolution against `rootfs_dir`."""
+    """Validate `PT_INTERP` and `DT_NEEDED` resolution against `rootfs_dir`.
+
+    Reject dependencies in `forbidden_needed`; callers inspecting packaged
+    Alpine programs may relax the default policy for Lumen-built binaries.
+    """
     interp, needed = read_dynamic_elf(elf_path, readobj=readobj)
     if expect_interp:
         if interp != expected_interp:
@@ -290,11 +297,11 @@ def validate_dynamic_elf(
     elif interp is not None:
         raise ValueError(f"{elf_path}: expected no PT_INTERP, got {interp!r}")
 
-    forbidden = [lib for lib in needed if lib in FORBIDDEN_NEEDED]
+    forbidden = [lib for lib in needed if lib in forbidden_needed]
     if forbidden:
         raise ValueError(f"{elf_path}: forbidden DT_NEEDED libraries: {forbidden}")
 
-    missing = [lib for lib in needed if not _resolves_in_rootfs(rootfs_dir, lib)]
+    missing = [lib for lib in needed if resolve_soname(rootfs_dir, lib) is None]
     if missing:
         raise ValueError(f"{elf_path}: unresolved DT_NEEDED in {rootfs_dir}: {missing}")
 

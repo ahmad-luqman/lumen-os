@@ -975,10 +975,22 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `tools/ext4-signed-hash.sh`, #308); `tools/mkrootfs-dev.sh` (`make
   rootfs-dev`, #344) builds `build/alpine-dev.ext4` from the minirootfs,
   `build/linux/*`, and the Alpine v3.21 closure of `gcc`, `g++`, `make`,
-  `musl-dev`, `binutils`, `git`, `sqlite`, `vim` resolved and unpacked by
+  `musl-dev`, `binutils`, `git`, `sqlite`, `vim`, plus M9's `curl`,
+  `ca-certificates`, `python3`, `python3-dev`, `py3-setuptools`, `ruby`
+  and `ruby-dev` (#452), resolved and unpacked by
   `tools/alpine-lock.py` (`tools/alpine-packages.{txt,lock}`), fetched by
   `tools/fetch-alpine-packages.sh` (`make deps-dev`) with durable GitHub
   release mirror `tools/mirror-alpine-packages.sh` (`alpine-apk-mirror`);
+  #452 keeps one developer image; `alpine-lock.py ca-store` reproduces
+  Alpine's CA bundle, absolute PEM links and new-style subject hashes,
+  preserving configuration order and deduplicating fingerprints, while refusing
+  subject-hash collisions and entries in `/usr/local/share/ca-certificates`.
+  `stage` pins the certhash hook; no guest install scripts run. The build requires
+  OpenSSL ≥ 3 (`LUMEN_OPENSSL`, Homebrew openssl@3, then PATH), and leaves
+  fixture destinations in `/etc/ssl` and `/etc/apk/keys` for #453's `prepare_image`.
+  `tests/harness/test_rootfs_dev.py` checks M9's runtime ELF closures,
+  extension build files, exact trust-store layout and deterministic image rebuilds;
+  `lumen_harness.rootfs.resolve_soname` confines library lookup to the guest;
   `tools/linux-m7/` `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
   for #255's exit scenarios, and `libm7.so`;
   `m7_vfs`, #254's exit scenarios' program: `posix`, `locks`, `keep` (a

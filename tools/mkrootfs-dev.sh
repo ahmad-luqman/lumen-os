@@ -5,9 +5,9 @@
 #
 # The minirootfs (build/deps/alpine-minirootfs/, `make deps`) plus the data of
 # every package in tools/alpine-packages.lock (build/deps/alpine-packages/,
-# `make deps-dev`: gcc, g++, make, musl-dev, binutils, git, sqlite, vim and
-# their closure), plus build/linux/* as tools/mkrootfs.sh copies them. M8's
-# gate scenarios boot on it.
+# `make deps-dev`: M8's compiler tools and M9's curl, Python and Ruby with
+# development headers and setuptools, and their closure), plus build/linux/*
+# as tools/mkrootfs.sh copies them. Both milestones share this image (#452).
 #
 # Duplication: the e2fsprogs discovery, the build/linux/* copy and its ELF
 # checks, the mtime normalization, the mke2fs flags, the signed-hash step, the
@@ -20,8 +20,10 @@
 # Install scripts: none is ever run. tools/alpine-lock.py's `stage` checks
 # every .apk's sha256, then extracts only each one's data segment, and refuses
 # a package whose control segment carries a script its HANDLED_SCRIPTS table
-# doesn't list with how this script reproduces it. At the lock of #344 none of
-# the 34 carries one: no .pre-install, .post-install or trigger. The one script
+# doesn't list with how the image reproduces it. `alpine-lock.py ca-store`
+# reproduces the CA trigger with host OpenSSL; no guest code runs (#452).
+# Its deinstall cleanup and Ruby's pre-2.5 upgrade notice have nothing to
+# do in a fresh image. The other script
 # the packages set off is the minirootfs' busybox trigger (on /bin, /usr/bin,
 # /sbin, /usr/sbin), which runs `busybox --install -s`: links for applets
 # with nothing at their path. The minirootfs already has every link, so it
@@ -101,6 +103,9 @@ alpine_lock() {
     fi
 }
 
+# Check the host prerequisite before allocating a staging tree or image.
+alpine_lock openssl >/dev/null
+
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/lumen-rootfs-dev.XXXXXX")
 DBG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lumen-rootfs-dev-dbg.XXXXXX")
 mkdir -p "$(dirname "$OUT")"
@@ -120,6 +125,18 @@ alpine_lock stage --lock "$LOCK" --apk-dir "$APK_DIR" --minirootfs "$MINIROOTFS"
 chmod 0755 "$STAGE/dev"
 chmod 0555 "$STAGE/proc"
 chmod 1777 "$STAGE/tmp"
+
+# #453 owns the test CA, signing key and resolver/hosts contents. Keep the
+# minirootfs' /etc/hosts and /etc/resolv.conf as supplied until #450 settles
+# their values; never copy the build host's resolver or trust configuration.
+install -d -m 0755 "$STAGE/etc/ssl" "$STAGE/etc/ssl/certs" \
+    "$STAGE/etc/apk" "$STAGE/etc/apk/keys" "$STAGE/usr/local" \
+    "$STAGE/usr/local/share" "$STAGE/usr/local/share/ca-certificates"
+
+# Alpine's update-ca-certificates and certhash: absolute ca-cert-*.pem links,
+# the bundle, and new-style subject hashes only, with duplicate fingerprints
+# skipped. No guest binary runs; host OpenSSL reads explicit staged inputs.
+alpine_lock ca-store --lock "$LOCK" "$STAGE"
 
 if [[ -d "$LINUX_DIR" ]]; then
     mkdir -p "$STAGE/usr/local/bin" "$STAGE/usr/local/lib"
