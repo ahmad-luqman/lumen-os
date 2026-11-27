@@ -654,9 +654,11 @@ pub fn ktest_rings() -> u64 {
     BELL.rings()
 }
 
-/// Ktests: wait until the device's doorbell has rung past `seen`, or
-/// `deadline` (`time::now_ns`) passes.
+/// Ktests: block until the device's doorbell has rung past `seen`, or
+/// `deadline` (`time::now_ns`) passes. Returns
+/// [`crate::virtio::Wake::CannotBlock`] at once where the thread can't block.
 #[cfg(feature = "ktest")]
+#[must_use = "a deadline or no block at all means nothing rang"]
 pub fn ktest_wait_ring(seen: u64, deadline: u64) -> crate::virtio::Wake {
     BELL.wait_after(seen, deadline)
 }
