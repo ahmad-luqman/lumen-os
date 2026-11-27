@@ -11571,31 +11571,44 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 - **libc-test (D4; zig pinned by #368, the build and harness by #369).**
   `make libc-test` builds libc-test's `src/functional` and `src/regression`,
   static and dynamic, with the pinned zig into `build/libc-test/` (284
-  tests). D4 stages that directory into an image as `/libc-test` (D4
-  decides which image), boots it, and runs each test under libc-test's own
+  tests: 140 static and 144 dynamic, none not built). D4's
+  `scenario:test_conformance::test_musl_libc_test_core` stages the binaries,
+  DSOs and manifest as `/libc-test` in a private copy of the Alpine
+  minirootfs image, boots it with 512 MiB, and runs each test under libc-test's own
   `runtest` (which forks, `execve`s, and times each out with
   `sigtimedwait` and `kill`, so D4 needs C1, C2, C5 and C6), printing an
   `EXIT <path> <code>` line after each, as `lumen_harness.libctest`'s
   driver does natively (`runtest -t 30`: 30 s is that harness's choice,
   runtest's own default is 5 s). The harness parses the transcript into
-  pass, fail and error, and compares it with
-  `tests/conformance/libc-test-xfail.txt` (each entry a test's path, a
-  reason and an issue; a runner error, which `lumen_harness.libctest`
-  lists, is never covered by one; a listed test that passes fails the
-  run; a test with no `EXIT` line counts as not run). The list is empty
-  today. 274 of the 284 pass natively on CI's x86-64 Linux (`NATIVE_PASS`
-  in `tests/harness/test_libctest.py`). D4 adds to the list, each with an
-  issue: the 10 that fail natively too (`mntent`, `strptime`, `wordexp`,
-  `regex-backref-oob` and `regexec-backref`, each static and dynamic:
-  most likely libc-test's tip checking musl fixes newer than 1.2.5;
-  tracked by a musl-bump issue); `pthread_mutex_pi` and
-  `pthread_mutex_pi-static` (PI futexes stay `-ENOSYS`, section 8; a
-  backlog issue); and each test Lumen fails. `runtest -t 30` is a ceiling
-  on the guest's clock, which a busy host stretches, so D4 extends the
-  harness: a timed-out test is its own class and is run once more before
-  it counts as failed, and an entry may be marked `flaky` (it covers a
-  fail or a timeout, never an error, and is exempt from the
-  listed-pass-fails rule), each with its issue; its self-tests are
+  four outcomes: pass, fail, timeout and error. It compares them with
+  `tests/conformance/libc-test-xfail.txt`, whose entries each carry a path,
+  reason and issue. A runner error is never covered; a test with no `EXIT`
+  counts as not run. The list has 32 strict expected failures, leaving
+  252 tests required to pass: 10 native musl failures (#398: `mntent`,
+  `strptime`, `wordexp`, `regex-backref-oob`, `regexec-backref`, each static
+  and dynamic; likely fixed in musl after 1.2.5), 4 PI-futex failures
+  (#397: `pthread_mutex_pi` and `pthread_robust`, each linkage), 6 SysV IPC
+  failures (#432), 6 missing-`/dev/shm` failures (#433), 2 socket failures
+  (#434, M9), and 4 non-stack resource-limit failures (#435, M10).
+  The native reference set remains 274 passes out of 284 (`NATIVE_PASS`
+  in `tests/harness/test_libctest.py`); the 10 #398 failures are not missing
+  Lumen interfaces.
+
+  `runtest -t 30` is a ceiling on the guest's clock, which a busy host
+  stretches. `run_with_retry` runs a timeout once more before comparison;
+  the second attempt is authoritative, and the first is preserved with
+  `RETRY ` prefixes so its EXIT cannot cover a truncated retry. Expectation
+  kinds are separate from outcomes: the default `fail` kind rejects a
+  listed pass, while optional `flaky` permits pass, fail or timeout, never
+  an error or missing result. Flaky failures also get one retry. Every
+  entry needs its reason and issue; none of the current 32 is flaky.
+  Errors and incomplete transcripts are never retried. For #422's native
+  SysV IPC clock-edge failures, `run_native` additionally retries a failure
+  once only for `src/functional/ipc_shm{,-static}.exe`,
+  `src/functional/ipc_msg{,-static}.exe` and
+  `src/functional/ipc_sem{,-static}.exe` (six exact paths). A persistent
+  failure or error still fails the native reference comparison; this rule
+  does not apply to the guest. The timeout/flaky self-tests are
   `harness:test_libctest::test_a_timed_out_test_is_run_once_more` and
   `harness:test_libctest::test_a_flaky_entry_covers_a_fail_or_timeout_never_an_error`.
 - **Which gates need the heavy tier: none in M8.** Every M8 gate runs in

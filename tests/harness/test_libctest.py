@@ -1,4 +1,4 @@
-"""musl libc-test (#345): its output read into pass, fail and error; the
+"""musl libc-test (#345, #396): pass, fail, timeout and error, bounded retries; the
 expected-failure list's format; a run judged against that list; and, where
 `make libc-test` has built it, the build's linkage and the native reference
 run on CI's Linux host."""
@@ -50,7 +50,7 @@ def test_the_parser_reads_pass_fail_signal_and_timeout():
     killed = r["src/regression/sigaltstack.exe"]
     assert (killed.outcome, killed.detail) == (Outcome.FAIL, "signal Segmentation fault")
     timed_out = r["src/functional/pthread_cond.exe"]
-    assert (timed_out.outcome, timed_out.detail) == (Outcome.FAIL, "timed out")
+    assert (timed_out.outcome, timed_out.detail) == (Outcome.TIMEOUT, "timed out")
     assert run.trailing == []
 
 
@@ -328,6 +328,16 @@ def test_the_checked_in_xfail_list_is_well_formed():
     libctest.load_xfail()
 
 
+def test_xfail_kind_is_validated_at_construction():
+    test = "src/functional/a-static.exe"
+    assert libctest.Xfail(test, "known", 396, 1).kind == "fail"
+    for kind in ("fail", "flaky"):
+        assert libctest.Xfail(test, "known", 396, 1, kind=kind).kind == kind
+    for kind in ("flakey", "FAIL", "", None, 0):
+        with pytest.raises(libctest.XfailError, match="invalid expected-failure kind"):
+            libctest.Xfail(test, "known", 396, 1, kind=kind)
+
+
 # A run judged against the list.
 
 A = "src/functional/a-static.exe"
@@ -392,6 +402,116 @@ def test_an_error_fails_the_comparison_even_when_listed():
     v = libctest.compare(_run(A="pass", B="internal", C="pass"), _xfail(B), [A, B, C])
     assert not v.ok
     assert [r.test for r in v.errors] == [B]
+
+
+@pytest.mark.parametrize("second", ["pass", "fail", "timeout", "internal", "missing"])
+def test_a_timed_out_test_is_run_once_more(second):
+    first = f"FAIL {A} [timed out]\nEXIT {A} 1\n"
+    again = {
+        "pass": f"EXIT {A} 0\n",
+        "fail": f"FAIL {A} [status 1]\nEXIT {A} 1\n",
+        "timeout": first,
+        "internal": f"FAIL {A} [internal]\nEXIT {A} 255\n",
+        "missing": "unfinished\n",
+    }[second]
+    attempts = []
+
+    def execute():
+        attempts.append(len(attempts))
+        assert len(attempts) <= 2, "a retry must never be retried"
+        return first if len(attempts) == 1 else again
+
+    transcript = libctest.run_with_retry(A, execute)
+    assert attempts == [0, 1]
+    assert transcript == "".join(f"RETRY {line}\n" for line in first.splitlines()) + again
+    run = libctest.parse(transcript)
+    verdict = libctest.compare(run, {}, [A])
+    assert verdict.ok == (second == "pass")
+    if second == "missing":
+        assert verdict.not_run == [A]
+    else:
+        assert (
+            run.results[A].outcome
+            is {
+                "pass": Outcome.PASS,
+                "fail": Outcome.FAIL,
+                "timeout": Outcome.TIMEOUT,
+                "internal": Outcome.ERROR,
+            }[second]
+        )
+
+
+@pytest.mark.parametrize("how", ["pass", "fail", "signal", "timeout", "internal"])
+def test_a_flaky_entry_covers_a_fail_or_timeout_never_an_error(how):
+    entries = libctest.parse_xfail(f"{A} flaky # busy host #422\n")
+    assert (entries[A].kind, entries[A].reason, entries[A].issue) == ("flaky", "busy host", 422)
+    v = libctest.compare(_run(A=how), entries, [A])
+    assert v.ok == (how != "internal"), v.summary()
+    assert not v.unexpected_passes
+    assert len(v.errors) == (how == "internal")
+    assert len(v.expected_failures) == (how in ("fail", "signal", "timeout"))
+    assert v.passed == ([A] if how == "pass" else [])
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        f"EXIT {A} 0\n",
+        f"FAIL {A} [status 1]\nEXIT {A} 1\n",
+        f"FAIL {A} [internal]\nEXIT {A} 255\n",
+        f"FAIL {A} [timed out]\n",
+        f"FAIL {A} [timed out]\nEXIT {A} 1\nunfinished\n",
+        f"FAIL {B} [timed out]\nEXIT {B} 1\n",
+        f"FAIL {A} [timed out]\nEXIT {A} 1\nEXIT {B} 0\n",
+        (
+            f"src/common/runtest.c:82: {A} kill failed: No such process\n"
+            f"FAIL {A} [timed out]\nEXIT {A} 1\n"
+        ),
+    ],
+)
+def test_only_a_complete_timeout_is_retried_without_a_flaky_entry(first):
+    calls = []
+
+    def execute():
+        calls.append(True)
+        return first
+
+    assert libctest.run_with_retry(A, execute) == first
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("first", ["fail", "signal", "timeout", "internal", "pass"])
+def test_a_flaky_failure_is_retried_once_but_an_error_is_not(first):
+    result = _run(A=first).results[A]
+    transcript = (
+        f"EXIT {A} 0\n"
+        if first == "pass"
+        else f"FAIL {A} [{result.detail if first != 'internal' else 'internal'}]\n"
+        f"EXIT {A} {255 if first == 'internal' else 1}\n"
+    )
+    calls = []
+
+    def execute():
+        calls.append(True)
+        return transcript
+
+    run = libctest.parse(libctest.run_with_retry(A, execute, retry_failure=True))
+    assert len(calls) == (2 if first in ("fail", "signal", "timeout") else 1)
+    assert run.results[A].outcome is result.outcome
+
+
+@pytest.mark.parametrize("entry", ["flaky # #422", "flaky # reason", "unknown # reason #422"])
+def test_flaky_entries_require_a_known_kind_reason_and_issue(entry):
+    with pytest.raises(libctest.XfailError):
+        libctest.parse_xfail(f"{A} {entry}\n")
+
+
+def test_flaky_entries_still_require_a_built_and_run_test():
+    entries = libctest.parse_xfail(f"{A} flaky # timing #422\n")
+    assert libctest.compare(libctest.Run(), entries, [A]).not_run == [A]
+    assert libctest.compare(libctest.Run(), entries, []).stale == [entries[A]]
+    with pytest.raises(libctest.XfailError, match="listed twice"):
+        libctest.parse_xfail(f"{A} # fails #397\n{A} flaky # timing #422\n")
 
 
 def test_a_listed_test_that_was_not_built_fails_the_comparison():
@@ -732,6 +852,48 @@ def test_run_native_refuses_a_dynamic_test_without_a_loader(tmp_path):
         libctest.run_native(tmp_path, ["src/functional/a.exe"], loader=None)
 
 
+@pytest.mark.parametrize("first", ["status 1", "timed out", "internal"])
+@pytest.mark.parametrize("second", ["pass", "status 1", "timed out", "internal"])
+def test_native_ipc_retries_are_scoped_and_never_hide_persistent_failures(tmp_path, first, second):
+    ipc = {
+        f"src/functional/ipc_{kind}{suffix}.exe"
+        for kind in ("shm", "msg", "sem")
+        for suffix in ("", "-static")
+    }
+    assert libctest.NATIVE_RETRY_FAILURES == ipc
+    tests = [*sorted(ipc), "src/regression/ipc_shm.exe", "src/functional/ipc_shm_extra.exe"]
+    runtest = tmp_path / libctest.RUNTEST
+    runtest.parent.mkdir(parents=True)
+    log = tmp_path / "calls"
+    runtest.write_text(
+        '#!/bin/sh\nfor test in "$@"; do :; done\n'
+        f'echo "$test" >> "{log}"\n'
+        'mark=$(printf "%s" "$test" | tr / _)\n'
+        f'if [ -e "$mark" ]; then why="{second}"; else why="{first}"; fi\n'
+        ': > "$mark"\n'
+        '[ "$why" = pass ] && exit 0\n'
+        'echo "FAIL $test [$why]"\n'
+        '[ "$why" = internal ] && exit 255\nexit 1\n'
+    )
+    runtest.chmod(0o755)
+    transcript = libctest.run_native(tmp_path, tests, loader=tmp_path / "loader")
+    results = libctest.parse(transcript).results
+    calls = log.read_text().splitlines()
+    for test in tests:
+        retry = first == "timed out" or (first == "status 1" and test in ipc)
+        assert calls.count(test) == (2 if retry else 1)
+        last = second if retry else first
+        assert (
+            results[test].outcome
+            is {
+                "pass": Outcome.PASS,
+                "status 1": Outcome.FAIL,
+                "timed out": Outcome.TIMEOUT,
+                "internal": Outcome.ERROR,
+            }[last]
+        )
+
+
 # The build itself, where `make libc-test` made it (CI's job builds it before
 # the harness tests; there a missing build fails rather than skips, so the
 # feature can't pass with these unchecked).
@@ -776,6 +938,8 @@ def test_every_built_binary_is_linked_as_its_name_says():
 # badly stalled runner or a new runner image can upset it. Re-record when a
 # pin changes: a mismatch's message lists how each other test failed and
 # prints the set to paste here.
+# #422's native SysV IPC clock-edge failures get one retry in run_native;
+# persistent failures and errors still fail this unchanged reference set.
 NATIVE_PASS: frozenset[str] = frozenset(
     {
         "src/functional/argv-static.exe",
