@@ -183,7 +183,7 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
             sink.clear();
             let done = rq.finish_scan(&set, scan, &pbuf[..len], 7, &mut sink);
             assert_eq!(done.reported, 7);
-            assert!(done.has_ready);
+            assert!(done.wake_waiters);
 
             // Roll back the tail via `unreport` (zero alloc).
             assert!(rq.unreport(sink.slice()[3..done.reported].iter().map(|e| e.unwrap().handle)));
@@ -195,7 +195,7 @@ fn spinlock_ready_queue_ops_and_modify_perform_zero_allocations() {
                 *p = EPOLLIN | EPOLLOUT;
             }
             let pdone = rq.finish_peek(pscan, &pbuf[..plen]);
-            assert!(pdone.ready && pdone.has_ready);
+            assert!(pdone.ready && pdone.wake_waiters);
 
             // Error-path `abort_scan`.
             let ascan = rq.begin_scan(&mut hbuf);

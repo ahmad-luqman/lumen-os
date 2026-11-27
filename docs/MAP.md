@@ -697,15 +697,18 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `ReadyQueue` behind the level-10e leaf spinlock (`ep->lock`: generational
   `Handle`-indexed intrusive ready list with `Handle::INVALID`, copied watch
   masks, `in_ready`/`in_scan`/`armed`/`woke_during_scan` flags; zero-alloc
-  `wake -> Wake` (`Queued`/`DuringScan`/`AlreadyQueued`/`Filtered`/`Stale`),
-  `activate(&mut set, Added) -> Option<Storage>` confirming growth capacity
-  and taking over stale slots, `apply(Modified)`, `unlink`, `install(Storage)`,
-  `events_available`, full-list two-phase `begin_scan`/`Scan` + `finish_scan`
-  (`ScanDone`, `Event`, `ep_done_scan` order) / `finish_peek` (`PeekDone`) /
-  `abort_scan`, and `unreport` for copy-out rollback under `ep->mtx`); plus
-  `LoopCheck<Id>` (cycle and Linux v6.17+ `EP_MAX_NESTS` = 4 bidirectional
-  depth check with refcounted edges) and `Errno`/`EPOLL*` constants from
-  `linux-raw-sys` (host-tested, incl. randomized models and
+  `wake -> Wake` (`Queued`/`DuringScan`/`AlreadyQueued`/`Filtered`/`Stale`;
+  only real source wakes notify `PollHead` subscribers via
+  `should_notify_subscribers`), `activate(&mut set, Added) -> Option<Storage>`
+  confirming growth capacity and taking over stale slots, `apply(Modified)`,
+  `unlink`, `install(Storage)`, `events_available`, full-list two-phase
+  `begin_scan`/`Scan` + `finish_scan` (`ScanDone.wake_waiters`, `Event`,
+  `ep_done_scan` order) / `finish_peek` (`PeekDone.wake_waiters`) /
+  `abort_scan`, and `unreport` for copy-out rollback under `ep->mtx`
+  (scan/rollback results wake `ep->wq` waiters only, never `PollHead`
+  subscribers)); plus `LoopCheck<Id>` (cycle and Linux v6.17+ `EP_MAX_NESTS` =
+  4 bidirectional depth check with refcounted edges) and `Errno`/`EPOLL*`
+  constants from `linux-raw-sys` (host-tested, incl. randomized models and
   `tests/zero_alloc.rs`).
 - `crates/lumen-tty`: a terminal line discipline as logic, after Linux's
   n_tty (M8, #340; ARCHITECTURE section 10): `LineDiscipline` (`receive`

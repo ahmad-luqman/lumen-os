@@ -12,20 +12,22 @@ use crate::{Added, EPOLLET, EPOLLONESHOT, EpollSet, Errno, Event, Handle, Modifi
 /// Outcome of [`ReadyQueue::wake`].
 ///
 /// This is **not** Linux `ep_poll_callback`'s integer return value (`1`/`0` for
-/// waitqueue traversal). B5 wakes `ep->wq` and notifies the epoll file's
-/// `PollHead` on both [`Self::Queued`] and [`Self::DuringScan`]
-/// ([`Self::should_notify`]).
+/// waitqueue traversal). Only a real source wake returning [`Self::Queued`] or
+/// [`Self::DuringScan`] triggers **both** waking this epoll's own `epoll_wait`
+/// waiters (`ep->wq`, [`Self::should_wake_waiters`]) and notifying this epoll
+/// file's `PollHead` subscribers (`ep->poll_wait`,
+/// [`Self::should_notify_subscribers`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub enum Wake {
     /// The interest was armed, matched `ready`, and was newly appended to the
-    /// ready list. Wake `ep->wq` and notify the epoll file's `PollHead`.
+    /// ready list. Wake `ep->wq` waiters **and** notify `PollHead` subscribers.
     Queued,
     /// The interest was armed and matched `ready`, and is currently detached
     /// in an active [`Scan`]; `woke_during_scan` was recorded so the scan will
-    /// not lose the edge. **Notify like [`Self::Queued`]** (wake `ep->wq` and
-    /// notify the epoll file's `PollHead`, matching Linux `ep_poll_callback`'s
-    /// ovflist path).
+    /// not lose the edge. **Notify like [`Self::Queued`]** (wake `ep->wq`
+    /// waiters **and** notify `PollHead` subscribers, matching Linux
+    /// `ep_poll_callback`'s ovflist path).
     DuringScan,
     /// The interest was armed and matched `ready`, and was already linked on
     /// the ready list (`in_ready == true`, not in an active scan).
@@ -39,35 +41,49 @@ pub enum Wake {
 }
 
 impl Wake {
-    /// Returns `true` when B5 should wake `ep->wq` and notify the epoll file's
-    /// `PollHead` ([`Self::Queued`] or [`Self::DuringScan`]).
-    pub const fn should_notify(self) -> bool {
+    /// Returns `true` when B5 should wake this epoll's own `epoll_wait` waiters
+    /// (`ep->wq`) ([`Self::Queued`] or [`Self::DuringScan`]).
+    pub const fn should_wake_waiters(self) -> bool {
+        matches!(self, Self::Queued | Self::DuringScan)
+    }
+
+    /// Returns `true` when B5 should notify this epoll file's `PollHead`
+    /// subscribers (`ep->poll_wait`: outer epolls and `poll`/`select`)
+    /// ([`Self::Queued`] or [`Self::DuringScan`]).
+    pub const fn should_notify_subscribers(self) -> bool {
         matches!(self, Self::Queued | Self::DuringScan)
     }
 }
 
 /// Outcome of [`ReadyQueue::finish_scan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[must_use = "wake ep->wq and notify the epoll file's PollHead when has_ready is true"]
+#[must_use = "wake this epoll's epoll_wait waiters (ep->wq) when wake_waiters is true; never notify PollHead subscribers"]
 pub struct ScanDone {
     /// Number of events appended to `out`.
     pub reported: usize,
-    /// `true` if the ready list is non-empty after the scan completed; when
-    /// `true`, B5 must wake `ep->wq` and notify the epoll file's `PollHead`
-    /// (Linux `fs/eventpoll.c`, `ep_done_scan`).
-    pub has_ready: bool,
+    /// `true` if the ready list is non-empty after the scan completed.
+    ///
+    /// When `true`, B5 must wake **only** this epoll's own `epoll_wait` waiters
+    /// (`ep->wq`, Linux `ep_done_scan`'s `wake_up(&ep->wq)`). **Never** notify
+    /// the epoll file's `PollHead` subscribers (`ep->poll_wait`).
+    pub wake_waiters: bool,
 }
 
 /// Outcome of [`ReadyQueue::finish_peek`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[must_use = "wake ep->wq and notify the epoll file's PollHead when has_ready is true"]
+#[must_use = "wake this epoll's epoll_wait waiters (ep->wq) when wake_waiters is true; never notify PollHead subscribers"]
 pub struct PeekDone {
     /// `true` if at least one queued interest polled non-zero (`EPOLLIN | EPOLLRDNORM`).
     pub ready: bool,
     /// `true` if the ready list is non-empty afterwards (a ready entry was
-    /// restored or a mid-peek wake arrived on a drained entry); when `true`,
-    /// B5 must wake `ep->wq` and notify the epoll file's `PollHead`.
-    pub has_ready: bool,
+    /// restored or a mid-peek wake arrived on a drained entry).
+    ///
+    /// When `true`, B5 must wake **only** this epoll's own `epoll_wait` waiters
+    /// (`ep->wq`, Linux `__ep_eventpoll_poll` / `ep_done_scan`). **Never**
+    /// notify the epoll file's `PollHead` subscribers (`ep->poll_wait`): doing
+    /// so during an outer `EPOLLET` epoll's scan would feed back into the outer
+    /// handle's `woke_during_scan` and cause an infinite self-requeue loop.
+    pub wake_waiters: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -439,10 +455,10 @@ impl ReadyQueue {
     ///    head, ahead of LT requeues;
     /// 3. level-triggered requeues at the **tail**.
     ///
-    /// Returns [`ScanDone`]; when [`ScanDone::has_ready`] is `true`, B5 must
-    /// wake `ep->wq` and notify the epoll file's `PollHead`. Performs **zero
-    /// heap allocations and zero deallocations** provided `out` does not
-    /// allocate.
+    /// Returns [`ScanDone`]; when [`ScanDone::wake_waiters`] is `true`, B5 must
+    /// wake **only** this epoll's own `epoll_wait` waiters (`ep->wq`) — never
+    /// notify `PollHead` subscribers. Performs **zero heap allocations and zero
+    /// deallocations** provided `out` does not allocate.
     pub fn finish_scan<K: Ord + Copy, T>(
         &mut self,
         set: &EpollSet<K, T>,
@@ -453,7 +469,7 @@ impl ReadyQueue {
     ) -> ScanDone {
         let handles = self.end_scan(scan);
         if handles.is_empty() {
-            return ScanDone { reported: 0, has_ready: self.has_ready() };
+            return ScanDone { reported: 0, wake_waiters: self.has_ready() };
         }
 
         let visit_limit = handles.len().min(polled.len());
@@ -504,7 +520,7 @@ impl ReadyQueue {
         self.append_ready_list(lt_requeue);
         self.restore_front(&handles[visited..]);
 
-        ScanDone { reported, has_ready: self.has_ready() }
+        ScanDone { reported, wake_waiters: self.has_ready() }
     }
 
     /// Complete a non-consuming nested-epoll readiness probe started by
@@ -520,14 +536,15 @@ impl ReadyQueue {
     ///   (without disarming `EPOLLONESHOT`) unless a matching wake arrived
     ///   mid-scan, in which case they are placed back at the head ahead of
     ///   later entries.
-    /// - Returns [`PeekDone`]; when [`PeekDone::has_ready`] is `true`, B5 must
-    ///   wake `ep->wq` and notify the epoll file's `PollHead`.
+    /// - Returns [`PeekDone`]; when [`PeekDone::wake_waiters`] is `true`, B5
+    ///   must wake **only** this epoll's own `epoll_wait` waiters (`ep->wq`) —
+    ///   **never** notify `PollHead` subscribers.
     ///
     /// Performs **zero heap allocations and zero deallocations**.
     pub fn finish_peek(&mut self, scan: Scan<'_>, polled: &[u32]) -> PeekDone {
         let handles = self.end_scan(scan);
         if handles.is_empty() {
-            return PeekDone { ready: false, has_ready: self.has_ready() };
+            return PeekDone { ready: false, wake_waiters: self.has_ready() };
         }
 
         let visit_limit = handles.len().min(polled.len());
@@ -558,7 +575,7 @@ impl ReadyQueue {
 
         self.prepend_ready_list(woken_requeue);
         self.restore_front(&handles[visited..]);
-        PeekDone { ready: found_ready, has_ready: self.has_ready() }
+        PeekDone { ready: found_ready, wake_waiters: self.has_ready() }
     }
 
     /// Abort an in-flight [`Scan`] on a B5 error path between `begin_scan` and
@@ -566,10 +583,11 @@ impl ReadyQueue {
     /// the ready list in its original order without reporting, disarming, or
     /// pruning any handle.
     ///
-    /// Returns `true` if the ready list is non-empty afterwards (when `true`,
-    /// wake `ep->wq` and notify the epoll file's `PollHead`). Performs **zero
-    /// heap allocations and zero deallocations**.
-    #[must_use = "wake ep->wq and notify the epoll file's PollHead when true"]
+    /// Returns `true` if the ready list is non-empty afterwards; when `true`,
+    /// B5 must wake **only** this epoll's own `epoll_wait` waiters (`ep->wq`)
+    /// — never notify `PollHead` subscribers. Performs **zero heap allocations
+    /// and zero deallocations**.
+    #[must_use = "wake this epoll's epoll_wait waiters (ep->wq) when true; never notify PollHead subscribers"]
     pub fn abort_scan(&mut self, scan: Scan<'_>) -> bool {
         let handles = self.end_scan(scan);
         if !handles.is_empty() {
@@ -586,10 +604,11 @@ impl ReadyQueue {
     /// live handles at the front of the ready list in their original order,
     /// ignoring stale handles.
     ///
-    /// Returns `true` if the ready list is non-empty afterwards (when `true`,
-    /// wake `ep->wq` and notify the epoll file's `PollHead`). Performs **zero
-    /// heap allocations and zero deallocations**.
-    #[must_use = "wake ep->wq and notify the epoll file's PollHead when true"]
+    /// Returns `true` if the ready list is non-empty afterwards; when `true`,
+    /// B5 must wake **only** this epoll's own `epoll_wait` waiters (`ep->wq`)
+    /// — never notify `PollHead` subscribers. Performs **zero heap allocations
+    /// and zero deallocations**.
+    #[must_use = "wake this epoll's epoll_wait waiters (ep->wq) when true; never notify PollHead subscribers"]
     pub fn unreport<I>(&mut self, handles: I) -> bool
     where
         I: IntoIterator<Item = Handle>,
