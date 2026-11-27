@@ -21,7 +21,7 @@ use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use ext4plus::dir::Dir;
-use ext4plus::error::Ext4Error;
+use ext4plus::error::{Corrupt, Ext4Error};
 use ext4plus::file::{read_at as ext4_read_at, truncate as ext4_truncate, write_at as ext4_write_at};
 use ext4plus::inode::{Inode, InodeFlags, InodeMode};
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
@@ -58,6 +58,9 @@ pub trait LatchableCache: BlockCacheBackend {
     /// Writeback stopped and writes into the cache refused
     /// ([`BlockCache::freeze`]).
     fn freeze(&self);
+    /// Stop device writeback while allowing running operations' cache
+    /// writes, including undo after detected corruption (#350).
+    fn stop_writeback(&self);
     /// The first device write or flush that failed
     /// ([`BlockCache::first_failure`]): the one signal that one did.
     fn first_failure(&self) -> Option<BlockError>;
@@ -86,6 +89,10 @@ impl<B: BlockDevice + Send + Sync + 'static> LatchableCache for SleepMutex<Block
         self.lock().freeze();
     }
 
+    fn stop_writeback(&self) {
+        self.lock().stop_writeback();
+    }
+
     fn first_failure(&self) -> Option<BlockError> {
         self.lock().first_failure()
     }
@@ -101,8 +108,8 @@ type SharedBlockCache = Arc<LatchedCache>;
 /// The volume's state under `errors=remount-ro` (#349, ARCHITECTURE §9):
 /// writable.
 const HEALTHY: u8 = 0;
-/// A device write failed (writeback stopped there, in the block cache); the
-/// write-type operations running then haven't all ended, and still write
+/// A device write failed or an allocator detected corrupt accounting;
+/// writeback has stopped, but running write-type operations still write
 /// into the cache (the failing one's undo among them).
 const TRIPPED: u8 = 1;
 /// Settled and frozen: writes into the cache are refused too.
@@ -123,8 +130,8 @@ fn thread_id() -> u64 {
 /// writes, the syncs). `errors=remount-ro` (#349) trips it ([`TRIPPED`])
 /// when the cache below has a failed device write or flush
 /// ([`LatchableCache::first_failure`], set wherever a block is written back,
-/// a read's eviction included, #331), not by a call's result; the cache
-/// below stopped writing back inside the call that met it, so nothing more
+/// a read's eviction included, #331), or an allocator detects a count/bitmap
+/// mismatch (#350). The cache below stops writing back at detection, so nothing more
 /// reaches the device, while it still takes writes. When the last
 /// write-type operation running then ends ([`WriteOp`]'s drop), or at once
 /// when none runs (a read's), it settles ([`Self::settle`]): it refuses
@@ -134,6 +141,9 @@ struct LatchedCache {
     inner: Arc<dyn LatchableCache>,
     dev: DevId,
     state: AtomicU8,
+    /// The winning trip's corruption, or None for a device failure. The
+    /// lock serializes cause publication with the state transition (#350).
+    allocation_corrupt: crate::sync::SpinLock<Option<Corrupt>>,
     /// Write-type operations running ([`WriteOp`]s alive).
     ops: AtomicUsize,
     /// The thread whose call met the failure ([`NO_THREAD`] before).
@@ -152,6 +162,7 @@ impl LatchedCache {
             inner,
             dev,
             state: AtomicU8::new(HEALTHY),
+            allocation_corrupt: crate::sync::SpinLock::new(None),
             ops: AtomicUsize::new(0),
             tripper: AtomicU64::new(NO_THREAD),
             failed_op: crate::sync::SpinLock::new(None),
@@ -167,10 +178,27 @@ impl LatchedCache {
         self.state.load(Ordering::SeqCst) == FROZEN
     }
 
-    /// A device write failed below: trip, remembering whose call met it.
-    fn trip(&self) {
-        if self.state.compare_exchange(HEALTHY, TRIPPED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            self.tripper.store(thread_id(), Ordering::SeqCst);
+    /// Trip for a device failure or allocator corruption, publishing its
+    /// cause and thread together. Only the first cause wins (#350).
+    fn trip(&self, corruption: Option<&Corrupt>) -> bool {
+        let mut cause = self.allocation_corrupt.lock();
+        if self.state.compare_exchange(HEALTHY, TRIPPED, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return false;
+        }
+        *cause = corruption.cloned();
+        self.tripper.store(thread_id(), Ordering::SeqCst);
+        true
+    }
+
+    /// Stop writeback on a bitmap mismatch, leaving cache writes available
+    /// for running operations' undo. An earlier device failure keeps its
+    /// cause even if its caller has not reached `watched` yet (#350).
+    fn trip_corrupt(&self, corruption: &Corrupt) {
+        self.inner.stop_writeback();
+        if self.inner.first_failure().is_some() {
+            self.trip(None);
+        } else {
+            self.trip(Some(corruption));
         }
     }
 
@@ -181,7 +209,8 @@ impl LatchedCache {
     }
 
     /// No write-type operation runs any more (or a read met the failure
-    /// outside one): if the latch tripped (and nobody settled it yet),
+    /// outside one): if a device failure or allocator corruption tripped
+    /// the latch (and nobody settled it yet),
     /// refuse every write from now on, freeze the cache below and log it,
     /// once, naming the operation that met the failure.
     fn settle(&self) {
@@ -189,14 +218,20 @@ impl LatchedCache {
             return;
         }
         self.inner.freeze();
-        let cause = self.inner.first_failure().unwrap_or(BlockError::Io);
         let op = self.failed_op.lock().unwrap_or("a read's eviction");
-        error!(
-            target: "vfs",
-            "ext4 {:?}: {op} failed writing to the device ({cause}); the volume is read-only until reboot \
-             (errors=remount-ro); run e2fsck -f",
-            self.dev
-        );
+        let corruption = self.allocation_corrupt.lock().clone();
+        if let Some(cause) = corruption {
+            error!(target: "vfs", "ext4 {:?}: {op} found {cause}; the volume is \
+                read-only until reboot (errors=remount-ro); run e2fsck -f", self.dev);
+        } else {
+            let cause = self.inner.first_failure().unwrap_or(BlockError::Io);
+            error!(
+                target: "vfs",
+                "ext4 {:?}: {op} failed writing to the device ({cause}); the volume is read-only until reboot \
+                 (errors=remount-ro); run e2fsck -f",
+                self.dev
+            );
+        }
     }
 
     /// `call` on the cache below, tripping if a device write failed
@@ -206,7 +241,7 @@ impl LatchedCache {
     fn watched(&self, call: impl FnOnce() -> Result<(), BlockError>) -> Result<(), BlockError> {
         let res = call();
         if self.healthy() && self.inner.first_failure().is_some() {
-            self.trip();
+            self.trip(None);
         }
         res
     }
@@ -435,6 +470,11 @@ impl Ext4Read for BcacheIo {
 }
 
 impl Ext4Write for BcacheIo {
+    /// Latch allocator corruption before retries or undo can hide it (#350).
+    fn on_allocation_corruption(&self, corruption: &Corrupt) {
+        self.0.trip_corrupt(corruption);
+    }
+
     fn write(&self, start_byte: u64, src: &[u8]) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         self.0.write_at(start_byte, src).map_err(|e| Box::new(BcacheIoError(e)) as _)
     }
@@ -5439,12 +5479,12 @@ pub(crate) mod ktest_util {
     ///   faults reach steps the real path can fail only under cache
     ///   pressure.
     /// - What the operation then reports is partly `ext4plus`'s doing: it
-    ///   retries a failed range free block by block and a failed allocation
-    ///   one block shorter, so a failed write can come back as `Ok` or as
-    ///   `NoSpc`, with counts or bits left wrong (ARCHITECTURE section 9,
+    ///   retries a failed range free block by block, so a failed write can
+    ///   come back as `Ok`. Allocation errors propagate since #350, but
+    ///   counts or bits can still be left wrong (ARCHITECTURE section 9,
     ///   "Write errors an operation doesn't see";
     ///   `ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio`,
-    ///   `ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc`).
+    ///   `ext4_a_failed_write_in_a_block_allocation_preserves_eio`).
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         pub(in crate::vfs) dev: MemBlkDev,
@@ -5564,6 +5604,11 @@ pub(crate) mod ktest_util {
         /// the first, until `clear`.
         pub fn reads_fail_from_fault(&self, nth: usize) {
             self.quiet_faults.store(nth.saturating_sub(1), Ordering::Release);
+        }
+
+        /// Reads still allowed before the range's persistent failure (#350).
+        pub fn range_skip_left(&self) -> usize {
+            self.range_skip.load(Ordering::Acquire)
         }
 
         /// How many of the range's reads are still to fail.
@@ -5697,6 +5742,10 @@ pub(crate) mod ktest_util {
     impl LatchableCache for FaultCache {
         fn freeze(&self) {
             self.inner.lock().freeze();
+        }
+
+        fn stop_writeback(&self) {
+            self.inner.lock().stop_writeback();
         }
 
         fn first_failure(&self) -> Option<BlockError> {
@@ -7361,12 +7410,9 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc() {
-        // #331 review: `ext4plus` 0.1.0-rc.2's `Extent::allocate`
-        // (`extent.rs`) retries any failed `alloc_contiguous_blocks(n)` with
-        // one block fewer and gives `NoSpace` at 0. On 4 KiB blocks a page's
-        // writeback asks for 1 block, so nothing is retried and a failed
-        // write among the allocation's comes back as `NoSpc`, not `Io`. The
+    fn ext4_a_failed_write_in_a_block_allocation_preserves_eio() {
+        // #350: Extent::allocate retries only NoSpace, preserving EIO.
+        // #331's partial allocation accounting remains pinned here. The
         // allocation writes the bitmap byte, the descriptor's checksum, then
         // lowers the group's count in memory and writes it, then the
         // superblock's; nothing is put back. So once the bit has landed it
@@ -7417,7 +7463,7 @@ crate::ktest!(
             (m.cache.writes.load(O::Acquire), block_bitmap_offset(&m.fs)?)
         };
         let c0 = counts_4k(&setup, bitmap);
-        let (mut nospc, mut leaked, mut above, mut after) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut leaked, mut above, mut after) = (Vec::new(), Vec::new(), Vec::new());
         for k in 1..=total {
             let m = mount(setup.clone(), 276)?;
             let _op = m.fs.shared.op("writeback");
@@ -7427,12 +7473,9 @@ crate::ktest!(
             m.cache.clear();
             // Whatever it returned, the failed write errored the volume (#349).
             kassert!(m.fs.errored());
-            match res {
-                Err(VfsError::NoSpc) => nospc.push(k),
-                other => {
-                    kassert_eq!(other, Err(VfsError::Io));
-                    continue;
-                }
+            kassert_eq!(res, Err(VfsError::Io));
+            if k > 4 {
+                continue; // the allocation completed before this failure
             }
             let c = counts_4k(&image(&m)?, bitmap);
             kassert!(c.sb <= c0.sb && c.bg <= c0.bg && c.bits <= c0.bits + 1);
@@ -7451,10 +7494,9 @@ crate::ktest!(
             after.push((k, c.bits - c0.bits, c0.bg - c.bg, c0.sb - c.sb));
         }
         crate::ktest::diag(format_args!(
-            "{total} writes: NoSpc at {nospc:?}, a bit leaked at {leaked:?}, the group's count above its bitmap at \
+            "{total} writes: EIO at every failed write, a bit leaked at {leaked:?}, the group's count above its bitmap at \
              {above:?}; after the next writeback (k, bits taken, group and superblock counts lowered): {after:?}"
         ));
-        kassert_eq!(nospc, alloc::vec![1, 2, 3, 4]);
         kassert_eq!(leaked, alloc::vec![2, 3, 4]);
         kassert_eq!(above, alloc::vec![2, 3]);
         // k=1 clean; k=2 both counts one above for good; k=3 the
@@ -7965,13 +8007,10 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ext4_a_failed_page_writeback_errors_the_volume_as_enospc() {
-        // The first page's write fails in its block allocation, which
-        // `ext4plus` (`Extent::allocate`) retries one block shorter and then
-        // calls `NoSpace`: the sync says `ENOSPC`, yet a write failed, so
-        // the volume goes read-only all the same (#349: the trigger is the
-        // write, not the errno) and the writeback stops there: the other
-        // pages stay dirty in memory, never written.
+    fn ext4_a_failed_page_writeback_errors_the_volume_as_eio() {
+        // The first page's allocation preserves its EIO (#350); the
+        // volume goes read-only and writeback stops there (#349), leaving
+        // the other pages dirty in memory, never written.
         use self::ktest_util::*;
         use crate::kassert_eq;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 239)?;
@@ -7979,7 +8018,7 @@ crate::ktest!(
         let data = pattern(3 * PAGE_SIZE, 5);
         f.write_at(0, &data).map_err(|_| "write")?;
         m.cache.arm_write(1); // the first page's block allocation, as it happens
-        kassert_eq!(f.sync(false), Err(VfsError::NoSpc));
+        kassert_eq!(f.sync(false), Err(VfsError::Io));
         crate::kassert!(m.fs.errored());
         m.cache.clear();
         let f4 = m.fs.lookup_live_by_lock_id(f.lock_id()).ok_or("live")?;
@@ -10106,6 +10145,388 @@ crate::ktest!(
                     free_files: 22,
                 }
             );
+        }
+        Ok(())
+    }
+);
+
+/// A deterministic hang guard: repeated bitmap reads fail persistently.
+/// Checking both counters proves the exact budget was consumed, without
+/// replacing a corruption result with the guard's I/O error (#350).
+#[cfg(feature = "ktest")]
+fn guard_bitmap_scans(m: &ktest_util::Mnt, bitmap: u64, bytes: usize, reads: usize) {
+    m.cache.fail_reads_in_after(bitmap, bitmap + bytes as u64, reads, usize::MAX);
+}
+
+/// Set a group-relative block bit in a test image's bitmap (#350).
+#[cfg(feature = "ktest")]
+fn set_block_bit(bitmap: &mut [u8], bit: usize, used: bool) {
+    let mask = 1 << (bit % 8);
+    if used {
+        bitmap[bit / 8] |= mask;
+    } else {
+        bitmap[bit / 8] &= !mask;
+    }
+}
+
+/// One fragmented group, or two groups with a contiguous run in group 0
+/// and only isolated blocks in group 1. New inodes start in the last group.
+/// The root remains block-mapped; new files follow `extents` (#350).
+#[cfg(feature = "ktest")]
+fn allocation_test_image(two_groups: bool, extents: bool) -> Vec<u8> {
+    use crate::vfs::{write_u16le as w16, write_u32le as w32};
+    let mut img = ktest_util::build_1k_blockmap_image(if two_groups { 129 } else { 128 });
+    w32(&mut img, 1024 + 0x60, if extents { 0x42 } else { 0x02 }); // s_feature_incompat
+    img[3 * 1024..4 * 1024].fill(0xff); // group 0 block bitmap
+    for n in 0..16 {
+        let block = 14 + n * if two_groups { 1 } else { 2 };
+        set_block_bit(&mut img[3 * 1024..4 * 1024], block - 1, false);
+    }
+    w16(&mut img, 2 * 1024 + 0x0c, 16); // bg_free_blocks_count_lo
+    w32(&mut img, 1024 + 0x0c, if two_groups { 32 } else { 16 }); // s_free_blocks_count_lo
+    if two_groups {
+        w32(&mut img, 1024, 64); // s_inodes_count
+        w32(&mut img, 1024 + 0x10, 32); // s_free_inodes_count: all in group 1
+        w32(&mut img, 1024 + 0x20, 64); // s_blocks_per_group
+        w32(&mut img, 1024 + 0x24, 64); // s_clusters_per_group
+        img[4 * 1024..5 * 1024].fill(0xff); // group 0 inode bitmap
+        w16(&mut img, 2 * 1024 + 0x0e, 0); // group 0 bg_free_inodes_count_lo
+        let gd = 2 * 1024 + 32; // group 1 descriptor
+        w32(&mut img, gd, 67); // bg_block_bitmap_lo
+        w32(&mut img, gd + 4, 68); // bg_inode_bitmap_lo
+        w32(&mut img, gd + 8, 69); // bg_inode_table_lo
+        w16(&mut img, gd + 0x0c, 16); // bg_free_blocks_count_lo
+        w16(&mut img, gd + 0x0e, 32); // bg_free_inodes_count_lo
+        img[67 * 1024..69 * 1024].fill(0xff); // group 1 bitmaps
+        img[68 * 1024..68 * 1024 + 4].fill(0); // 32 free inodes
+        for block in (78..110).step_by(2) {
+            set_block_bit(&mut img[67 * 1024..68 * 1024], block - 65, false);
+        }
+    }
+    img
+}
+
+/// A full bitmap fails allocation without changing the image. Optional
+/// clear padding must not be mistaken for an allocatable block (#350).
+#[cfg(feature = "ktest")]
+fn check_block_bitmap_mismatch(img: Vec<u8>, padding: Option<usize>) -> Result<(), &'static str> {
+    use self::ktest_util::*;
+    use crate::{kassert, kassert_eq};
+    let setup = mount(img, 350)?;
+    let bs = setup.fs.shared.state.lock().layout.block_size() as usize;
+    let bitmap = block_bitmap_offset(&setup.fs)?;
+    setup.root.create(b"f", 0o644).map_err(|_| "create before corruption")?;
+    setup.fs.sync().map_err(|_| "sync before corruption")?;
+    let mut img = image(&setup)?;
+    let bits = &mut img[bitmap as usize..bitmap as usize + bs];
+    bits.fill(0xff); // counts still promise room
+    if let Some(end) = padding {
+        for bit in end..bs * 8 {
+            set_block_bit(bits, bit, false);
+        }
+    }
+    let m = mount(img.clone(), 350)?;
+    let f = m.root.lookup(b"f").map_err(|_| "lookup")?;
+    kassert!(!m.fs.read_only());
+    kassert!(free_blocks(&m.fs) > 0);
+    let extents = u32::from_le_bytes(img[1024 + 0x60..1024 + 0x64].try_into().unwrap()) & 0x40 != 0;
+    // n > 1 first searches for a run, then confirms no free bit exists.
+    let scans = if extents && bs < PAGE_SIZE { 2 } else { 1 };
+    guard_bitmap_scans(&m, bitmap, bs, scans * bs);
+    kassert_eq!(f.write_at(0, &pattern(PAGE_SIZE, 35)), Ok(PAGE_SIZE));
+    kassert_eq!(f.sync(false), Err(VfsError::Io));
+    kassert_eq!(m.cache.range_reads_left(), usize::MAX);
+    kassert_eq!(m.cache.range_skip_left(), 0);
+    kassert!(went_read_only(&m));
+    kassert!(!m.cache.faulted());
+    kassert_eq!(m.cache.writes.load(Ordering::Acquire), 0);
+    kassert_eq!(image(&m)?, img);
+    kassert_eq!(f.write_at(0, b"again"), Err(VfsError::RoFs));
+    Ok(())
+}
+
+crate::ktest!(
+    fn ext4_block_bitmap_mismatch_fails_read_only_without_reallocation() {
+        check_block_bitmap_mismatch(crate::vfs::build_minimal_ext4_image_blocks(256), None)?;
+        check_block_bitmap_mismatch(allocation_test_image(false, false), None)?;
+        // A 1 KiB extent page requests n == 4: a wholly full bitmap is
+        // corruption, not fragmentation (#350).
+        check_block_bitmap_mismatch(allocation_test_image(false, true), None)?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_block_bitmap_padding_is_never_allocated() {
+        use crate::vfs::{write_u16le as w16, write_u32le as w32};
+        for extents in [false, true] {
+            // The last group has only 127 real blocks, though its capacity
+            // is 8192. Clear padding past the volume must not be allocated.
+            check_block_bitmap_mismatch(allocation_test_image(false, extents), Some(127))?;
+            let mut img = allocation_test_image(true, extents);
+            // Allow a new inode in group 0, whose padding would alias group 1.
+            img[4 * 1024..4 * 1024 + 4].copy_from_slice(&[0xff, 3, 0, 0]);
+            w16(&mut img, 2 * 1024 + 0x0e, 22); // group 0 free inodes
+            w32(&mut img, 1024 + 0x10, 54); // total free inodes
+            check_block_bitmap_mismatch(img, Some(64))?;
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_inode_bitmap_mismatch_fails_read_only_without_reallocation() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        // Every valid inode is allocated, but both counts promise room (#350).
+        let mut img = crate::vfs::build_minimal_ext4_image_blocks(256);
+        img[3 * 4096..4 * 4096].fill(0xff);
+        let m = mount(img.clone(), 351)?;
+        kassert!(!m.fs.read_only());
+        kassert!(free_inodes(&m.fs) > 0);
+        guard_bitmap_scans(&m, 3 * 4096, 4096, 4096);
+        kassert_eq!(m.root.create(b"cannot-create", 0o644).err(), Some(VfsError::Io));
+        kassert_eq!(m.cache.range_reads_left(), usize::MAX);
+        kassert_eq!(m.cache.range_skip_left(), 0);
+        kassert!(went_read_only(&m));
+        kassert!(!m.cache.faulted());
+        kassert_eq!(m.cache.writes.load(Ordering::Acquire), 0);
+        kassert_eq!(image(&m)?, img);
+        kassert_eq!(m.root.lookup(b"cannot-create").err(), Some(VfsError::NoEnt));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_fragmented_extent_group_falls_back_without_corruption() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        // A page needs four blocks. With no adjacent free bits, requests
+        // are 4,3,2,1, then 3,2,1, then 2,1, then 1 (#350).
+        let m = mount(allocation_test_image(false, true), 352)?;
+        let f = m.root.create(b"fragmented", 0o644).map_err(|_| "create")?;
+        let before = image(&m)?;
+        let bitmap = block_bitmap_offset(&m.fs)?;
+        // Six full run scans; free-bit probes read 13 bytes, successful run
+        // scans 10, setting bits 4, and four whole-bitmap checksum reads.
+        guard_bitmap_scans(&m, bitmap, 1024, 6 * 1024 + 31);
+        let data = pattern(PAGE_SIZE, 36);
+        kassert_eq!(f.write_at(0, &data), Ok(data.len()));
+        kassert_eq!(f.sync(false), Ok(()));
+        kassert_eq!(m.cache.range_reads_left(), usize::MAX);
+        kassert_eq!(m.cache.range_skip_left(), 0);
+        kassert!(!m.fs.read_only());
+        kassert!(!m.fs.errored());
+        kassert_eq!(free_blocks(&m.fs), 12);
+        let after = image(&m)?;
+        let at = bitmap as usize;
+        let mut expected = before[at..at + 1024].to_vec();
+        for block in [14, 16, 18, 20] {
+            set_block_bit(&mut expected, block - 1, true);
+        }
+        kassert_eq!(&after[at..at + 1024], expected.as_slice());
+        let ro = mount_ro_image(after, 353)?;
+        kassert_eq!(read_all(&ro.root_inode().lookup(b"fragmented").map_err(|_| "remount lookup")?)?, data);
+        Ok(())
+    }
+);
+
+/// The bitmap of the inode's group, using the same descriptor lookup as
+/// the group-zero helper rather than a test image's fixed offsets (#350).
+#[cfg(feature = "ktest")]
+fn inode_group_bitmap(m: &ktest_util::Mnt, f: &Arc<dyn VfsInode>) -> Result<u64, &'static str> {
+    let inner = m.fs.shared.state.lock();
+    let group = (f.ino() as u32 - 1) / inner.layout.inodes_per_group;
+    let block = inner.layout.group_block(&inner.bcache, group, BG_BLOCK_BITMAP).map_err(|_| "group bitmap")?;
+    inner.layout.block_byte(block).map_err(|_| "bitmap byte")
+}
+
+crate::ktest!(
+    fn ext4_fragmented_extent_group_wraps_to_another_group_once() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(allocation_test_image(true, true), 354)?;
+        let f = m.root.create(b"wrap", 0o644).map_err(|_| "create in group 1")?;
+        kassert_eq!(f.ino(), 33);
+        let before = image(&m)?;
+        let bitmap = inode_group_bitmap(&m, &f)?;
+        // One full run scan in group 1, then two byte reads finding its
+        // first free bit. Starting in group 0 would leave this budget unused.
+        guard_bitmap_scans(&m, bitmap, 1024, 1024 + 2);
+        let data = pattern(PAGE_SIZE, 37);
+        kassert_eq!(f.write_at(0, &data), Ok(data.len()));
+        kassert_eq!(f.sync(false), Ok(()));
+        kassert_eq!(m.cache.range_reads_left(), usize::MAX);
+        kassert_eq!(m.cache.range_skip_left(), 0);
+        kassert!(!m.fs.read_only());
+        kassert_eq!(free_blocks(&m.fs), 28);
+        let after = image(&m)?;
+        let at = bitmap as usize;
+        kassert_eq!(&after[at..at + 1024], &before[at..at + 1024]);
+        kassert_eq!(&after[14 * 1024..18 * 1024], data.as_slice());
+        let ro = mount_ro_image(after, 355)?;
+        kassert_eq!(read_all(&ro.root_inode().lookup(b"wrap").map_err(|_| "remount lookup")?)?, data);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_block_map_allocation_starts_in_its_group_then_wraps() {
+        use self::ktest_util::*;
+        use crate::vfs::{write_u16le as w16, write_u32le as w32};
+        use crate::{kassert, kassert_eq};
+        let mut img = allocation_test_image(true, false);
+        // One free block in group 1 proves where the search starts. After
+        // taking it, that group's count is zero: the next allocation wraps.
+        img[67 * 1024..68 * 1024].fill(0xff);
+        set_block_bit(&mut img[67 * 1024..68 * 1024], 78 - 65, false);
+        w16(&mut img, 2 * 1024 + 32 + 0x0c, 1); // group 1 free blocks
+        w32(&mut img, 1024 + 0x0c, 17); // total free blocks
+        let m = mount(img, 356)?;
+        let f = m.root.create(b"wrap-map", 0o644).map_err(|_| "create")?;
+        kassert_eq!(f.ino(), 33);
+        let bitmap = inode_group_bitmap(&m, &f)?;
+        // Two scan reads, the set's pre-read, and one checksum read.
+        guard_bitmap_scans(&m, bitmap, 1024, 4);
+        let data = pattern(2048, 38);
+        kassert_eq!(f.write_at(0, &data), Ok(data.len()));
+        kassert_eq!(f.sync(false), Ok(()));
+        kassert_eq!(m.cache.range_skip_left(), 0);
+        kassert_eq!(m.cache.range_reads_left(), usize::MAX);
+        kassert!(!m.fs.read_only());
+        kassert_eq!(free_blocks(&m.fs), 15);
+        let after = image(&m)?;
+        kassert!(after[bitmap as usize..bitmap as usize + 1024].iter().all(|b| *b == 0xff));
+        kassert_eq!(&after[78 * 1024..79 * 1024], &data[..1024]);
+        kassert_eq!(&after[14 * 1024..15 * 1024], &data[1024..]);
+        let ro = mount_ro_image(after, 357)?;
+        kassert_eq!(read_all(&ro.root_inode().lookup(b"wrap-map").map_err(|_| "remount lookup")?)?, data);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_allocation_corruption_allows_mkdir_undo_before_freezing() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let setup = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 358)?;
+        let bitmap = block_bitmap_offset(&setup.fs)?;
+        let mut img = image(&setup)?;
+        img[bitmap as usize..bitmap as usize + 4096].fill(0xff);
+        let m = mount(img.clone(), 358)?;
+        let before = free_inodes(&m.fs);
+        let nlink = m.root.stat().map_err(|_| "stat before")?.nlink;
+        // Inode allocation writes first. Dir::init then finds the lying
+        // block count; its undo must still write into the stopped cache.
+        // The undo may probe the bitmap again while trying to clean up.
+        guard_bitmap_scans(&m, bitmap, 4096, 2 * 4096);
+        kassert_eq!(m.root.mkdir(b"failed-dir", 0o755).err(), Some(VfsError::Io));
+        kassert!(m.cache.writes.load(Ordering::Acquire) > 4);
+        kassert!(went_read_only(&m));
+        kassert_eq!(m.cache.range_reads_left(), usize::MAX);
+        kassert_eq!(free_inodes(&m.fs), before);
+        kassert_eq!(m.root.lookup(b"failed-dir").err(), Some(VfsError::NoEnt));
+        kassert_eq!(m.root.stat().map_err(|_| "stat after")?.nlink, nlink);
+        kassert_eq!(raw_mode_and_links(&m.fs, 2)?.1, nlink as u16);
+        kassert_eq!(raw_mode_and_links(&m.fs, 11)?, (0, 0));
+        // Undo reached only the cache; the inode bit was returned there.
+        kassert_eq!(m.dev_bytes(), img);
+        let cached = image(&m)?;
+        kassert_eq!(&cached[3 * 4096..4 * 4096], &img[3 * 4096..4 * 4096]);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_allocation_corruption_keeps_the_first_failure_cause() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        for device_first in [true, false] {
+            let setup = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 359)?;
+            let f = setup.root.create(b"f", 0o644).map_err(|_| "create")?;
+            let ino = NonZeroU32::new(f.ino() as u32).ok_or("ino")?;
+            let bitmap = block_bitmap_offset(&setup.fs)?;
+            let mut img = image(&setup)?;
+            img[bitmap as usize..bitmap as usize + 4096].fill(0xff);
+            let m = mount(img, 359)?;
+            let op = m.fs.shared.op("writeback");
+            m.cache.fail_syncs.store(true, Ordering::Release);
+            if device_first {
+                kassert_eq!(m.fs.shared.cache.sync(), Err(BlockError::Io));
+            }
+            // Continue inside an already running operation, directly through
+            // ext4plus so the second trigger is reached after the first.
+            guard_bitmap_scans(&m, bitmap, 4096, 4096);
+            let err = {
+                let inner = m.fs.shared.state.lock();
+                let mut disk = Inode::read(&inner.ext4, ino).map_err(|_| "read inode")?;
+                ext4_write_all(&inner.ext4, &mut disk, &pattern(PAGE_SIZE, 39), 0).unwrap_err()
+            };
+            kassert!(matches!(err, Ext4Error::Corrupt(_)));
+            if !device_first {
+                kassert_eq!(m.fs.shared.cache.sync(), Err(BlockError::Io));
+            }
+            kassert_eq!(m.fs.shared.cache.allocation_corrupt.lock().is_none(), device_first);
+            kassert!(m.fs.errored());
+            kassert!(!m.cache.frozen()); // running operations may still undo
+            kassert_eq!(m.cache.range_skip_left(), 0);
+            kassert_eq!(m.cache.range_reads_left(), usize::MAX);
+            drop(op);
+            kassert!(went_read_only(&m));
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_extent_allocation_does_not_retry_nonspace_errors() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let _held = crate::klog::hold_repeats("vfs");
+        // A page requests four contiguous blocks. Failing the second bitmap
+        // write must return its EIO, not retry three blocks and succeed.
+        for kind in 0..3 {
+            let m = mount(allocation_test_image(true, true), 350)?;
+            let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
+            let ino = NonZeroU32::new(f.ino() as u32).ok_or("ino")?;
+            // Group 0 has the contiguous run after group 1 is searched.
+            let bitmap = block_bitmap_offset(&m.fs)?;
+            let before = image(&m)?;
+            let op = m.fs.shared.op("writeback");
+            m.cache.arm_write(if kind == 0 { 2 } else { 0 });
+            if kind == 1 {
+                m.cache.fail_writes_uncounted.store(true, Ordering::Release);
+            } else if kind == 2 {
+                m.cache.freeze(); // a cache already frozen by another operation
+            }
+            let res = {
+                let inner = m.fs.shared.state.lock();
+                let mut disk = Inode::read(&inner.ext4, ino).map_err(|_| "read inode")?;
+                ext4_write_all(&inner.ext4, &mut disk, &pattern(PAGE_SIZE, 40), 0).map_err(map_ext4_err)
+            };
+            kassert_eq!(res, Err(if kind == 2 { VfsError::RoFs } else { VfsError::Io }));
+            kassert_eq!(
+                m.cache.writes.load(Ordering::Acquire),
+                if kind == 0 {
+                    2
+                } else if kind == 1 {
+                    0
+                } else {
+                    1
+                }
+            );
+            kassert_eq!(m.fs.errored(), kind == 0);
+            m.cache.clear();
+            drop(op);
+            let after = image(&m)?;
+            let at = bitmap as usize;
+            let mut expected = before[at..at + 1024].to_vec();
+            if kind == 0 {
+                set_block_bit(&mut expected, 14 - 1, true); // just the first write landed
+            }
+            kassert_eq!(&after[at..at + 1024], expected.as_slice());
+            kassert_eq!(&after[1024 + 0x0c..1024 + 0x10], &before[1024 + 0x0c..1024 + 0x10]);
+            kassert!(m.root.lookup(b"f").is_ok());
         }
         Ok(())
     }

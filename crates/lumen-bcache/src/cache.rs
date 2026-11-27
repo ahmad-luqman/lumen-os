@@ -60,7 +60,7 @@ impl Slot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Writeback {
     Running,
-    /// `BlockCache::stop_writeback` (test-util), or a failure under
+    /// [`BlockCache::stop_writeback`], or a failure under
     /// [`BlockCache::stop_writeback_on_failure`]: nothing is written to the
     /// device or flushed; writes into the cache are still taken.
     Stopped,
@@ -244,15 +244,15 @@ impl<B: BlockDevice> BlockCache<B> {
     }
 
     /// Write nothing more to the device or flush it, for good unless
-    /// [`Self::thaw`]ed, while still taking writes into the cache:
+    /// thawed by test utilities, while still taking writes into the cache:
     /// [`Self::sync`] and [`Self::flush_blocks`] return
     /// [`BlockError::ReadOnly`] without writing or flushing anything, and
     /// eviction takes only clean slots, so dirty blocks stay cached and keep
     /// being read (a [`Self::read_at`] miss while every unpinned slot is
     /// dirty is read from the device, uncached; a write or pin miss returns
     /// [`BlockError::CacheFull`]). For a filesystem that stops writing after
-    /// a write error (`ext4`'s `errors=remount-ro`).
-    #[cfg(any(test, feature = "test-util"))]
+    /// a write error or detected corruption (`ext4`'s `errors=remount-ro`).
+    /// Calling this on an already frozen cache never unfreezes it.
     pub fn stop_writeback(&self) {
         let mut inner = self.inner.borrow_mut();
         if inner.writeback == Writeback::Running {
@@ -269,7 +269,7 @@ impl<B: BlockDevice> BlockCache<B> {
         self.inner.borrow_mut().stop_on_failure = true;
     }
 
-    /// Whether writeback is stopped (`stop_writeback` (test-util),
+    /// Whether writeback is stopped ([`Self::stop_writeback`],
     /// [`Self::freeze`], or a failure under
     /// [`Self::stop_writeback_on_failure`]).
     pub fn writeback_stopped(&self) -> bool {

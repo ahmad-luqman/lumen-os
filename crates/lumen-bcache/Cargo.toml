@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# `BlockCache::thaw` and `stop_writeback`, for tests only (the kernel's
+# `BlockCache::thaw`, for tests only (the kernel's
 # ktest build turns it on).
 test-util = []
 
