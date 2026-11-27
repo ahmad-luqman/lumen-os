@@ -436,7 +436,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Failed openat(O_TRUNC) invalidates shared and private mappings in every address space after an in-memory shrink, preserving copies if the size did not change (#414)"
+name = "A failed openat(O_TRUNC) or ftruncate unmaps shared and private mappings in every address space mapping the file after an in-memory shrink, and keeps private copies if the size did not change (#414)"
 milestone = "M8"
 tests = [
     "cargo:lumen-vfs",

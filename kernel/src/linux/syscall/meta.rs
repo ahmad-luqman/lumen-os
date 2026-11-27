@@ -209,20 +209,20 @@ fn length(raw: u64) -> Result<u64, u32> {
 /// made; any leaf past the new end is cleared all the same.
 fn resize(inode: &dyn VfsInode, len: u64) -> Result<u64, u32> {
     writable_mount(inode)?;
-    match inode.truncate(len) {
-        Ok(()) => super::unmap_past(inode, len),
-        Err(e) => {
-            unmap_past_size_now(inode, len);
-            return Err(vfs(e));
-        }
+    if let Err(e) = inode.truncate(len) {
+        unmap_past_size_now(inode, len);
+        return Err(vfs(e));
     }
+    super::unmap_past(inode, len);
     Ok(0)
 }
 
 /// After a failed truncate, invalidate mappings even if ext4's
 /// `errors=remount-ro` (#349) turned an in-memory shrink into `EIO`.
-/// With the inode locks released, use its current size, never below the
-/// requested `len`: an unchanged file keeps its private copied pages.
+/// The caller must hold no inode lock. Use its current size, never below
+/// the requested `len`: an unchanged file keeps its private copied pages.
+/// On ext4 the errored volume is already read-only, so a concurrent grow
+/// cannot race this invalidation.
 /// If `stat` fails, warn and fall back to `len` so an unreadable size cannot
 /// silently leave pages past a possible new EOF mapped.
 pub(super) fn unmap_past_size_now(inode: &dyn VfsInode, len: u64) {

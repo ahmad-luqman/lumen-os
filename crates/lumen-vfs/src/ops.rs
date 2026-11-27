@@ -289,12 +289,13 @@ impl Opened {
 /// once this returns. An open file description built from it with
 /// [`OpenFile::new_unchecked_flags`](crate::fd::OpenFile::new_unchecked_flags)
 /// then fails with `ENOENT` (that call checks again); an
-/// [`OpenGuard::new_unchecked`] on it can hold a freed inode. File
-/// descriptors use [`open_inode_guarded`] and
+/// [`OpenGuard::new_unchecked`] on it can hold a freed inode. Syscall
+/// `openat` uses [`open_inode_guarded_with_truncate_error`] and
 /// [`OpenFile::from_opened`](crate::fd::OpenFile::from_opened). The brief
 /// reference it holds while opening can make a racing last-link unlink
 /// detach the file instead of freeing it, which on ext4 copies it into
 /// detached memory and can fail that unlink with `ENOSPC` over the quota.
+/// A failed `O_TRUNC` here unmaps nothing, even if it shrank the inode.
 pub fn open_inode(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
@@ -323,6 +324,9 @@ pub fn open_inode(
 /// its filesystem's Lock 3, by design: on a filesystem with a rename lock
 /// (ext4, tmpfs) no unlink can come between, and the open must succeed even
 /// if one follows at once. Every error gives the reference back.
+/// A failed `O_TRUNC` here unmaps nothing, even if it shrank the inode;
+/// syscall `openat` uses [`open_inode_guarded_with_truncate_error`] to
+/// invalidate mappings on that path.
 pub fn open_inode_guarded(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
@@ -334,7 +338,7 @@ pub fn open_inode_guarded(
     open_inode_guarded_with_truncate_error(env, start_dir, path, flags, mode, umask, &mut |_| {})
 }
 
-/// Like [`open_inode_guarded`], notifying `on_error` if the opened inode's
+/// Like [`open_inode_guarded`], notifying `on_truncate_error` if the opened inode's
 /// `O_TRUNC` fails. The callback runs after `truncate` releases its locks,
 /// while the open reference still pins that exact inode, before returning
 /// the original error. This lets a syscall invalidate mappings even when
@@ -347,10 +351,10 @@ pub fn open_inode_guarded_with_truncate_error(
     flags: OpenFlags,
     mode: u16,
     umask: u16,
-    on_error: &mut dyn FnMut(&dyn VfsInode),
+    on_truncate_error: &mut dyn FnMut(&dyn VfsInode),
 ) -> Result<Opened, VfsError> {
     for _ in 0..=MAX_CREAT_RACE_RETRIES {
-        if let Some((guard, path)) = open_once(env, start_dir, path, flags, mode, umask, on_error)? {
+        if let Some((guard, path)) = open_once(env, start_dir, path, flags, mode, umask, on_truncate_error)? {
             return Ok(Opened { guard, path, flags });
         }
     }
@@ -369,7 +373,7 @@ fn open_once(
     flags: OpenFlags,
     mode: u16,
     umask: u16,
-    on_error: &mut dyn FnMut(&dyn VfsInode),
+    on_truncate_error: &mut dyn FnMut(&dyn VfsInode),
 ) -> Result<Option<OpenedOnce>, VfsError> {
     if flags.has_tmpfile() {
         return Err(VfsError::OpNotSupp);
@@ -620,7 +624,7 @@ fn open_once(
         && guard.inode().inode_type() == InodeType::File
         && let Err(e) = guard.inode().truncate(0)
     {
-        on_error(&**guard.inode());
+        on_truncate_error(&**guard.inode());
         return Err(e);
     }
 

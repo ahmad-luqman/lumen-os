@@ -217,8 +217,10 @@ pub trait VfsInode: Send + Sync {
     /// unchanged or the requested size; [`Self::stat`] reports which (in
     /// the absence of a concurrent resize). A failure need not undo a
     /// completed in-memory shrink: ext4's `errors=remount-ro` (#349) can
-    /// report `EIO` after it. Callers must invalidate mappings past the
-    /// reported size on failure too, after this call releases inode locks.
+    /// report `EIO` after it. Syscall callers (`truncate`, `ftruncate`, and
+    /// `openat(O_TRUNC)`) must invalidate mappings past the reported size
+    /// on failure too, after this call releases inode locks. Kernel-side
+    /// truncations are exempt from mapping invalidation.
     fn truncate(&self, size: u64) -> Result<(), VfsError>;
     fn set_mode(&self, mode: u16) -> Result<(), VfsError>;
     /// Set the owner and group (`None` leaves either as it is), update

@@ -488,8 +488,8 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     let opened = start.open(&path, flags, mode)?;
     let mut file = KernelFile::from_opened(opened).map_err(vfs)?;
     if truncating && file.inode().inode_type() == InodeType::File {
-        // The open truncated it to 0 (exactly when `open_inode_guarded`
-        // does): unmap every address space's pages, as `truncate` does.
+        // `open_inode_guarded_with_truncate_error` truncated it to 0:
+        // unmap every address space's pages, as `truncate` does.
         super::unmap_past(&**file.inode(), 0);
     }
     if let Some(full) = start.display_path(&file.path) {
@@ -1633,100 +1633,114 @@ crate::ktest!(
         use lumen_vm::{MapPlace, Prot};
 
         let _held = crate::klog::hold_repeats("vfs");
-        let mut shrank = 0;
-        let mut kept = 0;
-        // Main's order: bitmap frees, descriptor checksum/count, superblock
-        // count, then the inode. The first extent bitmap write (1) fails
-        // once and is retried block-by-block; truncate shrinks in memory,
-        // then #349's WriteOp::end returns EIO. The final inode write
-        // (measured on a clean clone) fails without changing the size.
-        // Block maps do not retry a failed free: their first bitmap write
-        // fails before the shrink, so that leg must keep its mapped frames.
-        for case in 0..3 {
-            let changed = process::in_test_process(move |_| {
-                let minor = 414 + case;
-                let m = if case == 2 { mount(build_1k_blockmap_image(256), minor)? } else { fault_ext4(minor)? };
-                let f = m.root.create(b"mapped", 0o644).map_err(|_| "create")?;
-                kassert_eq!(f.write_at(0, &[0x5a; 8192]), Ok(8192));
-                f.sync(false).map_err(|_| "sync")?;
-                let ino = u32::try_from(f.ino()).map_err(|_| "ino")?;
-                let old_size = f.stat().map_err(|_| "stat before")?.size;
-                kassert_eq!(old_size, disk_inode_size(&m.fs, ino)?);
-                kassert_eq!(old_size, 8192);
-                let fail_at = if case == 1 {
-                    let clean = mount(image(&m)?, 417)?;
-                    let clean_file = clean.root.lookup(b"mapped").map_err(|_| "clean lookup")?;
-                    clean.cache.arm_write(0);
-                    clean_file.truncate(0).map_err(|_| "clean truncate")?;
-                    kassert_eq!(disk_inode_size(&clean.fs, ino)?, 0);
-                    clean.cache.writes.load(Ordering::Acquire)
-                } else {
-                    1
-                };
-                let dirfd = ktest_install(&m.root, b"/", OpenFlags::O_RDONLY)?;
-                let path = ktest_user_path(0, b"mapped")?;
-                let other = Arc::new(AddressSpace::new().map_err(|_| "other space")?);
-                let current = crate::sched::current_address_space().ok_or("current space")?;
-                let mut mapped = Vec::new();
-                for space in [&current, &other] {
-                    for sharing in [Sharing::Shared, Sharing::Private] {
-                        let va = space
-                            .mmap_file(
-                                MapPlace::Hint(None),
-                                8192,
-                                Prot::READ | Prot::WRITE,
-                                file_vm_open(&f)?,
-                                0,
-                                sharing,
-                            )
-                            .map_err(|_| "map file")?;
-                        // A write fault makes a real private copy as well as
-                        // a writable shared leaf, both past the future EOF.
-                        kassert_eq!(space.handle_page_fault(va + 4096, 1 << 1), FaultResult::Resolved);
-                        let phys = file_vm_leaf(space, va + 4096).ok_or("mapped leaf")?.phys;
-                        mapped.push((Arc::clone(space), va, phys));
-                    }
-                }
-                m.cache.arm_write(fail_at);
-                let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_TRUNC);
-                kassert_eq!(sys_openat(Dirfd::Fd(dirfd), path, flags, at::reg(0)), neg_errno(errno::EIO));
-                let completed = own_result(&m.fs, Err(VfsError::Io)).is_ok();
-                kassert!(m.cache.faulted());
-                kassert!(crate::vfs::ext4::ktest_util::went_read_only(&m));
-                let size = f.stat().map_err(|_| "stat after")?.size;
-                let disk_size = disk_inode_size(&m.fs, ino)?;
-                let layout = if case == 2 { "block-map" } else { "extents" };
-                let write = if case == 1 { "final inode" } else { "first data bitmap free" };
-                crate::ktest::diag(format_args!(
-                    "O_TRUNC {layout}: failed write {fail_at} ({write}), before={old_size}, \
-                     stat={size}, cached disk inode={disk_size}, truncate completed={completed}, returned EIO"
-                ));
-                kassert_eq!(size, disk_size);
-                kassert_eq!(completed, size == 0);
-                kassert!(size == 0 || size == old_size);
-                for (space, va, phys) in mapped {
-                    if size == 0 {
-                        kassert!(file_vm_leaf(&space, va + 4096).is_none());
-                        kassert_eq!(space.handle_page_fault(va + 4096, 0), FaultResult::BusError);
+        for use_ftruncate in [false, true] {
+            let mut shrank = 0;
+            let mut kept = 0;
+            // The vendored ext4plus's truncate order: bitmap frees, descriptor
+            // checksum/count, superblock count, then the inode. The first
+            // extent bitmap write (1) fails
+            // once and is retried block-by-block; truncate shrinks in memory,
+            // then #349's WriteOp::end returns EIO. The final inode write
+            // (measured on a clean clone) fails without changing the size.
+            // Block maps do not retry a failed free: their first bitmap write
+            // fails before the shrink, so that leg must keep its mapped frames.
+            for case in 0..3 {
+                let changed = process::in_test_process(move |_| {
+                    let minor = 414 + case + 10 * u32::from(use_ftruncate);
+                    let m = if case == 2 { mount(build_1k_blockmap_image(256), minor)? } else { fault_ext4(minor)? };
+                    let f = m.root.create(b"mapped", 0o644).map_err(|_| "create")?;
+                    kassert_eq!(f.write_at(0, &[0x5a; 8192]), Ok(8192));
+                    f.sync(false).map_err(|_| "sync")?;
+                    let ino = u32::try_from(f.ino()).map_err(|_| "ino")?;
+                    let old_size = f.stat().map_err(|_| "stat before")?.size;
+                    kassert_eq!(old_size, disk_inode_size(&m.fs, ino)?);
+                    kassert_eq!(old_size, 8192);
+                    let fail_at = if case == 1 {
+                        let clean = mount(image(&m)?, minor + 100)?;
+                        let clean_file = clean.root.lookup(b"mapped").map_err(|_| "clean lookup")?;
+                        clean.cache.arm_write(0);
+                        clean_file.truncate(0).map_err(|_| "clean truncate")?;
+                        kassert_eq!(disk_inode_size(&clean.fs, ino)?, 0);
+                        clean.cache.writes.load(Ordering::Acquire)
                     } else {
-                        kassert_eq!(file_vm_leaf(&space, va + 4096).map(|leaf| leaf.phys), Some(phys));
+                        1
+                    };
+                    let fd = if use_ftruncate {
+                        ktest_install(&f, b"/mapped", OpenFlags::O_RDWR)?
+                    } else {
+                        ktest_install(&m.root, b"/", OpenFlags::O_RDONLY)?
+                    };
+                    let path = ktest_user_path(0, b"mapped")?;
+                    let other = Arc::new(AddressSpace::new().map_err(|_| "other space")?);
+                    let current = crate::sched::current_address_space().ok_or("current space")?;
+                    let mut mapped = Vec::new();
+                    for space in [&current, &other] {
+                        for sharing in [Sharing::Shared, Sharing::Private] {
+                            let va = space
+                                .mmap_file(
+                                    MapPlace::Hint(None),
+                                    8192,
+                                    Prot::READ | Prot::WRITE,
+                                    file_vm_open(&f)?,
+                                    0,
+                                    sharing,
+                                )
+                                .map_err(|_| "map file")?;
+                            // A write fault makes a real private copy as well as
+                            // a writable shared leaf, both past the future EOF.
+                            kassert_eq!(space.handle_page_fault(va + 4096, 1 << 1), FaultResult::Resolved);
+                            let phys = file_vm_leaf(space, va + 4096).ok_or("mapped leaf")?.phys;
+                            mapped.push((Arc::clone(space), va, phys));
+                        }
                     }
-                    space.munmap(va, 8192).map_err(|_| "unmap")?;
+                    m.cache.arm_write(fail_at);
+                    let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_TRUNC);
+                    let result = if use_ftruncate {
+                        super::meta::sys_ftruncate(fd, 0)
+                    } else {
+                        sys_openat(Dirfd::Fd(fd), path, flags, at::reg(0))
+                    };
+                    kassert_eq!(result, neg_errno(errno::EIO));
+                    let completed = own_result(&m.fs, Err(VfsError::Io)).is_ok();
+                    kassert!(m.cache.faulted());
+                    kassert!(crate::vfs::ext4::ktest_util::went_read_only(&m));
+                    let size = f.stat().map_err(|_| "stat after")?.size;
+                    let disk_size = disk_inode_size(&m.fs, ino)?;
+                    let layout = if case == 2 { "block-map" } else { "extents" };
+                    let write = if case == 1 { "final inode" } else { "first data bitmap free" };
+                    let call = if use_ftruncate { "ftruncate" } else { "O_TRUNC" };
+                    crate::ktest::diag(format_args!(
+                        "{call} {layout}: failed write {fail_at} ({write}), before={old_size}, \
+                         stat={size}, cached disk inode={disk_size}, truncate completed={completed}, returned EIO"
+                    ));
+                    kassert_eq!(size, disk_size);
+                    kassert_eq!(completed, size == 0);
+                    kassert!(size == 0 || size == old_size);
+                    for (space, va, phys) in mapped {
+                        if size == 0 {
+                            kassert!(file_vm_leaf(&space, va + 4096).is_none());
+                            kassert_eq!(space.handle_page_fault(va + 4096, 0), FaultResult::BusError);
+                        } else {
+                            kassert_eq!(file_vm_leaf(&space, va + 4096).map(|leaf| leaf.phys), Some(phys));
+                        }
+                        space.munmap(va, 8192).map_err(|_| "unmap")?;
+                    }
+                    other.teardown();
+                    kassert_eq!(sys_close(fd), 0);
+                    Ok(size < old_size)
+                })??;
+                kassert_eq!(changed, case == 0);
+                if changed {
+                    shrank += 1;
+                } else {
+                    kept += 1;
                 }
-                other.teardown();
-                kassert_eq!(sys_close(dirfd), 0);
-                Ok(size < old_size)
-            })??;
-            if changed {
-                shrank += 1;
-            } else {
-                kept += 1;
             }
+            // Reach guards: observing only unchanged failures must not turn
+            // the regression test into a pass with no failed-shrink coverage.
+            kassert_eq!(shrank, 1);
+            kassert_eq!(kept, 2);
         }
-        // Reach guards: observing only unchanged failures must not turn
-        // the regression test into a pass with no failed-shrink coverage.
-        kassert_eq!(shrank, 1);
-        kassert_eq!(kept, 2);
         Ok(())
     }
 );

@@ -8763,8 +8763,8 @@ fn truncate_error_callback_runs_once_on_the_pinned_file_only() {
         assert_eq!(inode.open_count(), 1, "the callback still holds the open reference");
         assert!(f.state.try_lock().is_ok(), "no inode lock held by truncate");
         assert!(g.rename_lock.try_lock().is_ok(), "no rename lock held by open");
-        // Unlink here: the callback's guard must preserve the data until
-        // the failed open returns, just as a racing last-link unlink does.
+        // Unlink here: the open's guard still pins the inode, so its data
+        // stays until the failed open returns.
         g.root.unlink(b"trunc").unwrap();
         assert!(inode.is_detached());
         assert_eq!(inode.stat().unwrap().size, GATE_DATA.len() as u64);
