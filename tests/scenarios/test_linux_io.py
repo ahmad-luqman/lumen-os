@@ -299,16 +299,25 @@ def test_ptyrun_console_relay(boot, tmp_path):
 
     def read_console_termios() -> str:
         m.send_line(f"linux {program} termios")
-        found = m.expect(re.compile(r"^TERMIOS:([0-9a-f]{72})\r?$", re.MULTILINE), 20)
+        found = m.expect(
+            re.compile(r"^(TERMIOS:[0-9a-f]{72}|FAIL termios[^\r\n]*)\r?\n", re.MULTILINE), 20
+        )
+        line = found.group(1)
+        assert line.startswith("TERMIOS:"), line
         m.expect(rf"linux: {re.escape(program)} exit=0 leaked_frames=-?\d+\n", 20)
         m.expect(r"lumen> ", 10)
-        return found.group(1)
+        return line.removeprefix("TERMIOS:")
 
     termios_before = read_console_termios()
+    # Bytes 12..16 hold c_lflag; console must start cooked (non-zero) so raw=0 is observable.
+    assert termios_before[24:32] != "00000000", termios_before
 
-    # Interactive serial-console relay: input reaches child over PTY, output
-    # returns over serial, non-zero exit code propagates, console tty restored.
+    # Interactive serial-console relay: console enters raw mode during the
+    # relay, input reaches child over PTY, output returns over serial, non-zero
+    # exit code propagates, and console tty termios is restored.
     m.send_line(f"linux /usr/local/bin/ptyrun {program} ptyrun-child console-echo")
+    lflag_match = m.expect(re.compile(r"^RELAY_CONSOLE_LFLAG:(\d+)\r?\n", re.MULTILINE), 30)
+    assert int(lflag_match.group(1)) == 0, lflag_match.group(0)
     m.expect(re.compile(r"^RELAY_CONSOLE_READY\r?$", re.MULTILINE), 30)
     m.send("hello-relay-console\n")
     m.expect(re.compile(r"^RELAY_GOT:hello-relay-console\r?$", re.MULTILINE), 30)

@@ -140,7 +140,8 @@ macro_rules! say_err {
 static WINCH_PIPE_W: AtomicI32 = AtomicI32::new(-1);
 
 /// Async-signal-safe `SIGWINCH` handler: performs one atomic load and one raw
-/// `write` syscall to the non-blocking self-pipe. `EAGAIN` on a full pipe is
+/// `write` syscall to the non-blocking self-pipe (`write_raw` is a direct
+/// syscall and never touches libc `errno`). `EAGAIN` on a full pipe is
 /// harmless because the read end is already readable and will coalesce resizes.
 extern "C" fn sigwinch_handler(_sig: c_int) {
     let fd = WINCH_PIPE_W.load(Ordering::Acquire);
@@ -168,8 +169,8 @@ fn set_sigwinch(old: &mut [u64; 4]) -> i64 {
     set_sigaction(SIGWINCH, &action, Some(old))
 }
 
-fn restore_sigaction(sig: u64, old: &[u64; 4]) {
-    let _ = set_sigaction(sig, old, None);
+fn restore_sigaction(sig: u64, old: &[u64; 4]) -> i64 {
+    set_sigaction(sig, old, None)
 }
 
 fn read_stdin_winsize() -> Option<[u16; 4]> {
@@ -774,15 +775,32 @@ struct RelaySetup {
     saved_stdout_fl: Option<u64>,
 }
 
-fn undo_relay_setup(setup: &RelaySetup) {
+/// Undo relay setup in reverse dependency order: stdout flags and stdin
+/// termios first, then restore `SIGWINCH` before clearing `WINCH_PIPE_W` and
+/// closing `winch_pipe` (so the handler cannot write to a closed/reused fd),
+/// and finally restore `SIGPIPE`. Returns `false` if any restore failed.
+fn undo_relay_setup(setup: &RelaySetup) -> bool {
+    let mut restored = true;
     if let Some(fl) = setup.saved_stdout_fl {
-        let _ = sys(SYS_FCNTL, [1, F_SETFL, fl, 0, 0, 0]);
+        let r = sys(SYS_FCNTL, [1, F_SETFL, fl, 0, 0, 0]);
+        if r < 0 {
+            say_err!("ptyrun: restore stdout F_SETFL failed (got {r})");
+            restored = false;
+        }
     }
     if setup.have_tty {
-        let _ = ioctl(0, TCSETS, setup.saved_termios.as_ptr() as u64);
+        let r = ioctl(0, TCSETS, setup.saved_termios.as_ptr() as u64);
+        if r < 0 {
+            say_err!("ptyrun: restore stdin TCSETS failed (got {r})");
+            restored = false;
+        }
     }
     if setup.installed_sigwinch {
-        restore_sigaction(SIGWINCH, &setup.old_sigwinch);
+        let r = restore_sigaction(SIGWINCH, &setup.old_sigwinch);
+        if r < 0 {
+            say_err!("ptyrun: restore SIGWINCH failed (got {r})");
+            restored = false;
+        }
     }
     WINCH_PIPE_W.store(-1, Ordering::Release);
     if let Some([r, w]) = setup.winch_pipe {
@@ -790,8 +808,13 @@ fn undo_relay_setup(setup: &RelaySetup) {
         let _ = close(w);
     }
     if setup.ignored_sigpipe {
-        restore_sigaction(SIGPIPE, &setup.old_sigpipe);
+        let r = restore_sigaction(SIGPIPE, &setup.old_sigpipe);
+        if r < 0 {
+            say_err!("ptyrun: restore SIGPIPE failed (got {r})");
+            restored = false;
+        }
     }
+    restored
 }
 
 /// Interactive relay mode: copy stdin's window size onto the PTY, forward
@@ -817,12 +840,16 @@ unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fai
         saved_stdout_fl: None,
     };
 
-    setup.ignored_sigpipe = set_sigpipe(SIG_IGN, Some(&mut setup.old_sigpipe)) == 0;
+    let sigpipe_r = set_sigpipe(SIG_IGN, Some(&mut setup.old_sigpipe));
+    setup.ignored_sigpipe = sigpipe_r == 0;
+    if !setup.ignored_sigpipe {
+        say_err!("ptyrun: rt_sigaction SIGPIPE failed (got {sigpipe_r})");
+    }
 
     let winch_pipe = match pipe(O_NONBLOCK | O_CLOEXEC) {
         Ok(p) => p,
         Err(e) => {
-            undo_relay_setup(&setup);
+            let _ = undo_relay_setup(&setup);
             return Err(e);
         }
     };
@@ -848,24 +875,33 @@ unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fai
         raw[12..16].fill(0);
         raw[17 + 6] = 1; // VMIN = 1
         raw[17 + 5] = 0; // VTIME = 0
-        let _ = ioctl(0, TCSETS, raw.as_ptr() as u64);
+        let r = ioctl(0, TCSETS, raw.as_ptr() as u64);
+        if r < 0 {
+            say_err!("ptyrun: raw TCSETS failed (got {r})");
+        }
+    }
+
+    // Set O_NONBLOCK on stdout before spawning the child (which rebinds fds
+    // 0..=2 to the fresh slave) so stdout is already non-blocking once the
+    // child starts, and spawn failure restores it via undo_relay_setup.
+    let fl = sys(SYS_FCNTL, [1, F_GETFL, 0, 0, 0, 0]);
+    if fl < 0 {
+        say_err!("ptyrun: fcntl F_GETFL stdout failed (got {fl})");
+    } else if (fl as u64 & O_NONBLOCK) == 0 {
+        let r = sys(SYS_FCNTL, [1, F_SETFL, (fl as u64) | O_NONBLOCK, 0, 0, 0]);
+        if r == 0 {
+            setup.saved_stdout_fl = Some(fl as u64);
+        } else {
+            say_err!("ptyrun: fcntl F_SETFL O_NONBLOCK stdout failed (got {r})");
+        }
     }
 
     // SAFETY: forwarded from caller's `argv` contract.
     let child = match unsafe { spawn_on_pty(argv, cmd_idx, rows, cols, setup.ignored_sigpipe) } {
         Ok(c) => c,
         Err(e) => {
-            undo_relay_setup(&setup);
+            let _ = undo_relay_setup(&setup);
             return Err(e);
-        }
-    };
-
-    setup.saved_stdout_fl = {
-        let fl = sys(SYS_FCNTL, [1, F_GETFL, 0, 0, 0, 0]);
-        if fl >= 0 && (fl as u64 & O_NONBLOCK) == 0 {
-            if sys(SYS_FCNTL, [1, F_SETFL, (fl as u64) | O_NONBLOCK, 0, 0, 0]) == 0 { Some(fl as u64) } else { None }
-        } else {
-            None
         }
     };
 
@@ -998,7 +1034,7 @@ unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fai
     }
 
     let _ = close(child.master);
-    undo_relay_setup(&setup);
+    let restore_ok = undo_relay_setup(&setup);
     if let Some(err) = &relay_err {
         say_err!("FAIL ptyrun: {} (got {})", err.what, err.got);
     }
@@ -1011,7 +1047,8 @@ unsafe fn run_relay(argv: *const *const u8, cmd_idx: usize) -> Result<c_int, Fai
         return Ok(1);
     }
     let status = status?;
-    if status & 0x7f != 0 { Ok(128 + (status & 0x7f)) } else { Ok((status >> 8) & 0xff) }
+    let code = if status & 0x7f != 0 { 128 + (status & 0x7f) } else { (status >> 8) & 0xff };
+    if !restore_ok && code == 0 { Ok(1) } else { Ok(code) }
 }
 
 #[unsafe(no_mangle)]
