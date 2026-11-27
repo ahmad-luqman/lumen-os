@@ -66,6 +66,8 @@ cp "$W/ca/ca.crt" /usr/local/share/ca-certificates/census-ca.crt
 update-ca-certificates >/dev/null 2>&1
 
 # Local APK mirror holding one small package not yet installed (`patch`).
+# `apk add --no-cache` above stored no index; `apk fetch` needs one.
+apk update -q
 apk fetch -q -o "$W/srv/mirror/x86_64" patch
 apk index -q -o "$W/srv/mirror/x86_64/APKINDEX.tar.gz" "$W/srv/mirror/x86_64"/*.apk
 printf 'hello from census\n' >"$W/srv/hello.txt"
