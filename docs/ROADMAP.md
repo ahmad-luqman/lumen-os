@@ -300,7 +300,9 @@ run over the guest's loopback.
 Not in M9 (later): IPv6 on `eth0` (SLAAC: the fixture runs `ipv6=off`, and
 smoltcp's `proto-ipv6-slaac` isn't enabled), IP fragmentation, `AF_PACKET`
 and netlink (no census use), `sendmmsg`/`recvmmsg`, out-of-band data and
-`SIGURG`, and `EPOLLEXCLUSIVE`'s wake-one (accepted, every waiter woken).
+`SIGURG`, `EPOLLEXCLUSIVE`'s wake-one (accepted, every waiter woken), ICMP
+errors reported to connected UDP sockets, and TCP's retransmission give-up
+(`tcp_retries2`).
 
 ## M10: JIT VM, advanced signals and Tier-1 runtimes
 
