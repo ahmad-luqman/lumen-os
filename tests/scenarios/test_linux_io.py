@@ -265,3 +265,45 @@ def test_console_ash_job_control(boot, tmp_path):
     expect_screen(m, r"^vt-returned$")
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_ptyrun_console_relay(boot, tmp_path):
+    """#437: deterministic regression tests for `ptyrun`'s console relay mode.
+
+    Runs `m8_pty ptyrun-relay` (two-way backpressure while output is undrained,
+    partial writes to stdout and master, failed stdout write reported after
+    termios/flag cleanup rather than the child's status, `SIGPIPE` on a closed
+    stdout reaching cleanup with child `SIGPIPE`/`SIGWINCH` reset to `SIG_DFL`,
+    `SIGWINCH` resize forwarding from stdin's `TIOCGWINSZ` to master's
+    `TIOCSWINSZ`, and exit-status/EOF forwarding), then runs `ptyrun` directly
+    on the serial console and confirms console restoration.
+    """
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+    start = len(m.output)
+    program = "/usr/local/bin/m8_pty"
+    m.send_line(f"linux {program} ptyrun-relay")
+    for check in (
+        "ptyrun_relay_two_way_backpressure",
+        "ptyrun_relay_partial_writes",
+        "ptyrun_relay_stdout_write_error_cleanup",
+        "ptyrun_relay_sigpipe_reaches_cleanup",
+        "ptyrun_relay_sigwinch_forwards_resize",
+        "ptyrun_relay_exit_status_and_eof",
+    ):
+        m.expect(re.compile(rf"^ok {check}\r?$", re.MULTILINE), 60)
+    m.expect(rf"linux: {re.escape(program)} exit=0 leaked_frames=-?\d+\n", 30)
+    m.expect(r"lumen> ", 10)
+
+    # Interactive serial-console relay: input reaches child over PTY, output
+    # returns over serial, non-zero exit code propagates, console returns cleanly.
+    m.send_line(f"linux /usr/local/bin/ptyrun {program} ptyrun-child console-echo")
+    m.expect(re.compile(r"^RELAY_CONSOLE_READY\r?$", re.MULTILINE), 30)
+    m.send("hello-relay-console\n")
+    m.expect(re.compile(r"^RELAY_GOT:hello-relay-console\r?$", re.MULTILINE), 30)
+    m.expect(r"linux: /usr/local/bin/ptyrun exit=7 leaked_frames=-?\d+\n", 30)
+    m.expect(r"lumen> ", 10)
+    assert run(m, "echo relay-console-returned") == "relay-console-returned\n"
+    assert CRASH_BEGIN not in m.output[start:]
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
