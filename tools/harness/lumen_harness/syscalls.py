@@ -1,14 +1,18 @@
-"""The M8 syscall census (#337): which Linux syscalls the M8 gate workloads make.
+"""The M8 (#337) and M9 (#451) syscall censuses: which Linux syscalls the gate
+workloads make.
 
 `tools/syscall-census.sh` runs the workloads under `strace -f -X raw` on stock
 Alpine (x86-64) and calls `build` here on the traces, inside the container: so
 this module uses the standard library only (no uv, no harness dependencies,
-Python 3.12) and imports nothing else from `lumen_harness`. The result,
-`tests/linux/m8-census.toml`, is checked in. `report` compares it with the
-syscalls the kernel dispatches and the milestones the roadmap plans them for.
+Python 3.12) and imports nothing else from `lumen_harness`. The results,
+`tests/linux/m8-census.toml` and `tests/linux/m9-census.toml`, are checked in.
+`report` compares a census with the syscalls the kernel dispatches (M8) or the
+M6–M8 kernel tables (M9) and the milestones the roadmap plans them for.
 
     python3 syscalls.py build --traces DIR --meta DIR -o m8-census.toml
+    python3 syscalls.py build --milestone M9 --traces DIR --meta DIR -o m9-census.toml
     PYTHONPATH=tools/harness uv run python -m lumen_harness.syscalls report [--verbose]
+    PYTHONPATH=tools/harness uv run python -m lumen_harness.syscalls report --milestone M9 [--verbose]
 """
 
 from __future__ import annotations
@@ -21,6 +25,9 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, get_args
+
+Milestone = Literal["M8", "M9"]
 
 # x86-64 syscall numbers, generated from linux-raw-sys 0.12.1's
 # src/x86_64/general.rs (the crate the kernel takes its numbers from).
@@ -112,8 +119,13 @@ X86_64: dict[str, int] = {
 # - no field: that argument's value (`futex`'s op);
 # - a field: `field=value` inside that argument (`clone(child_stack=NULL,
 #   flags=17)`'s flags; `rt_sigaction`'s new action's sa_flags, never the old
-#   action's). An argument of `NULL` has no field and records nothing.
+#   action's). An argument of `NULL` has no field and records nothing; so does
+#   `epoll_ctl(.., EPOLL_CTL_DEL, .., event)`'s undecoded bare-address pointer,
+#   which Linux ignores (see `_undecoded_ignored_struct`).
+# `setsockopt` and `getsockopt` fold their `level` and `optname` into one
+# combined `option = "<level>:<optname>"` label in `key_values`.
 KEY_ARGS: dict[str, tuple[tuple[str, int, str | None], ...]] = {
+    "accept4": (("flags", 3, None),),
     "arch_prctl": (("code", 0, None),),
     "clock_getres": (("clock", 0, None),),
     "clock_gettime": (("clock", 0, None),),
@@ -121,16 +133,22 @@ KEY_ARGS: dict[str, tuple[tuple[str, int, str | None], ...]] = {
     "clone": (("flags", 1, "flags"),),
     "clone3": (("flags", 0, "flags"),),
     "dup3": (("flags", 2, None),),
+    "epoll_create1": (("flags", 0, None),),
+    "epoll_ctl": (("op", 1, None), ("events", 3, "events")),
+    "eventfd2": (("flags", 1, None),),
     "faccessat2": (("flags", 3, None),),
     "fcntl": (("cmd", 1, None),),
     "flock": (("operation", 1, None),),
     "futex": (("op", 1, None),),
     "getrandom": (("flags", 2, None),),
+    "getsockopt": (("level", 1, None), ("optname", 2, None)),
+    "inotify_init1": (("flags", 0, None),),
     "ioctl": (("request", 1, None),),
     "kill": (("signal", 1, None),),
     "lseek": (("whence", 2, None),),
     "madvise": (("advice", 2, None),),
     "membarrier": (("cmd", 0, None),),
+    "memfd_create": (("flags", 1, None),),
     "mmap": (("prot", 2, None), ("flags", 3, None)),
     "mprotect": (("prot", 2, None),),
     "mremap": (("flags", 3, None),),
@@ -142,13 +160,26 @@ KEY_ARGS: dict[str, tuple[tuple[str, int, str | None], ...]] = {
     "pipe2": (("flags", 1, None),),
     "prctl": (("option", 0, None),),
     "prlimit64": (("resource", 1, None), ("new_limit", 2, None)),
+    "recvfrom": (("flags", 3, None),),
+    "recvmmsg": (("flags", 3, None),),
+    "recvmsg": (("flags", 2, None),),
     "renameat2": (("flags", 4, None),),
     "rt_sigaction": (("signal", 0, None), ("sa_flags", 1, "sa_flags")),
     "rt_sigprocmask": (("how", 0, None),),
     "rt_sigqueueinfo": (("signal", 1, None),),
-    "socket": (("domain", 0, None), ("type", 1, None)),
+    "sendmmsg": (("flags", 3, None),),
+    "sendmsg": (("flags", 2, None),),
+    "sendto": (("flags", 3, None),),
+    "setsockopt": (("level", 1, None), ("optname", 2, None)),
+    "shutdown": (("how", 1, None),),
+    "signalfd4": (("flags", 3, None),),
+    "socket": (("domain", 0, None), ("type", 1, None), ("protocol", 2, None)),
+    "socketpair": (("domain", 0, None), ("type", 1, None), ("protocol", 2, None)),
     "statx": (("flags", 2, None),),
     "tgkill": (("signal", 2, None),),
+    "timer_create": (("clock", 0, None),),
+    "timerfd_create": (("clock", 0, None), ("flags", 1, None)),
+    "timerfd_settime": (("flags", 1, None),),
     "tkill": (("signal", 1, None),),
     "unlinkat": (("flags", 2, None),),
     "utimensat": (("flags", 3, None),),
@@ -157,7 +188,20 @@ KEY_ARGS: dict[str, tuple[tuple[str, int, str | None], ...]] = {
 }
 
 # Labels shown in decimal; every other number (flags, ops, requests) in hex.
-DECIMAL_LABELS = frozenset({"signal", "clock", "resource", "domain", "idtype", "whence", "code"})
+DECIMAL_LABELS = frozenset(
+    {
+        "signal",
+        "clock",
+        "resource",
+        "domain",
+        "protocol",
+        "level",
+        "optname",
+        "idtype",
+        "whence",
+        "code",
+    }
+)
 # Pointer labels recorded only as `NULL` or `set` (whether `prlimit64` writes).
 PRESENCE_LABELS = frozenset({"new_limit"})
 
@@ -358,18 +402,29 @@ def parse_trace(lines: Iterable[str]) -> list[Call]:
     return calls
 
 
+_HTONS = re.compile(r"^htons\(([^)]+)\)$")
+
+
 def render_value(label: str, value: str) -> str:
     """A recorded argument as the census writes it: in hex, or in decimal for
     the labels in `DECIMAL_LABELS`, or as `NULL` or `set` for those in
     `PRESENCE_LABELS`. A `|`-joined value (`clone`'s flags with its exit
-    signal, `0x4100|17`) is one number, its parts OR'd. Anything else is a
-    `CensusError`: `-X raw` prints every recorded argument as a number."""
+    signal, `0x4100|17`) is one number, its parts OR'd. `htons(n)` is handled
+    as a defensive guess for non-raw `AF_PACKET` protocols (real `strace -X
+    raw` traces print raw integers and never print `htons(n)`). Anything else
+    is a `CensusError`: `-X raw` prints every recorded argument as a number."""
     if label in PRESENCE_LABELS:
         return "NULL" if value == "NULL" else "set"
     try:
-        n = 0
-        for part in value.split("|"):
-            n |= int(part, 0)
+        if m := _HTONS.match(value):
+            v = int(m.group(1), 0)
+            if not 0 <= v <= 0xFFFF:
+                raise ValueError
+            n = ((v & 0xFF) << 8) | ((v >> 8) & 0xFF)
+        else:
+            n = 0
+            for part in value.split("|"):
+                n |= int(part, 0)
     except ValueError:
         raise CensusError(f"{label}={value!r}: not a number (a trace without -X raw?)") from None
     if label in DECIMAL_LABELS or n < 0:
@@ -377,11 +432,24 @@ def render_value(label: str, value: str) -> str:
     return hex(n)
 
 
+def _undecoded_ignored_struct(call: Call, pos: int, value: str) -> bool:
+    """`epoll_ctl(.., EPOLL_CTL_DEL, .., event)`: Linux ignores the event
+    (fs/eventpoll.c, ep_op_has_event()), so strace prints its bare address."""
+    return (
+        call.name == "epoll_ctl"
+        and pos == 3
+        and call.args[1] in ("0x2", "EPOLL_CTL_DEL")
+        and re.fullmatch(r"0x[0-9a-f]+", value) is not None
+    )
+
+
 def key_values(call: Call) -> dict[str, str]:
     """The recorded arguments of one call (`KEY_ARGS`). An argument strace
     didn't print is skipped only in a call that never returned (printed in
-    part), and a field only in a `NULL` argument; anything else missing is a
-    `CensusError`."""
+    part), and a field only in a `NULL` argument or one the kernel ignores;
+    anything else missing is a `CensusError`. For `setsockopt` and
+    `getsockopt`, `level` and `optname` are combined into `option` as
+    `"<level>:<optname>"`."""
     out: dict[str, str] = {}
     for label, pos, fld in KEY_ARGS.get(call.name, ()):
         if pos >= len(call.args):
@@ -392,11 +460,18 @@ def key_values(call: Call) -> dict[str, str]:
         if fld is not None:
             m = re.search(rf"(?:^|[{{,\s]){fld}=([^,}}\s]+)", value)
             if not m:
-                if value == "NULL":
+                if value == "NULL" or _undecoded_ignored_struct(call, pos, value):
                     continue
                 raise CensusError(f"{call.name}: no {fld}= in argument {pos}: {value!r}")
             value = m.group(1)
         out[label] = render_value(label, value)
+    if call.name in ("setsockopt", "getsockopt"):
+        level = out.pop("level", None)
+        optname = out.pop("optname", None)
+        # Drop a half-printed unfinished call (only `level` seen before
+        # `<unfinished ...>`) rather than emitting an unpaired label.
+        if level is not None and optname is not None:
+            out["option"] = f"{level}:{optname}"
     return out
 
 
@@ -425,9 +500,9 @@ def census(traces: dict[str, list[Call]]) -> dict[str, Seen]:
     return seen
 
 
-def _sort_key(value: str) -> tuple[int, int | str]:
+def _sort_key(value: str) -> tuple[int, tuple[int, ...] | str]:
     try:
-        return (0, int(value, 0))
+        return (0, tuple(int(p, 0) for p in value.split(":")))
     except ValueError:
         return (1, value)
 
@@ -440,16 +515,26 @@ def _toml_list(items: Iterable[str]) -> str:
     return "[" + ", ".join(_toml_str(i) for i in items) + "]"
 
 
-def render_toml(meta: dict[str, str | list[str]], seen: dict[str, Seen]) -> str:
+def render_toml(
+    meta: dict[str, str | list[str]], seen: dict[str, Seen], milestone: Milestone = "M8"
+) -> str:
     """The census file: `[meta]`, then one `[syscalls.<name>]` per syscall in
     number order, with its `args` and `errors` subtables when not empty."""
-    out = [
-        "# The M8 syscall census (#337), written by tools/syscall-census.sh: do not edit.",
-        "# Regenerate it by running that script on an x86-64 Linux Docker or Podman host.",
-        "",
-        "[meta]",
-    ]
-    for key, value in meta.items():
+    if milestone == "M8":
+        header = [
+            "# The M8 syscall census (#337), written by tools/syscall-census.sh: do not edit.",
+            "# Regenerate it by running that script on an x86-64 Linux Docker or Podman host.",
+        ]
+    elif milestone == "M9":
+        header = [
+            "# The M9 syscall census (#451), written by tools/syscall-census.sh: do not edit.",
+            "# Regenerate it via .github/workflows/syscall-census.yml or tools/syscall-census.sh m9.",
+        ]
+    else:
+        raise CensusError(f"unknown milestone {milestone!r} (expected 'M8' or 'M9')")
+    out = [*header, "", "[meta]"]
+    for key in sorted(meta):
+        value = meta[key]
         out.append(f"{key} = {_toml_list(value) if isinstance(value, list) else _toml_str(value)}")
     for name in sorted(seen, key=X86_64.__getitem__):
         s = seen[name]
@@ -492,7 +577,7 @@ def read_meta(directory: Path) -> dict[str, str | list[str]]:
     }
 
 
-def build(traces_dir: Path, meta_dir: Path) -> str:
+def build(traces_dir: Path, meta_dir: Path, milestone: Milestone = "M8") -> str:
     """The census file's text from every `<workload>.strace` in `traces_dir`."""
     files = sorted(traces_dir.glob("*.strace"))
     if not files:
@@ -503,7 +588,7 @@ def build(traces_dir: Path, meta_dir: Path) -> str:
             traces[f.stem] = parse_trace(lines)
     meta = read_meta(meta_dir)
     meta["workloads"] = sorted(traces)
-    return render_toml(meta, census(traces))
+    return render_toml(meta, census(traces), milestone=milestone)
 
 
 # --- the report ---
@@ -773,20 +858,33 @@ def classify(name: str, implemented: set[str]) -> str:
     return "unplanned"
 
 
+_VDSO_FOOTER = (
+    "",
+    "vDSO calls (Linux normally answers these without a syscall, so the census can't see them):",
+    f"{', '.join(VDSO)}.",
+    "Without a vDSO, musl makes clock_gettime (for gettimeofday and time too) and getcpu",
+    "syscalls on Lumen.",
+)
+
+
+def _format_syscall_row(name: str, entry: dict, verbose: bool) -> str:
+    line = f"  {entry['nr']:>3} {name:<20} {entry['calls']:>7}  {', '.join(entry['workloads'])}"
+    if verbose:
+        for label, values in entry.get("args", {}).items():
+            line += f"\n        {label}: {' '.join(values)}"
+        if entry.get("errors"):
+            errs = " ".join(f"{e}={n}" for e, n in entry["errors"].items())
+            line += f"\n        errors: {errs}"
+    return line
+
+
 def report(data: dict, implemented: set[str], verbose: bool = False) -> str:
     """The census against the kernel: unplanned syscalls first, then each
     milestone's, then the implemented ones; the vDSO calls listed apart."""
     rows: dict[str, list[str]] = {}
     for name, entry in data["syscalls"].items():
         cls = classify(name, implemented)
-        line = f"  {entry['nr']:>3} {name:<20} {entry['calls']:>7}  {', '.join(entry['workloads'])}"
-        if verbose:
-            for label, values in entry.get("args", {}).items():
-                line += f"\n        {label}: {' '.join(values)}"
-            if entry.get("errors"):
-                errs = " ".join(f"{e}={n}" for e, n in entry["errors"].items())
-                line += f"\n        errors: {errs}"
-        rows.setdefault(cls, []).append(line)
+        rows.setdefault(cls, []).append(_format_syscall_row(name, entry, verbose))
     meta = data["meta"]
     out = [
         (
@@ -805,11 +903,118 @@ def report(data: dict, implemented: set[str], verbose: bool = False) -> str:
         "-ENOSYS by a decision ARCHITECTURE section 8 records (ENOSYS_BY_DECISION).",
         "ERESTART* errors: the kernel's restart codes, where a signal interrupted the call;",
         "the program saw EINTR or a restart, by the code, the handler and SA_RESTART.",
+        *_VDSO_FOOTER,
+    ]
+    return "\n".join(out)
+
+
+# Linux include/uapi/linux/time.h: CLOCK_PROCESS_CPUTIME_ID (2) and
+# CLOCK_THREAD_CPUTIME_ID (3); negative clockids are dynamic POSIX CPU clocks
+# (clock_getcpuclockid / pthread_getcpuclockid).
+CPU_TIME_CLOCK_IDS = frozenset({2, 3})
+CLOCK_SYSCALLS = frozenset(
+    {"clock_gettime", "clock_getres", "clock_nanosleep", "timer_create", "timerfd_create"}
+)
+# Linux include/uapi/linux/sockios.h: SIOC*IF* range (SIOCGIFNAME 0x8910 .. 0x893f).
+SIOCGIF_MIN = 0x8910
+SIOCGIF_MAX = 0x893F
+# Linux include/linux/socket.h: AF_NETLINK (16), AF_PACKET (17).
+AF_NETLINK = "16"
+AF_PACKET = "17"
+_NOT_SEEN_NET_PROBE = "not seen (no workload runs udhcpc, getifaddrs or if_nameindex)"
+
+
+def cpu_time_clocks_seen(data: dict) -> dict[str, list[str]]:
+    """CPU-time clock IDs (2, 3, or dynamic negative IDs) recorded on clock
+    syscalls in `data`, mapped by syscall name in number order."""
+    found: dict[str, list[str]] = {}
+    for name in sorted(data["syscalls"], key=X86_64.__getitem__):
+        if name not in CLOCK_SYSCALLS:
+            continue
+        clocks = [
+            c
+            for c in data["syscalls"][name].get("args", {}).get("clock", ())
+            if int(c, 0) in CPU_TIME_CLOCK_IDS or int(c, 0) < 0
+        ]
+        if clocks:
+            found[name] = sorted(clocks, key=_sort_key)
+    return found
+
+
+def _probe_call(syscalls_map: dict, name: str) -> str:
+    entry = syscalls_map.get(name)
+    if not entry:
+        return "none"
+    return f"{entry['calls']} calls ({', '.join(entry['workloads'])})"
+
+
+def report_m9(data: dict, tables: dict[str, list[str]], verbose: bool = False) -> str:
+    """Compare an M9 census against the M6–M8 kernel tables and ROADMAP's
+    M9/M10 lists, surfacing unplanned calls, M10 rows, M8 `ENOSYS_BY_DECISION`
+    calls (plus CPU-time clocks separately), any M8 planned calls missing from
+    `tables`, M9 planned calls, M6–M8 table hits, and #450 design probes."""
+    m6_m8: set[str] = set().union(*(tables.get(m, ()) for m in ("M6", "M7", "M8")))
+    rows: dict[str, list[str]] = {}
+    syscalls_map = data["syscalls"]
+    for name in sorted(syscalls_map, key=X86_64.__getitem__):
+        entry = syscalls_map[name]
+        cls = classify(name, m6_m8)
+        rows.setdefault(cls, []).append(_format_syscall_row(name, entry, verbose))
+
+    cpu_clocks = cpu_time_clocks_seen(data)
+    meta = data["meta"]
+    out = [
+        (
+            f"M9 census of {', '.join(meta['workloads'])} on Alpine {meta['alpine']} "
+            f"(kernel {meta['kernel']}): {len(syscalls_map)} syscalls."
+        ),
+    ]
+    sections = (
+        ("unplanned", "unplanned"),
+        ("M10", "M10 rows seen in the M9 census"),
+        ("ENOSYS", "M8 ENOSYS_BY_DECISION seen in the M9 census"),
+        ("M8", "M8 planned"),
+        ("M9", "M9 planned"),
+        ("implemented", "M6-M8 tables"),
+    )
+    known_sections = {key for key, _ in sections}
+    assert rows.keys() <= known_sections, (
+        f"unprinted M9 report sections: {sorted(rows.keys() - known_sections)}"
+    )
+    for key, title in sections:
+        if key in rows:
+            out += ["", f"{title} ({len(rows[key])}):", *rows[key]]
+        if key == "ENOSYS" and cpu_clocks:
+            clock_lines = [
+                f"  {name}: {', '.join(clocks)} ({', '.join(syscalls_map[name]['workloads'])})"
+                for name, clocks in cpu_clocks.items()
+            ]
+            out += [
+                "",
+                f"CPU-time clocks seen in the M9 census ({len(clock_lines)}):",
+                *clock_lines,
+            ]
+
+    sock_domains = set(syscalls_map.get("socket", {}).get("args", {}).get("domain", ()))
+    ioctl_reqs = syscalls_map.get("ioctl", {}).get("args", {}).get("request", ())
+    siocgif = [r for r in ioctl_reqs if SIOCGIF_MIN <= int(r, 0) <= SIOCGIF_MAX]
+    cpu_probe = (
+        "; ".join(f"{name}={','.join(clocks)}" for name, clocks in cpu_clocks.items())
+        if cpu_clocks
+        else "none"
+    )
+    out += [
         "",
-        "vDSO calls (Linux normally answers these without a syscall, so the census can't see them):",
-        f"{', '.join(VDSO)}.",
-        "Without a vDSO, musl makes clock_gettime (for gettimeofday and time too) and getcpu",
-        "syscalls on Lumen.",
+        "M9 design probes (#450):",
+        f"  AF_NETLINK (domain 16): {'seen' if AF_NETLINK in sock_domains else _NOT_SEEN_NET_PROBE}",
+        f"  AF_PACKET (domain 17): {'seen' if AF_PACKET in sock_domains else _NOT_SEEN_NET_PROBE}",
+        f"  SIOC*IF* ioctls (0x8910–0x893f): {', '.join(siocgif) if siocgif else _NOT_SEEN_NET_PROBE}",
+        f"  accept: {_probe_call(syscalls_map, 'accept')}; accept4: {_probe_call(syscalls_map, 'accept4')}",
+        f"  sendmmsg: {_probe_call(syscalls_map, 'sendmmsg')}; recvmmsg: {_probe_call(syscalls_map, 'recvmmsg')}",
+        f"  epoll_pwait2: {_probe_call(syscalls_map, 'epoll_pwait2')}",
+        f"  sendfile: {_probe_call(syscalls_map, 'sendfile')}",
+        f"  CPU-time clocks: {cpu_probe}",
+        *_VDSO_FOOTER,
     ]
     return "\n".join(out)
 
@@ -820,19 +1025,33 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("build", help="traces into the census file")
     b.add_argument("--traces", type=Path, required=True)
     b.add_argument("--meta", type=Path, required=True)
+    b.add_argument("--milestone", choices=get_args(Milestone), default="M8")
     b.add_argument("-o", "--output", type=Path, required=True)
     r = sub.add_parser("report", help="the census against the kernel's dispatch table")
-    r.add_argument("--census", type=Path, help="default: tests/linux/m8-census.toml")
+    r.add_argument("--milestone", choices=get_args(Milestone), default="M8")
+    r.add_argument(
+        "--census",
+        type=Path,
+        help="default: tests/linux/m8-census.toml (M8) or tests/linux/m9-census.toml (M9)",
+    )
     r.add_argument("--dispatch", type=Path, help="default: kernel/src/linux/syscall/mod.rs")
+    r.add_argument("--tables", type=Path, help="default: kernel/src/linux/mod.rs (M9 report)")
     r.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "build":
-            args.output.write_text(build(args.traces, args.meta))
+            args.output.write_text(build(args.traces, args.meta, milestone=args.milestone))
             return 0
         # The repo root, three levels above tools/harness/lumen_harness/ (only
         # here: inside the census container this file sits at /harness/syscalls.py).
         root = Path(__file__).resolve().parents[3]
+        if args.milestone == "M9":
+            census_file = args.census or root / "tests/linux/m9-census.toml"
+            tables_file = args.tables or root / "kernel/src/linux/mod.rs"
+            data = tomllib.loads(census_file.read_text())
+            tables = kernel_tables(tables_file.read_text())
+            print(report_m9(data, tables, args.verbose))
+            return 0
         census_file = args.census or root / "tests/linux/m8-census.toml"
         dispatch_file = args.dispatch or root / "kernel/src/linux/syscall/mod.rs"
         data = tomllib.loads(census_file.read_text())
