@@ -19,12 +19,13 @@ line if it failed), then one line the driver adds with runtest's exit code:
 A passing test prints nothing, so a pass is only ever read from its EXIT line,
 and a test without one counts as not run, never as passed.
 
-Each test is a pass, a fail or an error:
+Each test is a pass, a fail, a timeout or an error:
 
 - pass: runtest exited 0 and printed no FAIL line;
 - fail: the test ran and failed: exit 1 with one `FAIL <path>` line saying
-  `[status N]`, `[signal <name>]` or `[timed out]` (these are the test's
+  `[status N]` or `[signal <name>]` (these are the test's
   verdict, so an expected-failure entry may cover them);
+- timeout: exit 1 with `[timed out]`, retried once before comparison;
 - error: anything else: runtest's own failures (`[internal]`, `[unknown]`,
   exit 255), an exit code runtest never returns, a FAIL line naming another
   test, or one that disagrees with the exit code. runtest's `fork` and
@@ -54,6 +55,10 @@ tests/conformance/libc-test-xfail.txt lists the tests expected to fail, one
 per line: the test's path, then `# <reason> #<issue>`, the issue that will fix
 it. Lines that are empty or start with `#` are comments. A listed test that
 passes fails the comparison too, so the list never keeps a fixed test.
+An optional `flaky` after the path allows pass, fail or timeout, never an
+error. Drivers retry timeouts and flaky failures once. The first attempt's
+lines are retained with a `RETRY ` prefix, leaving only the second attempt's
+EXIT authoritative; a truncated retry remains not run.
 """
 
 from __future__ import annotations
@@ -66,7 +71,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -77,6 +82,17 @@ XFAIL_FILE = REPO_ROOT / "tests" / "conformance" / "libc-test-xfail.txt"
 TESTS_FILE = "tests.txt"
 RUNTEST = "src/common/runtest-static.exe"
 MUSL_LOADER = "/lib/ld-musl-x86_64.so.1"
+
+# #422: native SysV IPC tests compare time(0) with kernel IPC timestamps
+# across a one-second clock edge. Retry only these exact binaries on a
+# failure (all tests retry timeouts); the retry must pass the reference
+# comparison. This does not excuse persistent failures or runner errors,
+# and does not apply to Lumen's deliberately unsupported SysV IPC calls.
+NATIVE_RETRY_FAILURES = frozenset(
+    f"src/functional/ipc_{kind}{suffix}.exe"
+    for kind in ("shm", "msg", "sem")
+    for suffix in ("", "-static")
+)
 
 _TEST = re.compile(r"^src/(?:functional|regression)/[A-Za-z0-9_.+-]+\.exe$")
 _EXIT = re.compile(r"^EXIT (\S+) (\d+)$")
@@ -105,12 +121,15 @@ def _loader_failure(test: str, line: str) -> bool:
     return m is not None and m.group(1).removeprefix("./") == test
 
 
-_XFAIL = re.compile(r"^(?P<test>\S+)\s+#\s*(?P<reason>\S.*?)\s+#(?P<issue>[1-9]\d*)$")
+_XFAIL = re.compile(
+    r"^(?P<test>\S+)(?:\s+(?P<kind>flaky))?\s+#\s*(?P<reason>\S.*?)\s+#(?P<issue>[1-9]\d*)$"
+)
 
 
 class Outcome(enum.Enum):
     PASS = "pass"
     FAIL = "fail"
+    TIMEOUT = "timeout"
     ERROR = "error"
 
 
@@ -118,7 +137,7 @@ class Outcome(enum.Enum):
 class Result:
     test: str
     outcome: Outcome
-    # "" for a pass; libc-test's bracket for a fail ("status 1", "signal
+    # "" for a pass; libc-test's bracket for a fail or timeout ("status 1", "signal
     # Segmentation fault", "timed out"); why it is an error otherwise.
     detail: str
     # What the test printed besides the FAIL line (its t_error lines).
@@ -170,7 +189,9 @@ def _classify(test: str, code: int, lines: list[str]) -> Result:
         return error(f"runner trouble, not the test's verdict: {trouble[0]} (FAIL [{why}])")
     if why in _NOT_RUN_STATUSES:
         return error(f"FAIL [{why}]: the program never ran (not executable, or not found)")
-    if _STATUS.match(why) or why == "timed out" or why.startswith("signal "):
+    if why == "timed out":
+        return Result(test, Outcome.TIMEOUT, why, output)
+    if _STATUS.match(why) or why.startswith("signal "):
         return Result(test, Outcome.FAIL, why, output)
     return error(f"runtest could not run it: FAIL [{why}]")
 
@@ -207,6 +228,7 @@ class Xfail:
     reason: str
     issue: int
     line: int
+    kind: str = "fail"
 
 
 class XfailError(ValueError):
@@ -214,7 +236,7 @@ class XfailError(ValueError):
 
 
 def parse_xfail(text: str) -> dict[str, Xfail]:
-    """The expected-failure list: `<test path> # <reason> #<issue>` per line.
+    """Read `<test path> [flaky] # <reason> #<issue>` entries.
 
     Raises XfailError naming the line for an entry without a reason or an
     issue, a path that isn't a libc-test test's, or a test listed twice."""
@@ -238,7 +260,9 @@ def parse_xfail(text: str) -> dict[str, Xfail]:
             raise XfailError(
                 f"line {number}: {test} is listed twice (first on line {entries[test].line})"
             )
-        entries[test] = Xfail(test, m.group("reason"), int(m.group("issue")), number)
+        entries[test] = Xfail(
+            test, m.group("reason"), int(m.group("issue")), number, m.group("kind") or "fail"
+        )
     return entries
 
 
@@ -305,7 +329,8 @@ def compare(run: Run, xfail: dict[str, Xfail], expected: Iterable[str]) -> Verdi
     that should have run (the build's tests.txt): one without a result fails
     the comparison, as does a result for a test not in it, an error, a failure
     not listed, a listed test that passed, and a listed test not in
-    `expected`. A listed test that failed (status, signal or timeout) passes."""
+    `expected`. A listed test that failed (status, signal or timeout) passes.
+    A flaky entry also permits a pass, but never covers an error."""
     want = set(expected)
     v = Verdict(trailing=list(run.trailing))
     v.not_run = sorted(want - run.results.keys())
@@ -315,9 +340,9 @@ def compare(run: Run, xfail: dict[str, Xfail], expected: Iterable[str]) -> Verdi
         r = run.results[test]
         if r.outcome is Outcome.ERROR:
             v.errors.append(r)
-        elif r.outcome is Outcome.FAIL:
+        elif r.outcome in (Outcome.FAIL, Outcome.TIMEOUT):
             (v.expected_failures if test in xfail else v.unexpected_failures).append(r)
-        elif test in xfail:
+        elif test in xfail and xfail[test].kind != "flaky":
             v.unexpected_passes.append(r)
         else:
             v.passed.append(test)
@@ -327,6 +352,24 @@ def compare(run: Run, xfail: dict[str, Xfail], expected: Iterable[str]) -> Verdi
 def read_tests(root: Path = BUILD) -> list[str]:
     """The tests the build made (its tests.txt), in order."""
     return [line for line in (root / TESTS_FILE).read_text().splitlines() if line]
+
+
+def run_with_retry(test: str, execute: Callable[[], str], *, retry_failure: bool = False) -> str:
+    """Return one authoritative transcript, retrying a timeout exactly once.
+
+    With `retry_failure`, a test failure also gets one retry. Errors, missing
+    results, extra results and trailing output never trigger a retry. The
+    first attempt is preserved as diagnostic output prefixed `RETRY `;
+    its EXIT cannot stand in for a missing EXIT on the second attempt.
+    """
+    first = execute()
+    run = parse(first)
+    if run.results.keys() != {test} or run.trailing:
+        return first
+    outcome = run.results[test].outcome
+    if outcome is Outcome.TIMEOUT or (retry_failure and outcome is Outcome.FAIL):
+        return "".join(f"RETRY {line}\n" for line in first.splitlines()) + execute()
+    return first
 
 
 def run_native(
@@ -347,6 +390,10 @@ def run_native(
     run through `loader`, a musl dynamic loader (Alpine's), as runtest's
     wrapper: this host needn't have musl installed.
 
+    Timeouts get one retry through `run_with_retry`; failures do too only
+    for `NATIVE_RETRY_FAILURES` (#422). The second outcome is authoritative,
+    so persistent native IPC failures still fail the reference comparison.
+
     The tests run in a fresh directory whose `src` links to `root`'s, so
     their paths (and libc-test's FAIL lines) read `src/...` and whatever they
     leave behind is deleted afterwards."""
@@ -355,7 +402,8 @@ def run_native(
     with tempfile.TemporaryDirectory(prefix="libc-test-") as tmp:
         cwd = Path(tmp)
         (cwd / "src").symlink_to(root / "src", target_is_directory=True)
-        for test in tests:
+
+        def execute(test: str) -> str:
             argv = [str(root / RUNTEST), "-t", str(timeout_s)]
             if not is_static(test):
                 if loader is None:
@@ -370,21 +418,32 @@ def run_native(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            lines: list[str] = []
             try:
                 stdout, _ = proc.communicate(timeout=timeout_s + grace_s)
-                out += stdout.decode(errors="replace").splitlines()
+                lines += stdout.decode(errors="replace").splitlines()
                 code = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
             except subprocess.TimeoutExpired:
                 # runtest itself hung: an error (its exit code isn't 0 or 1),
                 # after whatever it printed before it was killed.
                 _kill_group(proc.pid)
                 stdout, _ = proc.communicate()
-                out += stdout.decode(errors="replace").splitlines()
-                out.append(f"runtest did not end within {timeout_s + grace_s} s")
+                lines += stdout.decode(errors="replace").splitlines()
+                lines.append(f"runtest did not end within {timeout_s + grace_s} s")
                 code = 124
             _kill_group(proc.pid)
-            out.append(f"EXIT {test} {code}")
-    return "\n".join(out) + "\n"
+            lines.append(f"EXIT {test} {code}")
+            return "\n".join(lines) + "\n"
+
+        for test in tests:
+            out.append(
+                run_with_retry(
+                    test,
+                    lambda test=test: execute(test),
+                    retry_failure=test in NATIVE_RETRY_FAILURES,
+                )
+            )
+    return "".join(out)
 
 
 def _kill_group(pgid: int) -> None:

@@ -262,3 +262,17 @@ tests = [
     "ktest:lumen_kernel::mm::frame::low_water_mark_tracks_the_minimum",
     "scenario:test_alpine::test_gcc_gpp_compile_cpp_and_shared_lib",
 ]
+
+[[feature]]
+name = "M8 D4 musl libc-test gate (#396): all 284 static and dynamic core tests under runtest on Lumen at 512 MiB; strict expected failures with reasons and issues, runner errors and missing EXIT lines rejected, timeouts retried once, flaky failures retried once and allowed to pass; native SysV IPC clock-edge failures retried once only for ipc_shm, ipc_msg and ipc_sem (#422)"
+milestone = "M8"
+tests = [
+    "harness:test_libctest::test_a_timed_out_test_is_run_once_more",
+    "harness:test_libctest::test_a_flaky_entry_covers_a_fail_or_timeout_never_an_error",
+    "harness:test_libctest::test_only_a_complete_timeout_is_retried_without_a_flaky_entry",
+    "harness:test_libctest::test_a_flaky_failure_is_retried_once_but_an_error_is_not",
+    "harness:test_libctest::test_flaky_entries_require_a_known_kind_reason_and_issue",
+    "harness:test_libctest::test_flaky_entries_still_require_a_built_and_run_test",
+    "harness:test_libctest::test_native_ipc_retries_are_scoped_and_never_hide_persistent_failures",
+    "scenario:test_conformance::test_musl_libc_test_core",
+]

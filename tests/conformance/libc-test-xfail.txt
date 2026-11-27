@@ -23,3 +23,44 @@
 #     missing library, a failed relocation).
 # A listed test that passes fails the run, so remove its line in the PR that
 # fixes it.
+# An optional `flaky` after the path covers a fail or timeout and permits a
+# pass, never an error. Timeouts, and flaky failures, get exactly one retry.
+
+src/functional/pthread_mutex_pi-static.exe # PI futex operations remain ENOSYS #397
+src/functional/pthread_mutex_pi.exe # PI futex operations remain ENOSYS #397
+src/functional/mntent-static.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/functional/mntent.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/functional/strptime-static.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/functional/strptime.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/functional/wordexp-static.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/functional/wordexp.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/regression/regex-backref-oob-static.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/regression/regex-backref-oob.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/regression/regexec-backref-static.exe # also fails natively; requires musl newer than 1.2.5 #398
+src/regression/regexec-backref.exe # also fails natively; requires musl newer than 1.2.5 #398
+
+# Additional D4 findings, each with its follow-up issue: these interfaces are
+# absent, not runner errors. BSD sockets belong to M9 and non-stack rlimit
+# writes to M10 (ARCHITECTURE section 8); SysV IPC and a /dev/shm namespace
+# are not implemented in M8. Keep these strict so implementation removes
+# the entries.
+src/functional/ipc_msg-static.exe # SysV message queues are not implemented in M8 (ENOSYS) #432
+src/functional/ipc_msg.exe # SysV message queues are not implemented in M8 (ENOSYS) #432
+src/functional/ipc_sem-static.exe # SysV semaphores are not implemented in M8 (ENOSYS) #432
+src/functional/ipc_sem.exe # SysV semaphores are not implemented in M8 (ENOSYS) #432
+src/functional/ipc_shm-static.exe # SysV shared memory is not implemented in M8 (ENOSYS) #432
+src/functional/ipc_shm.exe # SysV shared memory is not implemented in M8 (ENOSYS) #432
+src/functional/pthread_robust-static.exe # robust mutex test also requests unsupported PI futexes #397
+src/functional/pthread_robust.exe # robust mutex test also requests unsupported PI futexes #397
+src/functional/pthread_cancel-points-static.exe # shm_open returns ENOENT before cancellation because /dev/shm is absent #433
+src/functional/pthread_cancel-points.exe # shm_open returns ENOENT before cancellation because /dev/shm is absent #433
+src/functional/sem_open-static.exe # /dev/shm is absent; sem_open fails and the test dereferences SEM_FAILED #433
+src/functional/sem_open.exe # /dev/shm is absent; sem_open fails and the test dereferences SEM_FAILED #433
+src/regression/sem_close-unmap-static.exe # /dev/shm is absent; the test dereferences the failed sem_open result #433
+src/regression/sem_close-unmap.exe # /dev/shm is absent; the test dereferences the failed sem_open result #433
+src/functional/socket-static.exe # BSD UDP and TCP sockets remain ENOSYS until M9 #434
+src/functional/socket.exe # BSD UDP and TCP sockets remain ENOSYS until M9 #434
+src/regression/pthread_atfork-errno-clobber-static.exe # RLIMIT_NPROC writes are ignored until M10, so fork succeeds #435
+src/regression/pthread_atfork-errno-clobber.exe # RLIMIT_NPROC writes are ignored until M10, so fork succeeds #435
+src/regression/rlimit-open-files-static.exe # RLIMIT_NOFILE writes are ignored until M10; the limit stays 1024 #435
+src/regression/rlimit-open-files.exe # RLIMIT_NOFILE writes are ignored until M10; the limit stays 1024 #435
