@@ -434,10 +434,12 @@ def test_gcc_gpp_compile_cpp_and_shared_lib(boot, tmp_path):
     against both with `-Wl,-rpath,.`; running it verifies normal calls and a
     C++ `std::runtime_error` thrown and unwound with RAII destructors across
     the `.so` boundary. `make -j1 -q` confirms targets are up to date, then
-    `make -j2` runs a two-rule Makefile of `true` commands using GNU make 4.4's
-    FIFO jobserver with empty stderr. Afterwards `mem` confirms the free-frame
-    low-water mark recorded the build's dip and stayed at or above 64 MiB, and
-    the synced ext4 image passes `e2fsck -fn` with the build outputs present.
+    `make -j2` runs two recipes locked in a two-way FIFO handshake using GNU
+    make 4.4's FIFO jobserver (`--jobserver-auth=fifo:`, empty stderr), so the
+    build finishes only if both run concurrently. Afterwards `mem` confirms the
+    free-frame minimum since initialization stayed at or above 64 MiB through
+    the build (and below the post-build free count), and the synced ext4 image
+    passes `e2fsck -fn` with the build outputs present.
     """
     _require_dev_rootfs()
     disk = copy_dev_rootfs(tmp_path)
@@ -531,21 +533,32 @@ fi
 ./app
 make -j1 -q
 printf 'uptodate=ok\n'
+""",
+        encoding="utf-8",
+    )
+    j2_script = tmp_path / "d2-j2.sh"
+    j2_script.write_text(
+        r"""set -eu
+export PATH=/bin:/usr/bin
+cd /d2
+mkfifo j2.a2b j2.b2a
 
+# Two-way FIFO handshake between recipes a and b: neither can finish unless
+# GNU make 4.4 acquires its jobserver token and runs both concurrently.
 cat > Makefile.j2 <<'EOF'
 .PHONY: all a b
 all: a b
 a:
-	+printf '%s\n' "$$MAKEFLAGS" > j2.flags
-	true
+	+printf '%s\n' "$$MAKEFLAGS" > j2.flags && printf 'from-a\n' > j2.a2b && read -r got < j2.b2a && [ "$$got" = from-b ]
 b:
-	true
+	read -r got < j2.a2b && [ "$$got" = from-a ] && printf 'from-b\n' > j2.b2a
 EOF
 
 if ! make -j2 -f Makefile.j2 > j2.out 2> j2.err; then
     cat j2.out j2.err
     exit 12
 fi
+rm j2.a2b j2.b2a
 if [ -s j2.err ]; then
     printf 'j2-stderr-unexpected:\n'
     cat j2.err
@@ -563,6 +576,7 @@ printf 'j2=ok\n'
         encoding="utf-8",
     )
     debugfs(disk, f'write "{script}" /d2.sh', write=True)
+    debugfs(disk, f'write "{j2_script}" /d2-j2.sh', write=True)
     m = boot("qemutest", memory="512M", devices=Devices(blk_image=disk, rng=True))
     m.expect(PROMPT, BOOT_TIMEOUT)
 
@@ -578,8 +592,10 @@ printf 'j2=ok\n'
         "caught=too big",
         "dtor=2",
         "uptodate=ok",
-        "j2=ok",
     ], raw
+    j2_done = run_busybox(m, "ash /d2-j2.sh")
+    assert j2_done.status == 0, j2_done.raw
+    assert j2_done.output.splitlines() == ["j2=ok"], j2_done.raw
     assert CRASH_BEGIN not in m.output
 
     mem_out = run(m, "mem")

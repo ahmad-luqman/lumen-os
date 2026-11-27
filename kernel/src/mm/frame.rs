@@ -658,6 +658,7 @@ mod checks {
     /// and restores the minimum across both when dropped, so tests observe
     /// transitions even after an earlier test (like `never_returns_reserved`)
     /// drained every frame.
+    #[must_use = "dropping the guard restores the low-water mark"]
     pub struct LowWaterGuard(usize);
 
     impl LowWaterGuard {
@@ -1479,7 +1480,7 @@ crate::ktest!(
         let initial = counts();
         kassert!(initial.min_free <= initial.free && initial.free <= initial.owned);
 
-        let _guard = LowWaterGuard::reset();
+        let outer = LowWaterGuard::reset();
         let baseline = counts();
         kassert_eq!(baseline.min_free, baseline.free);
         let before = baseline.free;
@@ -1535,6 +1536,32 @@ crate::ktest!(
         kassert!(alloc_contiguous(baseline.owned + 1, 1).is_none());
         kassert_eq!(counts().free, before);
         kassert_eq!(counts().min_free, before - 10);
+
+        // Dropping a guard restores the earlier minimum when it was lower than
+        // what the guarded section saw...
+        let inner = LowWaterGuard::reset();
+        kassert_eq!(counts().min_free, before);
+        let dip = alloc_contiguous(3, 1).ok_or("no 3-frame run")?;
+        kassert_eq!(counts().min_free, before - 3);
+        // SAFETY: `dip` was allocated above and is not used since.
+        kassert_eq!(unsafe { free_contiguous(dip, 3) }, Ok(()));
+        drop(inner);
+        kassert_eq!(counts().min_free, before - 10);
+
+        // ...and keeps a deeper minimum made while the guard was live.
+        let inner = LowWaterGuard::reset();
+        kassert_eq!(counts().min_free, before);
+        let deeper = alloc_contiguous(12, 1).ok_or("no 12-frame run")?;
+        kassert_eq!(counts().min_free, before - 12);
+        // SAFETY: `deeper` was allocated above and is not used since.
+        kassert_eq!(unsafe { free_contiguous(deeper, 12) }, Ok(()));
+        drop(inner);
+        kassert_eq!(counts().min_free, before - 12);
+
+        // Dropping the outer guard restores the minimum since initialization
+        // (or the new deeper minimum if none was lower).
+        drop(outer);
+        kassert_eq!(counts().min_free, (before - 12).min(initial.min_free));
         Ok(())
     }
 );
