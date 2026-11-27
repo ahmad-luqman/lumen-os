@@ -142,7 +142,8 @@ struct LatchedCache {
     dev: DevId,
     state: AtomicU8,
     /// The winning trip's corruption, or None for a device failure. The
-    /// lock serializes cause publication with the state transition (#350).
+    /// lock serializes cause publication with the state transition; the slot
+    /// is read only together with the state (#350).
     allocation_corrupt: crate::sync::SpinLock<Option<Corrupt>>,
     /// Write-type operations running ([`WriteOp`]s alive).
     ops: AtomicUsize,
@@ -180,23 +181,27 @@ impl LatchedCache {
 
     /// Trip for a device failure or allocator corruption, publishing its
     /// cause and thread together. Only the first cause wins (#350).
-    fn trip(&self, corruption: Option<&Corrupt>) -> bool {
+    fn trip(&self, corruption: Option<&Corrupt>) {
         let mut cause = self.allocation_corrupt.lock();
         if self.state.compare_exchange(HEALTHY, TRIPPED, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            return false;
+            drop(cause);
+            if let Some(corruption) = corruption {
+                debug!(target: "vfs", "ext4 {:?}: also found {corruption}; keeping the first failure cause", self.dev);
+            }
+            return;
         }
         *cause = corruption.cloned();
         self.tripper.store(thread_id(), Ordering::SeqCst);
-        true
     }
 
     /// Stop writeback on a bitmap mismatch, leaving cache writes available
     /// for running operations' undo. An earlier device failure keeps its
-    /// cause even if its caller has not reached `watched` yet (#350).
+    /// cause (#350).
     fn trip_corrupt(&self, corruption: &Corrupt) {
         self.inner.stop_writeback();
         if self.inner.first_failure().is_some() {
             self.trip(None);
+            debug!(target: "vfs", "ext4 {:?}: also found {corruption}; keeping the first failure cause", self.dev);
         } else {
             self.trip(Some(corruption));
         }
@@ -221,8 +226,12 @@ impl LatchedCache {
         let op = self.failed_op.lock().unwrap_or("a read's eviction");
         let corruption = self.allocation_corrupt.lock().clone();
         if let Some(cause) = corruption {
-            error!(target: "vfs", "ext4 {:?}: {op} found {cause}; the volume is \
-                read-only until reboot (errors=remount-ro); run e2fsck -f", self.dev);
+            error!(
+                target: "vfs",
+                "ext4 {:?}: {op} found {cause}; the volume is read-only until reboot \
+                 (errors=remount-ro); run e2fsck -f",
+                self.dev
+            );
         } else {
             let cause = self.inner.first_failure().unwrap_or(BlockError::Io);
             error!(
@@ -1376,7 +1385,8 @@ struct Ext4Shared {
 
 /// A write-type operation on the volume, from its start to its end (the
 /// guard's drop, after every lock the operation took): when the last one
-/// running after a failed device write ends, the volume settles
+/// running after a failed device write or detected allocation corruption (#350)
+/// ends, the volume settles
 /// ([`LatchedCache::settle`]); the one whose thread met the failure is the
 /// one the log line names.
 struct WriteOp<'a> {
@@ -1443,13 +1453,15 @@ impl Drop for WriteOp<'_> {
 }
 
 impl Ext4Shared {
-    /// Read-only: mounted so, or errored since (`errors=remount-ro`, #349,
-    /// from the failed write on, before the operation that hit it ends).
+    /// Read-only: mounted so, or errored since (`errors=remount-ro`, #349),
+    /// from a failed write or detected allocation corruption (#350), before
+    /// the operation that hit it ends.
     fn read_only(&self) -> bool {
         self.mounted_ro || self.errored()
     }
 
-    /// Gone read-only after a failed write (`errors=remount-ro`, #349).
+    /// Gone read-only after a failed write (`errors=remount-ro`, #349)
+    /// or detected allocation corruption (#350).
     fn errored(&self) -> bool {
         !self.cache.healthy()
     }
@@ -1685,9 +1697,10 @@ impl FileSystem for Ext4FileSystem {
         }
         match self.shared.sync_bcache() {
             Ok(()) => {}
-            // Another thread's failed write errored the volume since the
-            // check above (#349): `EIO`, the volume's line saying so.
-            Err((_, BlockError::ReadOnly)) if self.shared.errored() => {
+            // A failed write (#349) or detected allocation corruption (#350)
+            // stopped this writable mount's cache. The stop may precede the
+            // latch's trip: return EIO without another warning either way.
+            Err((_, BlockError::ReadOnly)) => {
                 first_err.get_or_insert(VfsError::Io);
             }
             Err((e, cause)) => {
@@ -5401,10 +5414,10 @@ impl VfsInode for Ext4Inode {
                 self.shared.bcache_sync_errno.store(0, Ordering::Release);
                 Ok(())
             }
-            // Another thread's failed write errored the volume since this
-            // sync's check (#349): `EIO`, not the cache's `EROFS`, the
-            // volume's line saying so.
-            Err((_, BlockError::ReadOnly)) if self.shared.errored() => Err(VfsError::Io),
+            // A failed write (#349) or detected allocation corruption (#350)
+            // stopped this writable mount's cache. The stop may precede the
+            // latch's trip: return EIO without another warning either way.
+            Err((_, BlockError::ReadOnly)) => Err(VfsError::Io),
             Err((e, cause)) => {
                 if self.shared.bcache_sync_errno.swap(e.to_errno(), Ordering::AcqRel) != e.to_errno() {
                     warn!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);
@@ -7419,8 +7432,8 @@ crate::ktest!(
         // leaks (no extent owns it), and:
         // - the checksum write failing (k=2) never lowers either count: both
         //   stay one above the bitmap for good (until e2fsck), every later
-        //   descriptor and superblock write storing them so: #350's hang,
-        //   once the group fills;
+        //   descriptor and superblock write storing them so: once the bitmap
+        //   fills, #350 returns EIO and makes the volume read-only;
         // - the count's write failing (k=3) lowers the group's count in
         //   memory (the next descriptor write stores it), not the
         //   superblock's, which stays one above for good;
@@ -7474,6 +7487,15 @@ crate::ktest!(
             // Whatever it returned, the failed write errored the volume (#349).
             kassert!(m.fs.errored());
             kassert_eq!(res, Err(VfsError::Io));
+            if k == 5 {
+                // The first write after allocation: exactly one bit taken
+                // and both counts lowered once. An extra allocation write
+                // would move this boundary and must fail the pin.
+                let c = counts_4k(&image(&m)?, bitmap);
+                kassert_eq!(c.bits, c0.bits + 1);
+                kassert_eq!(c.bg, c0.bg - 1);
+                kassert_eq!(c.sb, c0.sb - 1);
+            }
             if k > 4 {
                 continue; // the allocation completed before this failure
             }
@@ -10151,8 +10173,8 @@ crate::ktest!(
 );
 
 /// A deterministic hang guard: repeated bitmap reads fail persistently.
-/// Checking both counters proves the exact budget was consumed, without
-/// replacing a corruption result with the guard's I/O error (#350).
+/// Callers assert both counters to prove the exact budget was consumed,
+/// without replacing corruption with the guard's I/O error (#350).
 #[cfg(feature = "ktest")]
 fn guard_bitmap_scans(m: &ktest_util::Mnt, bitmap: u64, bytes: usize, reads: usize) {
     m.cache.fail_reads_in_after(bitmap, bitmap + bytes as u64, reads, usize::MAX);
@@ -10308,7 +10330,8 @@ crate::ktest!(
         let before = image(&m)?;
         let bitmap = block_bitmap_offset(&m.fs)?;
         // Six full run scans; free-bit probes read 13 bytes, successful run
-        // scans 10, setting bits 4, and four whole-bitmap checksum reads.
+        // scans 10, setting bits 4, and four checksum reads of the whole
+        // bitmap, one read each.
         guard_bitmap_scans(&m, bitmap, 1024, 6 * 1024 + 31);
         let data = pattern(PAGE_SIZE, 36);
         kassert_eq!(f.write_at(0, &data), Ok(data.len()));
@@ -10418,11 +10441,12 @@ crate::ktest!(
         let nlink = m.root.stat().map_err(|_| "stat before")?.nlink;
         // Inode allocation writes first. Dir::init then finds the lying
         // block count; its undo must still write into the stopped cache.
-        // The undo may probe the bitmap again while trying to clean up.
-        guard_bitmap_scans(&m, bitmap, 4096, 2 * 4096);
+        // Dir::init scans once; undo frees the inode without allocating a block.
+        guard_bitmap_scans(&m, bitmap, 4096, 4096);
         kassert_eq!(m.root.mkdir(b"failed-dir", 0o755).err(), Some(VfsError::Io));
         kassert!(m.cache.writes.load(Ordering::Acquire) > 4);
         kassert!(went_read_only(&m));
+        kassert_eq!(m.cache.range_skip_left(), 0);
         kassert_eq!(m.cache.range_reads_left(), usize::MAX);
         kassert_eq!(free_inodes(&m.fs), before);
         kassert_eq!(m.root.lookup(b"failed-dir").err(), Some(VfsError::NoEnt));
@@ -10450,8 +10474,9 @@ crate::ktest!(
             img[bitmap as usize..bitmap as usize + 4096].fill(0xff);
             let m = mount(img, 359)?;
             let op = m.fs.shared.op("writeback");
-            m.cache.fail_syncs.store(true, Ordering::Release);
+            let dev_before = m.dev_bytes();
             if device_first {
+                m.cache.fail_syncs.store(true, Ordering::Release);
                 kassert_eq!(m.fs.shared.cache.sync(), Err(BlockError::Io));
             }
             // Continue inside an already running operation, directly through
@@ -10464,6 +10489,11 @@ crate::ktest!(
             };
             kassert!(matches!(err, Ext4Error::Corrupt(_)));
             if !device_first {
+                // With no injected failure and op still held, only the
+                // corruption hook's stop prevents sync from succeeding.
+                kassert_eq!(m.fs.shared.cache.sync(), Err(BlockError::ReadOnly));
+                kassert_eq!(m.dev_bytes(), dev_before);
+                m.cache.fail_syncs.store(true, Ordering::Release);
                 kassert_eq!(m.fs.shared.cache.sync(), Err(BlockError::Io));
             }
             kassert_eq!(m.fs.shared.cache.allocation_corrupt.lock().is_none(), device_first);
@@ -10528,6 +10558,28 @@ crate::ktest!(
             kassert_eq!(&after[1024 + 0x0c..1024 + 0x10], &before[1024 + 0x0c..1024 + 0x10]);
             kassert!(m.root.lookup(b"f").is_ok());
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_stopped_cache_syncs_return_eio_before_the_latch_trips() {
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 360)?;
+        let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
+        m.fs.sync().map_err(|_| "sync setup")?;
+        let dev_before = m.dev_bytes();
+        // Model the interval between trip_corrupt's stop_writeback and
+        // trip: the mount is still writable, but its cache cannot sync.
+        m.cache.stop_writeback();
+        kassert!(!m.fs.errored());
+        kassert!(!m.cache.frozen());
+        kassert_eq!(m.fs.sync(), Err(VfsError::Io));
+        kassert_eq!(f.sync(false), Err(VfsError::Io));
+        kassert!(!m.fs.errored());
+        kassert_eq!(m.dev_bytes(), dev_before);
+        // The scenario's exact counts also reject a stray sync/fsync WARN.
         Ok(())
     }
 );

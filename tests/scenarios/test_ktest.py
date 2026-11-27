@@ -307,7 +307,7 @@ VFS_ERRORED_LINES = (
 VFS_HOLDABLE_LINES = (*VFS_SWEEP_LINES, *VFS_ERRORED_LINES)
 # The ktests erroring one volume outside a guard, one line each: the
 # writeback ktests (a sync stopping at a failing inode, a failing page's
-# ENOSPC, reclaim's write error, a write whose reclaim fails), vfs::tests'
+# EIO, reclaim's write error, a write whose reclaim fails), vfs::tests'
 # sync stopping at a failed write and flush/reclaim write error, io's sync
 # of every filesystem, mem's msync, meta's failed chown, an older mapping's
 # volume going read-only, the latch settling at the last operation's end,
@@ -371,7 +371,8 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 6,
     # mm::user_vm::file_vm_disk_read_error_is_a_bus_error: a fault's fill.
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 2 \(offset 8192\) failed: Io": 1,
-    # (vfs_sync_stops_at_a_failed_write_and_reports_it's, and
+    # (vfs_sync_stops_at_a_failed_write_and_reports_it's,
+    # ext4_sync_stops_at_the_first_failed_write's, and
     # ext4_nothing_reaches_the_device_after_the_first_failed_write's: one
     # each, the sync stopping at the inode whose write failed, #349)
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 3,
