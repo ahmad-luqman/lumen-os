@@ -105,7 +105,7 @@ Each rule exists because breaking it caused a real bug in v1.
    and/or host tests in a `no_std` crate under `crates/`. Prefer putting pure
    logic in a host-testable crate.
 4. Add your feature to `tests/features/<area>.toml` (one file per area, so
-   parallel PRs don't collide). Run `make lint test status-check` locally.
+   parallel PRs don't collide), and update the area's `docs/MAP.md` entry. Run `make lint test status-check` locally.
    **Don't commit `docs/STATUS.md` in feature PRs**: CI's feature gate
    (`make status-check`) fails the PR if any listed feature isn't passing, and
    the committed STATUS.md is refreshed on main (`make test status`) by the
@@ -170,10 +170,13 @@ you are changing first, and update it in the same PR. In short:
   interrupts, syscall entry; `mm/` frames, heap, stacks, paging, user
   address spaces, TLB; `sched.rs`, `smp.rs`, `sync.rs`; `shell/`, `term.rs`,
   `vt.rs`, `desktop.rs`, `ui.rs`, `taskbar.rs` (consoles and the desktop);
-  `pci/`, `drivers.rs`, `virtio.rs`, `blk/`, device drivers; `app/` WASM
+  `pci/`, `drivers.rs`, `virtio.rs` the PCI/virtio driver core, `blk/`,
+  and per-device files (`keyboard.rs`, `mouse.rs`, `sound.rs`, `rng.rs`,
+  `serial_in.rs`); `app/` WASM
   apps (M5); `vfs/` the VFS, ext4, tmpfs, devfs, devpts, procfs (M7);
-  `linux/` the Linux ABI: processes, signals, futexes, pipes, timers and
-  syscall handlers (M6 to M8); `tty.rs` line disciplines; `ktest.rs`,
+  `user.rs` ring-3 entry and exit, user copies, syscall dispatch; `linux/`
+  the Linux ABI: processes, signals, futexes, pipes, timers and syscall
+  handlers (M6 to M8); `tty.rs` line disciplines; `ktest.rs`,
   `crash.rs`, `trace.rs`, `klog.rs`.
 - `crates/lumen-*`: host-tested `no_std` logic the kernel and apps use
   (memory, VFS, block cache, process tree, signals, futexes, pipes, tty,
@@ -187,4 +190,5 @@ you are changing first, and update it in the same PR. In short:
   `tools/linux-m8/`).
 - `tests/`: QEMU scenarios (`scenarios/`), harness self-tests (`harness/`),
   the feature map (`features/*.toml`), libc-test's expected failures
-  (`conformance/`).
+  (`conformance/`), golden screenshots (`golden/`), the syscall census
+  (`linux/`).

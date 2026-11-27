@@ -1,6 +1,7 @@
 # Lumen code map
 
-Where things live and what each piece holds, one entry per file or crate.
+Where things live and what each piece holds: one entry per crate or tool
+group; the kernel's is one long entry, organised by file.
 Read the entry for an area before changing it; keep the entry current in
 the same PR (names, issue numbers, what each piece owns). Interfaces shared
 across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
