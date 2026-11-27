@@ -329,7 +329,7 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4's errors=remount-ro (#349): the first failed device write or flush of a volume (the block cache's first failure, wherever a block is written back: an ext4plus or adapter write's eviction, a writeback, a sync, a read's eviction; a flush's failure setting it host-tested, ext4 reacting to a failing cache sync tested; whatever ext4plus returns, ENOSPC or Ok included; a write the cache refuses with no device write failing doesn't count) makes it read-only at once: nothing more reaches the device from that write on (the block cache stops writing back inside the call that met it), syncs and writebacks stop there (the rest stays dirty in memory), the write-type operations running then finish against the cache (the failing one's undo included) and return EIO, even one whose own calls all worked (a link or unlink whose read met the failed eviction, served), and when the last ends the cache is frozen and one ERROR line names the device, the operation whose write failed (or a read's eviction) and the error; every later write-type operation is EROFS (create, mkdir, symlink, link, unlink, rmdir, rename, opens for writing or truncating, write, a write whose own reclaim met the failure included, and one whose partial page's read met it refused with nothing of it in that page, or short when that page is its last, truncate, chmod, chown, utimensat, a new shared writable mmap), a shared mapping made before gets no new writable PTE (a store fault or promotion is a bus error; a PTE already writable keeps taking stores into the page cache, never the disk) and mprotect can't make it writable, fsync, fdatasync, msync and the filesystem's sync write nothing and return EIO (sync(2) still returns 0), reclaim drops only clean pages, and reads keep working (a miss with every slot dirty is read straight from the device, uncached); NoSpc with no failed write leaves the volume writable; mount shows ro,errors and /proc/mounts ro,errors=remount-ro; a read error leaves the volume writable; the fault sweeps check each failed operation's own outcome and then that the volume went read-only"
+name = "ext4's errors=remount-ro (#349): the first failed device write or flush of a volume (the block cache's first failure, wherever a block is written back: an ext4plus or adapter write's eviction, a writeback, a sync, a read's eviction; a flush's failure setting it host-tested, ext4 reacting to a failing cache sync tested; whatever ext4plus returns, Ok included; a write the cache refuses with no device write failing doesn't count) makes it read-only at once: nothing more reaches the device from that write on (the block cache stops writing back inside the call that met it), syncs and writebacks stop there (the rest stays dirty in memory), the write-type operations running then finish against the cache (the failing one's undo included) and return EIO, even one whose own calls all worked (a link or unlink whose read met the failed eviction, served), and when the last ends the cache is frozen and one ERROR line names the device, the operation whose write failed (or a read's eviction) and the error; every later write-type operation is EROFS (create, mkdir, symlink, link, unlink, rmdir, rename, opens for writing or truncating, write, a write whose own reclaim met the failure included, and one whose partial page's read met it refused with nothing of it in that page, or short when that page is its last, truncate, chmod, chown, utimensat, a new shared writable mmap), a shared mapping made before gets no new writable PTE (a store fault or promotion is a bus error; a PTE already writable keeps taking stores into the page cache, never the disk) and mprotect can't make it writable, fsync, fdatasync, msync and the filesystem's sync write nothing and return EIO (sync(2) still returns 0), reclaim drops only clean pages, and reads keep working (a miss with every slot dirty is read straight from the device, uncached); NoSpc with no failed write leaves the volume writable; mount shows ro,errors and /proc/mounts ro,errors=remount-ro; a read error leaves the volume writable; the fault sweeps check each failed operation's own outcome and then that the volume went read-only"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_a_write_error_makes_the_volume_read_only",
@@ -337,7 +337,7 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_nothing_reaches_the_device_after_the_first_failed_write",
     "ktest:lumen_kernel::vfs::ext4::ext4_the_latch_settles_when_the_last_write_type_operation_ends",
     "ktest:lumen_kernel::vfs::ext4::ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio",
-    "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_page_writeback_errors_the_volume_as_enospc",
+    "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_page_writeback_errors_the_volume_as_eio",
     "ktest:lumen_kernel::vfs::ext4::ext4_sync_stops_at_the_first_failed_write",
     "ktest:lumen_kernel::vfs::ext4::ext4_a_write_refused_by_the_cache_alone_leaves_the_volume_writable",
     "ktest:lumen_kernel::vfs::ext4::ext4_a_write_whose_reclaim_meets_a_failed_write_is_refused",
@@ -354,11 +354,11 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4plus 0.1.0-rc.2's write-error retries pinned (#331), every run of each sweep checked: a write failing inside freeing a file's block range is retried block by block, so ext4plus returns Ok after exactly the range free's 5 failed writes (every other failed write giving EIO; the unlink itself returns EIO on every run, the volume errored, #349), the file gone and its blocks free in the bitmap, the group's free count raised twice by a failure at or after the descriptor write carrying it and the superblock's too by a failed superblock write; and a write failing in a page's block allocation on 4 KiB blocks comes back as ENOSPC, not EIO, leaving the bit it set owned by no extent, both counts one above the bitmap for good when the descriptor's checksum write failed, the superblock's when the count's write failed, and nothing wrong when the superblock write failed (each checked after the next writeback). An ext4plus bump that changes either fails the pin; under #349 every such failed write makes the volume read-only all the same"
+name = "ext4plus 0.1.0-rc.2's write-error retries pinned (#331), every run of each sweep checked: a write failing inside freeing a file's block range is retried block by block, so ext4plus returns Ok after exactly the range free's 5 failed writes (every other failed write giving EIO; the unlink itself returns EIO on every run, the volume errored, #349), the file gone and its blocks free in the bitmap, the group's free count raised twice by a failure at or after the descriptor write carrying it and the superblock's too by a failed superblock write; and a write failing in a page's block allocation on 4 KiB blocks preserves EIO without retrying (#350), leaving the bit it set owned by no extent, both counts one above the bitmap for good when the descriptor's checksum write failed, the superblock's when the count's write failed, and nothing wrong when the superblock write failed (each checked after the next writeback). An ext4plus bump that changes either fails the pin; under #349 every such failed write makes the volume read-only all the same"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio",
-    "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc",
+    "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_write_in_a_block_allocation_preserves_eio",
 ]
 
 [[feature]]
@@ -442,4 +442,27 @@ tests = [
     "cargo:lumen-vfs",
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_failed_truncate_stat_error_warns_and_invalidates",
     "ktest:lumen_kernel::linux::syscall::fd::open_trunc_error_unmaps_only_pages_past_the_remaining_size",
+]
+
+[[feature]]
+name = "Ext4 allocation scans terminate: lying block/inode counts fail read-only without reallocation, while fragmented extents wrap or fall back (#350)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_block_bitmap_mismatch_fails_read_only_without_reallocation",
+    "ktest:lumen_kernel::vfs::ext4::ext4_inode_bitmap_mismatch_fails_read_only_without_reallocation",
+    "ktest:lumen_kernel::vfs::ext4::ext4_fragmented_extent_group_falls_back_without_corruption",
+    "ktest:lumen_kernel::vfs::ext4::ext4_fragmented_extent_group_wraps_to_another_group_once",
+    "ktest:lumen_kernel::vfs::ext4::ext4_block_map_allocation_starts_in_its_group_then_wraps",
+]
+
+[[feature]]
+name = "Ext4 allocation corruption preserves undo and the first error cause; bitmap padding is never allocated, and non-space extent errors are not retried (#350)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-bcache",
+    "ktest:lumen_kernel::vfs::ext4::ext4_block_bitmap_padding_is_never_allocated",
+    "ktest:lumen_kernel::vfs::ext4::ext4_allocation_corruption_allows_mkdir_undo_before_freezing",
+    "ktest:lumen_kernel::vfs::ext4::ext4_allocation_corruption_keeps_the_first_failure_cause",
+    "ktest:lumen_kernel::vfs::ext4::ext4_extent_allocation_does_not_retry_nonspace_errors",
+    "ktest:lumen_kernel::vfs::ext4::ext4_stopped_cache_syncs_return_eio_before_the_latch_trips",
 ]

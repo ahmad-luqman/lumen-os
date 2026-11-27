@@ -1,5 +1,6 @@
 //! Interface used by [`crate::Ext4`] to write the filesystem data to a storage
-use crate::error::BoxedError;
+// Lumen (#350): the early notification carries the returned corruption.
+use crate::error::{BoxedError, Corrupt};
 #[cfg(not(feature = "sync"))]
 use async_trait::async_trait;
 
@@ -26,6 +27,13 @@ fn write_to_bytes(dst: &mut [u8], start_byte: u64, src: &[u8]) -> Option<()> {
 #[cfg(all(not(feature = "multi-threaded"), not(feature = "sync")))]
 #[async_trait(?Send)]
 pub trait Ext4Write {
+    // Lumen (#350): a default hook keeps existing writers compatible.
+    /// Called with the allocation bitmap mismatch before returning it as
+    /// `Ext4Error::Corrupt`, which remains the error contract. This optional
+    /// hook lets a volume latch early and stop writeback while allowing undo
+    /// writes into its cache until running operations finish.
+    fn on_allocation_corruption(&self, _corruption: &Corrupt) {}
+
     /// Write bytes from `src`, starting at `start_byte`.
     async fn write(
         &self,
@@ -40,6 +48,13 @@ pub trait Ext4Write {
 /// [`Ext4`]: crate::Ext4
 #[cfg(all(not(feature = "multi-threaded"), feature = "sync"))]
 pub trait Ext4Write {
+    // Lumen (#350): a default hook keeps existing writers compatible.
+    /// Called with the allocation bitmap mismatch before returning it as
+    /// `Ext4Error::Corrupt`, which remains the error contract. This optional
+    /// hook lets a volume latch early and stop writeback while allowing undo
+    /// writes into its cache until running operations finish.
+    fn on_allocation_corruption(&self, _corruption: &Corrupt) {}
+
     /// Write bytes from `src`, starting at `start_byte`.
     fn write(&self, start_byte: u64, src: &[u8]) -> Result<(), BoxedError>;
 }
@@ -51,6 +66,13 @@ pub trait Ext4Write {
 #[cfg(all(feature = "multi-threaded", not(feature = "sync")))]
 #[async_trait]
 pub trait Ext4Write: Send + Sync {
+    // Lumen (#350): a default hook keeps existing writers compatible.
+    /// Called with the allocation bitmap mismatch before returning it as
+    /// `Ext4Error::Corrupt`, which remains the error contract. This optional
+    /// hook lets a volume latch early and stop writeback while allowing undo
+    /// writes into its cache until running operations finish.
+    fn on_allocation_corruption(&self, _corruption: &Corrupt) {}
+
     /// Write bytes from `src`, starting at `start_byte`.
     async fn write(
         &self,
@@ -65,6 +87,13 @@ pub trait Ext4Write: Send + Sync {
 /// [`Ext4`]: crate::Ext4
 #[cfg(all(feature = "multi-threaded", feature = "sync"))]
 pub trait Ext4Write: Send + Sync {
+    // Lumen (#350): a default hook keeps existing writers compatible.
+    /// Called with the allocation bitmap mismatch before returning it as
+    /// `Ext4Error::Corrupt`, which remains the error contract. This optional
+    /// hook lets a volume latch early and stop writeback while allowing undo
+    /// writes into its cache until running operations finish.
+    fn on_allocation_corruption(&self, _corruption: &Corrupt) {}
+
     /// Write bytes from `src`, starting at `start_byte`.
     fn write(&self, start_byte: u64, src: &[u8]) -> Result<(), BoxedError>;
 }
@@ -134,6 +163,11 @@ impl<T> Ext4Write for alloc::rc::Rc<T>
 where
     T: Ext4Write,
 {
+    // Lumen (#350): preserve the notification through shared writers.
+    fn on_allocation_corruption(&self, corruption: &Corrupt) {
+        (**self).on_allocation_corruption(corruption);
+    }
+
     async fn write(
         &self,
         start_byte: u64,
@@ -148,6 +182,11 @@ impl<T> Ext4Write for alloc::rc::Rc<T>
 where
     T: Ext4Write,
 {
+    // Lumen (#350): preserve the notification through shared writers.
+    fn on_allocation_corruption(&self, corruption: &Corrupt) {
+        (**self).on_allocation_corruption(corruption);
+    }
+
     fn write(&self, start_byte: u64, src: &[u8]) -> Result<(), BoxedError> {
         (**self).write(start_byte, src)
     }
@@ -159,6 +198,11 @@ impl<T> Ext4Write for alloc::sync::Arc<T>
 where
     T: Ext4Write,
 {
+    // Lumen (#350): preserve the notification through shared writers.
+    fn on_allocation_corruption(&self, corruption: &Corrupt) {
+        (**self).on_allocation_corruption(corruption);
+    }
+
     async fn write(
         &self,
         start_byte: u64,
@@ -173,6 +217,11 @@ impl<T> Ext4Write for alloc::sync::Arc<T>
 where
     T: Ext4Write,
 {
+    // Lumen (#350): preserve the notification through shared writers.
+    fn on_allocation_corruption(&self, corruption: &Corrupt) {
+        (**self).on_allocation_corruption(corruption);
+    }
+
     fn write(&self, start_byte: u64, src: &[u8]) -> Result<(), BoxedError> {
         (**self).write(start_byte, src)
     }

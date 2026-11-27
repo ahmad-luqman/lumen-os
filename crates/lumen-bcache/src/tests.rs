@@ -741,3 +741,35 @@ fn a_stopped_cache_reads_a_partial_last_block_uncached() {
     assert_eq!(got, [0x7a; 4]);
     assert_eq!(cache.stats().cached, 1);
 }
+
+#[test]
+fn stopping_writeback_preserves_undo_until_freeze() {
+    let cache = BlockCache::new(MemBlockDevice::new(512, 64), 2).unwrap();
+    cache.write_at(0, &[0x11; 4]).unwrap();
+    cache.stop_writeback();
+    cache.stop_writeback(); // idempotent, with no device failure
+    assert!(cache.writeback_stopped());
+    assert!(!cache.is_frozen());
+    assert_eq!(cache.first_failure(), None);
+    cache.write_at(0, &[0x22; 4]).unwrap(); // undo a cached change
+    cache.write_at(BLOCK_SIZE as u64, &[0x33; 4]).unwrap(); // use a clean slot
+    assert_eq!(cache.sync(), Err(BlockError::ReadOnly));
+    assert_eq!(cache.flush_blocks(&[0, 1]), Err(BlockError::ReadOnly));
+    let mut buf = [0; 4];
+    cache.read_at(0, &mut buf).unwrap();
+    assert_eq!(buf, [0x22; 4]);
+    // No dirty eviction: a miss reads uncached, a write cannot get a slot.
+    cache.read_at(2 * BLOCK_SIZE as u64, &mut buf).unwrap();
+    assert_eq!(buf, [0; 4]);
+    assert_eq!(cache.write_at(2 * BLOCK_SIZE as u64, &[1]), Err(BlockError::CacheFull));
+    assert!(cache.device().write_log().is_empty());
+    assert_eq!(cache.device().flush_calls(), 0);
+    assert_eq!(cache.device().durable_snapshot()[..4], [0; 4]);
+    cache.freeze();
+    cache.stop_writeback(); // must not thaw a frozen cache
+    assert!(cache.is_frozen());
+    assert_eq!(cache.write_at(0, &[0x44]), Err(BlockError::ReadOnly));
+    assert_eq!(cache.pin_mut(0).err(), Some(BlockError::ReadOnly));
+    cache.read_at(0, &mut buf).unwrap();
+    assert_eq!(buf, [0x22; 4]);
+}

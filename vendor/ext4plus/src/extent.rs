@@ -46,7 +46,10 @@ impl Extent {
                 .await
             {
                 Ok(start_fs) => break start_fs,
-                Err(_) => {
+                // Lumen (#350): only exhaustion merits a shorter run.
+                // Retrying I/O or read-only errors hides failures and can
+                // leak bits already set by a partially failed allocation.
+                Err(Ext4Error::NoSpace) => {
                     if tried_blocks == 0 {
                         return Err(Ext4Error::NoSpace);
                     }
@@ -61,6 +64,8 @@ impl Extent {
                         return Err(Ext4Error::NoSpace);
                     }
                 }
+                // Lumen (#350): preserve every non-space error.
+                Err(err) => return Err(err),
             }
         };
         // Insert extent: file-blocks [current_block, current_block + tried_blocks) -> FS blocks [start_fs_block, ...]

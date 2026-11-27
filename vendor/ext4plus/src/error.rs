@@ -248,6 +248,10 @@ pub(crate) enum CorruptKind {
         u32,
     ),
 
+    // Lumen (#350): distinguish allocation accounting from malformed descriptors.
+    /// A positive free count has no free bit inside the group's bitmap range.
+    AllocationBitmapMismatch { group: u32, inode: bool },
+
     /// Invalid block group descriptor.
     BlockGroupDescriptor(
         /// Block group number.
@@ -460,6 +464,14 @@ impl Display for CorruptKind {
             Self::JournalInode => write!(f, "invalid journal inode"),
             Self::FirstDataBlock(block) => {
                 write!(f, "invalid first data block: {block}")
+            }
+            // Lumen (#350): identify the bitmap that contradicts its count.
+            Self::AllocationBitmapMismatch { group, inode } => {
+                let bitmap = if *inode { "inode" } else { "block" };
+                write!(
+                    f,
+                    "group {group}'s {bitmap} bitmap has no free bit despite a positive free count"
+                )
             }
             Self::BlockGroupDescriptor(block_group_num) => {
                 write!(f, "block group descriptor {block_group_num} is invalid")

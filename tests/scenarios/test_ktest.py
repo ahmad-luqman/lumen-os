@@ -307,12 +307,13 @@ VFS_ERRORED_LINES = (
 VFS_HOLDABLE_LINES = (*VFS_SWEEP_LINES, *VFS_ERRORED_LINES)
 # The ktests erroring one volume outside a guard, one line each: the
 # writeback ktests (a sync stopping at a failing inode, a failing page's
-# ENOSPC, reclaim's write error, a write whose reclaim fails), vfs::tests'
+# EIO, reclaim's write error, a write whose reclaim fails), vfs::tests'
 # sync stopping at a failed write and flush/reclaim write error, io's sync
 # of every filesystem, mem's msync, meta's failed chown, an older mapping's
 # volume going read-only, the latch settling at the last operation's end,
-# and the device write failing part-way through a sync (#349).
-VFS_ERRORED_UNGUARDED = 12
+# the device write failing part-way through a sync (#349), and
+# ext4_allocation_corruption_keeps_the_first_failure_cause's device-first leg.
+VFS_ERRORED_UNGUARDED = 13
 VFS_EXACT_LINES = {
     # page_quota_release_saturates_and_detached_quota_reports_nospc
     r"ERROR vfs: quota ktest \(16384 bytes\): released 20480 bytes with only 8192 reserved": 1,
@@ -324,17 +325,39 @@ VFS_EXACT_LINES = {
     r"ERROR vfs: ext4 inode \d+: restoring the inline symlink target failed; run e2fsck": 1,
     # ext4_truncate_and_open_unlink_preserve_state_on_io_error
     rf"ERROR vfs: ext4 {_DEV} inode \d+: truncate failed and its tail bytes couldn't be restored on disk": 1,
-    # The writeback-error ktests, one each. `NoSpc`: the full disk, and a
-    # block allocation's failed write coming back as ENOSPC (#331), so (#349)
-    # the sync stopping at a failing inode, a failing page's writeback,
-    # reclaim's write error and a write whose reclaim fails. `Io`: the
-    # flush/reclaim ktest's two, linux::syscall::io's
-    # io_fsync_writes_an_ext4_file_back_and_reports_eio, mem's
-    # mem_msync_returns_a_writeback_error_before_enomem, mm's older-mapping
-    # ktest, and ext4_nothing_reaches_the_device_after_the_first_failed_write
-    # (the one page whose write met the failure; the sync stops there).
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 5,
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 6,
+    # Writeback-error ktests: NoSpc only for the full disk. Since #350,
+    # allocation I/O failures keep EIO: ext4_sync_stops_at_the_first_failed_write,
+    # ext4_a_failed_page_writeback_errors_the_volume_as_eio, reclaim's write
+    # error and the write whose reclaim fails. The six older EIO cases are
+    # flush/reclaim's two, io_fsync_writes_an_ext4_file_back_and_reports_eio,
+    # mem_msync_returns_a_writeback_error_before_enomem, older shared mappings,
+    # and ext4_nothing_reaches_the_device_after_the_first_failed_write.
+    # Corruption adds three legs of
+    # ext4_block_bitmap_mismatch_fails_read_only_without_reallocation and
+    # four of ext4_block_bitmap_padding_is_never_allocated.
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 1,
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 17,
+    # Those same seven corrupt block-allocation legs: the precise group,
+    # bitmap and operation in their one errors=remount-ro line (#350).
+    (
+        rf"ERROR vfs: ext4 {_DEV}: fsync found group 0's block bitmap has no free bit despite a positive free count; "
+        r"the volume is read-only until reboot \(errors=remount-ro\); run e2fsck -f"
+    ): 7,
+    # ext4_inode_bitmap_mismatch_fails_read_only_without_reallocation.
+    (
+        rf"ERROR vfs: ext4 {_DEV}: create found group 0's inode bitmap has no free bit despite a positive free count; "
+        r"the volume is read-only until reboot \(errors=remount-ro\); run e2fsck -f"
+    ): 1,
+    # ext4_allocation_corruption_allows_mkdir_undo_before_freezing: no orphan ERROR.
+    (
+        rf"ERROR vfs: ext4 {_DEV}: mkdir found group 0's block bitmap has no free bit despite a positive free count; "
+        r"the volume is read-only until reboot \(errors=remount-ro\); run e2fsck -f"
+    ): 1,
+    # ext4_allocation_corruption_keeps_the_first_failure_cause: corruption-first leg.
+    (
+        rf"ERROR vfs: ext4 {_DEV}: writeback found group 0's block bitmap has no free bit despite a positive free count; "
+        r"the volume is read-only until reboot \(errors=remount-ro\); run e2fsck -f"
+    ): 1,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
     # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
     # fills, a good one, a third failed fill), one warning each;
@@ -348,11 +371,11 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 6,
     # mm::user_vm::file_vm_disk_read_error_is_a_bus_error: a fault's fill.
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 2 \(offset 8192\) failed: Io": 1,
-    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
-    # (vfs_sync_stops_at_a_failed_write_and_reports_it's, and
+    # (vfs_sync_stops_at_a_failed_write_and_reports_it's,
+    # ext4_sync_stops_at_the_first_failed_write's, and
     # ext4_nothing_reaches_the_device_after_the_first_failed_write's: one
     # each, the sync stopping at the inode whose write failed, #349)
-    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 2,
+    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 3,
     # linux::syscall::io: io_fsync_writes_an_ext4_file_back_and_reports_eio's
     # `fsync` with the block cache's sync failing, and
     # io_sync_flushes_every_mounted_filesystem's `sync` with one volume's;
