@@ -351,37 +351,62 @@ impl<F> FdTable<F> {
         self.slots.get_mut(idx).and_then(Option::as_mut)
     }
 
-    /// Allocate the lowest free FD in `[0, MAX_FDS)`.
-    pub fn alloc(&mut self, file: F, cloexec: bool) -> Result<i32, VfsError> {
-        self.alloc_from(0, file, cloexec)
+    /// Clamp a caller-supplied FD limit to the table's [`MAX_FDS`] ceiling.
+    #[inline]
+    fn cap(limit: usize) -> usize {
+        limit.min(MAX_FDS)
     }
 
-    /// Allocate the lowest free FD `>= min_fd` in `[0, MAX_FDS)` (`F_DUPFD` / `F_DUPFD_CLOEXEC`).
+    /// Lowest free (neither open nor reserved) slot in `[from, cap)`.
+    fn first_free(&self, from: i32, cap: usize) -> Result<i32, VfsError> {
+        (from..cap as i32).find(|&fd| self.get(fd).is_none() && !self.reserved.contains_key(&fd)).ok_or(VfsError::MFile)
+    }
+
+    /// Place an entry in `fd`, growing `slots` if needed, returning any displaced entry.
+    fn fill(&mut self, fd: i32, file: F, cloexec: bool) -> Option<FdEntry<F>> {
+        let idx = fd as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize_with(idx + 1, || None);
+        }
+        self.slots[idx].replace(FdEntry { file, cloexec })
+    }
+
+    /// Allocate the lowest free FD in `[0, limit.min(MAX_FDS))` (`dup`).
     ///
-    /// Returns `Err(Inval)` if `min_fd < 0 || min_fd >= MAX_FDS as i32`,
-    /// or `Err(MFile)` if every slot in `[min_fd, MAX_FDS)` is open or reserved.
-    pub fn alloc_from(&mut self, min_fd: i32, file: F, cloexec: bool) -> Result<i32, VfsError> {
-        let fd = self.lowest_free(min_fd)?;
-        self.slots.resize_with(self.slots.len().max(fd as usize + 1), || None);
-        self.slots[fd as usize] = Some(FdEntry { file, cloexec });
+    /// Returns `Err(MFile)` if every slot below the effective limit is open or
+    /// reserved, including when `limit == 0`.
+    pub fn alloc_below(&mut self, limit: usize, file: F, cloexec: bool) -> Result<i32, VfsError> {
+        let fd = self.first_free(0, Self::cap(limit))?;
+        let displaced = self.fill(fd, file, cloexec);
+        debug_assert!(displaced.is_none());
         Ok(fd)
     }
 
-    fn lowest_free(&self, from: i32) -> Result<i32, VfsError> {
-        if from < 0 || from as usize >= MAX_FDS {
+    /// Allocate the lowest free FD `>= min_fd` in `[0, limit.min(MAX_FDS))`
+    /// (`F_DUPFD` / `F_DUPFD_CLOEXEC` with `RLIMIT_NOFILE`).
+    ///
+    /// Returns `Err(Inval)` if `min_fd < 0 || min_fd as usize >= limit.min(MAX_FDS)`
+    /// (including `min_fd == 0` when `limit == 0`, matching Linux `f_dupfd`),
+    /// or `Err(MFile)` if every slot in `[min_fd, limit.min(MAX_FDS))` is open or reserved.
+    pub fn alloc_from_below(&mut self, min_fd: i32, limit: usize, file: F, cloexec: bool) -> Result<i32, VfsError> {
+        let cap = Self::cap(limit);
+        if min_fd < 0 || min_fd as usize >= cap {
             return Err(VfsError::Inval);
         }
-        (from..MAX_FDS as i32)
-            .find(|&fd| self.get(fd).is_none() && !self.reserved.contains_key(&fd))
-            .ok_or(VfsError::MFile)
+        let fd = self.first_free(min_fd, cap)?;
+        let displaced = self.fill(fd, file, cloexec);
+        debug_assert!(displaced.is_none());
+        Ok(fd)
     }
 
-    /// Reserve the lowest free slot at or above `from`, before doing work
-    /// outside the table lock. `Inval` for an out-of-range minimum,
-    /// `MFile` if none is free. Reserved slots are skipped by all open-FD
-    /// operations, drains and clones, and cannot be displaced by dup2.
-    pub fn reserve(&mut self, from: i32) -> Result<FdReservation, VfsError> {
-        let fd = self.lowest_free(from)?;
+    /// Reserve the lowest free slot in `[0, limit.min(MAX_FDS))`, before doing
+    /// work outside the table lock (`open`, `openat`, `pipe`, `pipe2` with
+    /// `RLIMIT_NOFILE`). Returns `Err(MFile)` if no slot below the effective
+    /// limit is free, including when `limit == 0`. Reserved slots are skipped
+    /// by all open-FD operations, drains and clones, and cannot be displaced by
+    /// `dup2`.
+    pub fn reserve_below(&mut self, limit: usize) -> Result<FdReservation, VfsError> {
+        let fd = self.first_free(0, Self::cap(limit))?;
         self.slots.resize_with(self.slots.len().max(fd as usize + 1), || None);
         let id = NEXT_RESERVATION.fetch_add(1, Ordering::Relaxed);
         assert_ne!(id, 0, "FD reservation identity exhausted");
@@ -394,7 +419,8 @@ impl<F> FdTable<F> {
     pub fn install(&mut self, r: FdReservation, file: F, cloexec: bool) -> i32 {
         self.cancel_reservation(&r);
         assert!(self.slots[r.fd as usize].is_none(), "reserved fd {} filled before install", r.fd);
-        self.slots[r.fd as usize] = Some(FdEntry { file, cloexec });
+        let displaced = self.fill(r.fd, file, cloexec);
+        debug_assert!(displaced.is_none());
         r.fd
     }
 
@@ -409,25 +435,41 @@ impl<F> FdTable<F> {
         self.reserved.remove(&r.fd);
     }
 
-    /// Insert or replace `fd` directly (`dup2` / `dup3` / stdio seeding).
+    /// Insert or replace `fd` directly within `0..MAX_FDS`, intentionally
+    /// unbounded by `RLIMIT_NOFILE`: used for kernel-internal installs (stdio
+    /// seeding, the exec copy, ktest fixtures; fork clones the whole table)
+    /// that must never be refused by a lowered soft limit.
     ///
-    /// Returns `Err(Busy)` for a reserved slot, `Err(BadF)` outside the table.
+    /// Returns `Err(Busy)` for a reserved slot, `Err(BadF)` outside `0..MAX_FDS`.
     /// Returns the displaced `FdEntry` (if any) so the caller can drop it
     /// outside every spinlock (the kernel's descriptor-table lock among them).
     pub fn insert_at(&mut self, fd: i32, file: F, cloexec: bool) -> Result<Option<FdEntry<F>>, VfsError> {
+        self.insert_at_below(fd, MAX_FDS, file, cloexec)
+    }
+
+    /// Insert or replace `fd` directly when `0 <= fd < limit.min(MAX_FDS)`
+    /// (`dup2` / `dup3` with `RLIMIT_NOFILE`).
+    ///
+    /// Returns `Err(BadF)` if `fd < 0 || fd as usize >= limit.min(MAX_FDS)`,
+    /// or `Err(Busy)` for a reserved slot within the limit.
+    pub fn insert_at_below(
+        &mut self,
+        fd: i32,
+        limit: usize,
+        file: F,
+        cloexec: bool,
+    ) -> Result<Option<FdEntry<F>>, VfsError> {
+        let cap = Self::cap(limit);
         let Ok(idx) = usize::try_from(fd) else {
             return Err(VfsError::BadF);
         };
-        if idx >= MAX_FDS {
+        if idx >= cap {
             return Err(VfsError::BadF);
         }
         if self.reserved.contains_key(&fd) {
             return Err(VfsError::Busy);
         }
-        if idx >= self.slots.len() {
-            self.slots.resize_with(idx + 1, || None);
-        }
-        Ok(self.slots[idx].replace(FdEntry { file, cloexec }))
+        Ok(self.fill(fd, file, cloexec))
     }
 
     /// Remove and return `fd` (`close`), or `Err(BadF)` if invalid/unallocated.
@@ -503,12 +545,61 @@ mod exec_tests {
         }
         assert_eq!(table.next_cloexec(1), Some(2));
         assert_eq!(table.next_cloexec(MAX_FDS), None);
-        assert_eq!(table.alloc(0, false), Err(VfsError::MFile));
+        assert_eq!(table.alloc_below(MAX_FDS, 0, false), Err(VfsError::MFile));
         for fd in 0..MAX_FDS as i32 {
             let entry = table.remove(fd).unwrap();
             assert_eq!((entry.file, entry.cloexec), (fd, fd % 2 == 0));
         }
         assert_eq!(table.slots.as_ptr(), storage);
-        assert_eq!(table.alloc(42, false), Ok(0));
+        assert_eq!(table.alloc_below(MAX_FDS, 42, false), Ok(0));
+    }
+
+    #[test]
+    fn nofile_limit_bounds_alloc_reserve_dupfd_and_insert() {
+        let mut t = FdTable::<u32>::new();
+
+        // Limit 0: alloc_below / reserve_below -> MFile; alloc_from_below -> Inval; insert_at_below -> BadF.
+        assert_eq!(t.alloc_below(0, 1, false), Err(VfsError::MFile));
+        assert_eq!(t.reserve_below(0).unwrap_err(), VfsError::MFile);
+        assert_eq!(t.alloc_from_below(0, 0, 1, false), Err(VfsError::Inval));
+        assert_eq!(t.insert_at_below(0, 0, 1, false).unwrap_err(), VfsError::BadF);
+
+        // Limit 4: slots 0..4 succeed, then MFile.
+        assert_eq!(t.alloc_below(4, 10, false), Ok(0));
+        let r1 = t.reserve_below(4).unwrap();
+        assert_eq!(r1.fd(), 1);
+        assert_eq!(t.alloc_from_below(2, 4, 20, true), Ok(2));
+        let r3 = t.reserve_below(4).unwrap();
+        assert_eq!(r3.fd(), 3);
+        assert_eq!(t.alloc_below(4, 30, false), Err(VfsError::MFile));
+        assert_eq!(t.reserve_below(4).unwrap_err(), VfsError::MFile);
+        assert_eq!(t.alloc_from_below(0, 4, 30, false), Err(VfsError::MFile));
+        assert_eq!(t.alloc_from_below(4, 4, 30, false), Err(VfsError::Inval));
+        assert_eq!(t.alloc_from_below(-1, 4, 30, false), Err(VfsError::Inval));
+
+        // insert_at_below: >= limit is BadF (even for a reserved slot); < limit displaces or Busy if reserved.
+        assert_eq!(t.insert_at_below(4, 4, 40, false).unwrap_err(), VfsError::BadF);
+        assert_eq!(t.insert_at_below(-1, 4, 40, false).unwrap_err(), VfsError::BadF);
+        assert_eq!(t.insert_at_below(1, 4, 40, false).unwrap_err(), VfsError::Busy);
+        assert_eq!(t.insert_at_below(3, 3, 40, false).unwrap_err(), VfsError::BadF);
+        let displaced = t.insert_at_below(2, 4, 22, false).unwrap().unwrap();
+        assert_eq!((displaced.file, displaced.cloexec), (20, true));
+        assert_eq!(t.get(2).unwrap().file, 22);
+
+        // Installing a reservation taken before lowering the limit still succeeds;
+        // existing fds above a lowered limit remain accessible and removable.
+        assert_eq!(t.install(r3, 33, false), 3);
+        assert_eq!(t.alloc_below(2, 99, false), Err(VfsError::MFile));
+        assert_eq!(t.get(3).unwrap().file, 33);
+        t.cancel(r1);
+        assert_eq!(t.alloc_below(2, 11, false), Ok(1));
+        assert_eq!(t.alloc_below(2, 12, false), Err(VfsError::MFile));
+        assert_eq!(t.remove(3).unwrap().file, 33);
+
+        // Limit above MAX_FDS is clamped to MAX_FDS.
+        assert_eq!(t.insert_at_below(MAX_FDS as i32, MAX_FDS + 100, 1, false).unwrap_err(), VfsError::BadF);
+        assert_eq!(t.alloc_from_below(MAX_FDS as i32, MAX_FDS + 100, 1, false), Err(VfsError::Inval));
+        assert_eq!(t.alloc_from_below(MAX_FDS as i32 - 1, MAX_FDS + 100, 7, false), Ok(MAX_FDS as i32 - 1));
+        assert_eq!(t.alloc_from_below(MAX_FDS as i32 - 1, MAX_FDS + 100, 8, false), Err(VfsError::MFile));
     }
 }

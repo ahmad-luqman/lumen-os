@@ -36,6 +36,20 @@ impl ProcTable {
     pub(super) fn live_process_count(&self) -> usize {
         self.procs.keys().filter(|&&pid| !matches!(self.tree.state(pid), Some(ProcState::Zombie(_)))).count()
     }
+    /// Check clone eligibility and `RLIMIT_NPROC` in one order for `fork_current`,
+    /// `link_child` and `link_thread`: `EINTR` (exiting/fatal), `ERESTARTNOINTR`
+    /// (exec/stop/pending signal), or `EAGAIN` (`RLIMIT_NPROC` exceeded).
+    pub(super) fn check_nproc(&self, signal: &SignalState) -> Result<(), u32> {
+        signal.check_clone()?;
+        if !self.tree.allows_new_task(signal.rlimits.nproc().soft()) {
+            return Err(errno::EAGAIN);
+        }
+        Ok(())
+    }
+    #[cfg(feature = "ktest")]
+    pub(super) fn nproc_task_count(&self) -> usize {
+        self.tree.nproc_task_count()
+    }
 
     pub(super) fn process_time(&self, pid: u32) -> [u64; 2] {
         let Some(process) = self.procs.get(&pid) else { return [0; 2] };
@@ -195,8 +209,8 @@ impl ProcTable {
     }
 
     /// Return the child's pid, holding the parent's signal throughout; refuse
-    /// with EINTR (exiting/fatal), ERESTARTNOINTR (pending signal), or the
-    /// tree's errno (EAGAIN when no pid is free).
+    /// with EINTR (exiting/fatal), ERESTARTNOINTR (pending signal), EAGAIN
+    /// (RLIMIT_NPROC exceeded or no pid free), or the tree's errno.
     pub(super) fn link_child(
         &mut self,
         parent: &UserThread,
@@ -204,7 +218,7 @@ impl ProcTable {
         request: ProcessClone,
     ) -> Result<u32, u32> {
         let signal = parent.process().signal.lock();
-        signal.check_clone()?;
+        self.check_nproc(&signal)?;
         let child = thread.process();
         // PROCS is held and the child is unreachable until insert_process:
         // no other thread can take its signal lock while we hold the parent's.
@@ -226,8 +240,9 @@ impl ProcTable {
     }
 
     /// Link `thread`, a non-leader thread of its (linked) process, with a
-    /// tid from the tree (`ProcTree::add_thread`): the tid, or the tree's
-    /// refusal (nothing changed).
+    /// tid from the tree (`ProcTree::add_thread`): the tid, or EAGAIN
+    /// (RLIMIT_NPROC exceeded or no tid free) / the tree's refusal (nothing
+    /// changed).
     pub(super) fn link_thread(
         &mut self,
         thread: &Arc<UserThread>,
@@ -235,7 +250,7 @@ impl ProcTable {
         signal: &mut SignalState,
     ) -> Result<u32, u32> {
         let pid = thread.process().pid();
-        let tid = match signal.check_clone().and_then(|()| self.tree.add_thread(pid).map_err(tree_errno)) {
+        let tid = match self.check_nproc(signal).and_then(|()| self.tree.add_thread(pid).map_err(tree_errno)) {
             Ok(tid) => tid,
             Err(e) => {
                 signal.cancel_thread(signals);

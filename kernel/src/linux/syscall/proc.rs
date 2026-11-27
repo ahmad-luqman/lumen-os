@@ -2,12 +2,18 @@
 //! `prlimit64`, `getrandom` (M6). M6's `rt_sigaction` and `rt_sigprocmask`
 //! are in `signal` since #371.
 
-use super::{DEFAULT_RLIMIT_NOFILE, IO_CHUNK, copy_pod_from_user, copy_pod_to_user, neg_errno};
+use super::{IO_CHUNK, copy_pod_from_user, copy_pod_to_user, neg_errno};
 use crate::arch;
-use crate::linux::process::current_process;
+use crate::linux::process::{Rlimit, RlimitKind, current_process};
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, default_utsname, errno, general};
 use crate::sched;
 use crate::user::{USER_MAX, copy_to_user, user_range_valid};
+
+const _: () = {
+    assert!(general::RLIMIT_STACK == 3);
+    assert!(general::RLIMIT_NPROC == 6);
+    assert!(general::RLIMIT_NOFILE == 7);
+};
 
 /// Cap bytes returned by a single `getrandom(2)` call to avoid issuing
 /// thousands of synchronous `virtio-rng` requests in one syscall.
@@ -75,22 +81,30 @@ pub(super) fn sys_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: 
     let new = if new_limit != 0 {
         // SAFETY: rlimit64 is two u64s and every bit pattern is valid.
         match unsafe { copy_pod_from_user::<general::rlimit64>(new_limit) } {
-            Ok(r) if r.rlim_cur > r.rlim_max => return neg_errno(errno::EINVAL),
-            Ok(r) => Some([r.rlim_cur, r.rlim_max]),
+            Ok(r) => match Rlimit::new(r.rlim_cur, r.rlim_max) {
+                Some(limit) => Some(limit),
+                None => return neg_errno(errno::EINVAL),
+            },
             Err(e) => return neg_errno(e.to_errno()),
         }
     } else {
         None
     };
-    let old = if resource as u32 == general::RLIMIT_STACK {
-        let new = new.map(|[soft, hard]| lumen_vm::StackLimit::new(soft, hard).expect("validated rlimit"));
-        let old = current_process().stack_limit(new);
-        [old.soft(), old.hard()]
-    } else {
-        [if resource as u32 == general::RLIMIT_NOFILE { DEFAULT_RLIMIT_NOFILE } else { u64::MAX }; 2]
+    let kind = match resource as u32 {
+        general::RLIMIT_STACK => Some(RlimitKind::Stack),
+        general::RLIMIT_NPROC => Some(RlimitKind::Nproc),
+        general::RLIMIT_NOFILE => Some(RlimitKind::Nofile),
+        _ => None,
+    };
+    let old = match kind {
+        Some(kind) => match current_process().rlimit(kind, new) {
+            Ok(old) => old,
+            Err(e) => return neg_errno(e),
+        },
+        None => Rlimit::INFINITY,
     };
     if old_limit != 0 {
-        let rlim = general::rlimit64 { rlim_cur: old[0], rlim_max: old[1] };
+        let rlim = general::rlimit64 { rlim_cur: old.soft(), rlim_max: old.hard() };
         // SAFETY: rlimit64 is two u64s without padding.
         if let Err(e) = unsafe { copy_pod_to_user(old_limit, &rlim) } {
             return neg_errno(e.to_errno());

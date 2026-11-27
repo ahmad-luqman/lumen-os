@@ -45,8 +45,8 @@ pub use files::{Files, FsInner, FsState, ReservedFd};
 #[cfg(feature = "ktest")]
 pub use signal::send_thread;
 pub use signal::{
-    Delivery, HandlerDelivery, SignalState, current_pending, send_current_signal, send_process_checked,
-    send_thread_checked,
+    Delivery, HandlerDelivery, Rlimit, RlimitKind, SignalState, current_pending, send_current_signal,
+    send_process_checked, send_thread_checked,
 };
 use table::ProcTable;
 
@@ -573,14 +573,17 @@ impl Process {
         pid
     }
 
-    /// Read or atomically replace the soft and hard stack limits; return the previous pair.
-    pub fn stack_limit(&self, new: Option<lumen_vm::StackLimit>) -> lumen_vm::StackLimit {
-        let mut state = self.signal.lock();
-        let old = state.rlimit_stack;
-        if let Some(new) = new {
-            state.rlimit_stack = new;
-        }
-        old
+    /// Read or atomically replace one per-process resource limit; returns the
+    /// previous pair, or `EPERM` if a `Nofile` write's hard limit exceeds [`lumen_vfs::MAX_FDS`].
+    pub fn rlimit(&self, kind: RlimitKind, new: Option<Rlimit>) -> Result<Rlimit, u32> {
+        self.signal.lock().rlimits.exchange(kind, new)
+    }
+
+    /// Current soft `RLIMIT_NOFILE`, bounded by [`lumen_vfs::MAX_FDS`].
+    pub fn nofile_soft(&self) -> usize {
+        let soft = self.signal.lock().rlimits.nofile().soft();
+        debug_assert!(soft <= lumen_vfs::MAX_FDS as u64);
+        soft as usize
     }
 
     /// CPU ticks accumulated by children reaped by this process.
@@ -1311,6 +1314,14 @@ pub(crate) fn fork_current(
         info!(target: "linux", "fork: capture console unsupported until children have a shared console (C7/C10)");
         return Err(errno::ENOSYS);
     }
+    // Fail fast on RLIMIT_NPROC (or a pending exit/exec/stop) before copying
+    // mm/files/fs or allocating a child kernel stack. link_child/link_thread
+    // recheck atomically under PROCS when publishing the child.
+    {
+        let table = PROCS.lock();
+        let signal = caller.process().signal.lock();
+        table.check_nproc(&signal)?;
+    }
     let flags = request.bits();
     let new = if request.is_thread() { None } else { Some(Process::copy_for_fork(caller.process(), flags)?) };
     let process = new.as_ref().map_or(caller.process(), |new| &new.process);
@@ -1761,26 +1772,29 @@ pub fn current_file(fd: i32) -> Option<FileRef> {
     with_current_fds(|t| t.get(fd).map(|e| Arc::clone(&e.file)))
 }
 
-/// Reserve the lowest free descriptor at or above `from` before an open
-/// can create or truncate anything. Its guard cancels the slot on every
-/// failure path.
-pub fn reserve_current_fd(from: i32) -> Result<ReservedFd, VfsError> {
-    current_process().reserve_fd(from)
+/// Reserve the lowest free descriptor below the current process's soft
+/// `RLIMIT_NOFILE` limit (`EMFILE` if every slot below that soft limit is open
+/// or reserved) before an open or pipe can create or truncate anything. Its
+/// guard cancels the slot on every failure path.
+pub fn reserve_current_fd() -> Result<ReservedFd, VfsError> {
+    current_process().reserve_fd()
 }
 
 /// Put `file`, a fresh open file description (its `fd_refs` 1, for this
-/// slot), in the current process's lowest free slot: the descriptor, or
-/// `EMFILE`.
+/// slot), in the current process's lowest free slot below its soft
+/// `RLIMIT_NOFILE`: the descriptor, or `EMFILE`.
 #[cfg(feature = "ktest")]
 pub fn install_current_fd(file: KernelFile, cloexec: bool) -> Result<i32, VfsError> {
-    Ok(reserve_current_fd(0)?.install(file, cloexec))
+    Ok(reserve_current_fd()?.install(file, cloexec))
 }
 
 /// Put `file`, a fresh open file description, on descriptor `fd` of the
 /// current process, closing what was there (its locks released outside the
 /// table's lock). `EBUSY` for a reserved slot; `EBADF` for an fd outside
 /// `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s inode
-/// number from it and relies on that range.
+/// number from it and relies on that range. Kernel-internal (the `vfstest`
+/// shell command, ktests): it ignores the soft `RLIMIT_NOFILE` on purpose,
+/// so no syscall path may use it.
 pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
     place_current_fd(fd, Arc::new(file), false)
 }
@@ -1788,13 +1802,16 @@ pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
 /// Make descriptor `new` share `old`'s open file description, close-on-exec
 /// as `cloexec` says (`dup2`/`dup3`'s slot work, M8): its `fd_refs` counts
 /// the new slot, and what `new` held is closed. `EBADF` if `old` isn't open
-/// or `new` is out of range; `old == new` changes nothing.
+/// or `new` is outside `0..RLIMIT_NOFILE`; `old == new` changes nothing
+/// (succeeding for an already-open descriptor even if `>= RLIMIT_NOFILE`,
+/// matching Linux `ksys_dup2`).
 ///
 /// Lookup, reference counting and installation use one table hold;
 /// displaced entries are released after it. A reserved target is `EBUSY`.
 pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError> {
     let process = current_process();
     let _access = process.files_access.read();
+    let limit = process.nofile_soft();
     let files = process.files.lock().clone().expect("a running process has its descriptors");
     let _closing = files.closing();
     let displaced = files.with_table(|t| {
@@ -1806,7 +1823,7 @@ pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError
         }
         // Even on refusal the source slot keeps this clone from being
         // the last Arc dropped under the table lock.
-        let displaced = t.insert_at(new, Arc::clone(&file), cloexec)?;
+        let displaced = t.insert_at_below(new, limit, Arc::clone(&file), cloexec)?;
         file.inc_fd_ref();
         Ok(displaced)
     })?;
@@ -1816,18 +1833,38 @@ pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError
     Ok(new)
 }
 
-/// Duplicate `old` into the lowest free slot at or above `min`, under one
-/// hold of the table. `EBADF` for a closed source, `EINVAL` for a minimum
-/// outside the table, `EMFILE` when no slot is free.
+fn dup_into(
+    old: i32,
+    alloc: impl FnOnce(&mut FdTable<FileRef>, usize, FileRef) -> Result<i32, VfsError>,
+) -> Result<i32, VfsError> {
+    let process = current_process();
+    let limit = process.nofile_soft();
+    process
+        .with_files(|t| {
+            let file = t.get(old).map(|e| Arc::clone(&e.file)).ok_or(VfsError::BadF)?;
+            #[cfg(feature = "ktest")]
+            dup_lookup_window();
+            let new = alloc(t, limit, Arc::clone(&file))?;
+            file.inc_fd_ref();
+            Ok(new)
+        })
+        .expect("a running process has its descriptors")
+}
+
+/// Duplicate `old` into the lowest free slot below `RLIMIT_NOFILE` (`dup`),
+/// under one hold of the table. `EBADF` for a closed source; `EMFILE` when no
+/// slot below the soft limit is free (including when the limit is 0).
+pub fn dup_current_fd_lowest(old: i32) -> Result<i32, VfsError> {
+    dup_into(old, |t, limit, file| t.alloc_below(limit, file, false))
+}
+
+/// Duplicate `old` into the lowest free slot at or above `min` and below
+/// `RLIMIT_NOFILE` (`F_DUPFD` / `F_DUPFD_CLOEXEC`), under one hold of the
+/// table. `EBADF` for a closed source, `EINVAL` for `min < 0` or
+/// `min >= RLIMIT_NOFILE`, `EMFILE` when no slot in `[min, RLIMIT_NOFILE)` is
+/// free.
 pub fn dup_current_fd_from(old: i32, min: i32, cloexec: bool) -> Result<i32, VfsError> {
-    with_current_fds(|t| {
-        let file = t.get(old).map(|e| Arc::clone(&e.file)).ok_or(VfsError::BadF)?;
-        #[cfg(feature = "ktest")]
-        dup_lookup_window();
-        let new = t.alloc_from(min, Arc::clone(&file), cloexec)?;
-        file.inc_fd_ref();
-        Ok(new)
-    })
+    dup_into(old, |t, limit, file| t.alloc_from_below(min, limit, file, cloexec))
 }
 
 /// Put `file` (its `fd_refs` already counting this slot) on `fd`, releasing
@@ -3394,7 +3431,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         in_test_process(|_| {
             let path = c"/tmp/b8-open-reservation";
-            let r = reserve_current_fd(0).map_err(|_| "find next open slot")?.fd();
+            let r = reserve_current_fd().map_err(|_| "find next open slot")?.fd();
             crate::user::copy_to_user(KTEST_USER_VA, path.to_bytes_with_nul()).map_err(|_| "copy paused open path")?;
             OPEN_INSTALL_PHASE.store(OPEN_ARMED, Ordering::SeqCst);
             let opener = spawn_test_thread(move |_| {
@@ -3440,7 +3477,7 @@ crate::ktest!(
     fn dup_and_openat_reserve_their_slot() {
         use crate::{kassert, kassert_eq};
         in_test_process(|pid| {
-            let slot = reserve_current_fd(0).map_err(|_| "reserve descriptor")?;
+            let slot = reserve_current_fd().map_err(|_| "reserve descriptor")?;
             let fd = slot.fd();
             kassert_eq!(fd, 3);
             let source = current_file(0).ok_or("source descriptor")?;
@@ -3472,14 +3509,14 @@ crate::ktest!(
                     hazard_call(general::__NR_openat, general::AT_FDCWD as u64, KTEST_USER_VA, 0, 0) as i64,
                     -(super::errno::ENOENT as i64)
                 );
-                let free = reserve_current_fd(0).map_err(|_| "reserve after failed open")?;
+                let free = reserve_current_fd().map_err(|_| "reserve after failed open")?;
                 kassert_eq!(free.fd(), 5);
             }
             // Fill with reservations, not opens: open_count alone cannot
             // detect that no slot is free.
             let mut held = Vec::new();
             for _ in 5..lumen_vfs::MAX_FDS {
-                held.push(reserve_current_fd(0).map_err(|_| "fill reservations")?);
+                held.push(reserve_current_fd().map_err(|_| "fill reservations")?);
             }
             kassert_eq!(
                 hazard_call(
@@ -3493,7 +3530,7 @@ crate::ktest!(
             );
             kassert!(matches!(crate::vfs::resolve_path_from_root("/tmp/b8-must-not-exist"), Err(VfsError::NoEnt)));
             drop(held);
-            kassert_eq!(reserve_current_fd(0).map_err(|_| "cancelled slots reusable")?.fd(), 5);
+            kassert_eq!(reserve_current_fd().map_err(|_| "cancelled slots reusable")?.fd(), 5);
             duplicate_racing_close_keeps_flock()
         })?
     }
@@ -3570,7 +3607,7 @@ crate::ktest!(
         in_test_process(|_| {
             let file = current_file(0).ok_or("stdin")?;
             kassert_eq!(dup_current_fd(0, 9, true), Ok(9));
-            let reserved = reserve_current_fd(0).map_err(|_| "reserve")?;
+            let reserved = reserve_current_fd().map_err(|_| "reserve")?;
             let fd = reserved.fd();
             let files = current_process().files.lock().clone().ok_or("files")?;
             let copy = Arc::new(files.fork_copy(0));
@@ -3600,7 +3637,7 @@ crate::ktest!(
             let process = current_process();
             let original = process.files.lock().clone().ok_or("files")?;
             let shared = original.share();
-            let reservation = reserve_current_fd(0).map_err(|_| "reserve")?;
+            let reservation = reserve_current_fd().map_err(|_| "reserve")?;
             let fd = reservation.fd();
             let swapper = spawn_test_thread(|_| unshare_current_files().expect("unshare"))?;
             let blocked = swapper.settle();
@@ -3620,14 +3657,14 @@ crate::ktest!(
             kassert_eq!(file.fd_ref_count(), 0);
             // A cancelled reservation releases the exclusive waiter too.
             let shared = new.share();
-            let cancelled = reserve_current_fd(0).map_err(|_| "reserve cancelled")?;
+            let cancelled = reserve_current_fd().map_err(|_| "reserve cancelled")?;
             let swapper = spawn_test_thread(|_| unshare_current_files().expect("unshare"))?;
             let blocked = swapper.settle();
             drop(cancelled);
             swapper.join()?;
             shared.leave(0);
             kassert!(blocked);
-            kassert_eq!(reserve_current_fd(0).map_err(|_| "cancelled slot free")?.fd(), fd);
+            kassert_eq!(reserve_current_fd().map_err(|_| "cancelled slot free")?.fd(), fd);
             Ok(())
         })?
     }
@@ -4892,6 +4929,154 @@ crate::ktest!(
             kassert!(report.is_some_and(|r| r.status() == lumen_proc::WaitStatus::Stopped(Signal::STOP)));
             let info = info.map_err(|_| "CLD_STOPPED")?;
             kassert_eq!(i32::from_ne_bytes(info.bytes()[8..12].try_into().unwrap()), 5);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn rlimit_nproc_enforces_fork_clone_and_reap() {
+        use crate::{kassert, kassert_eq};
+        in_test_process(|_| {
+            let process = current_process();
+            kassert_eq!(process.rlimit(RlimitKind::Nproc, None), Ok(Rlimit::INFINITY));
+            // Kernel callers cannot bypass the NOFILE hard ceiling either.
+            kassert_eq!(
+                process.rlimit(RlimitKind::Nofile, Some(Rlimit::new(0, lumen_vfs::MAX_FDS as u64 + 1).unwrap())),
+                Err(errno::EPERM)
+            );
+
+            let base = PROCS.lock().nproc_task_count() as u64;
+            // Only this test process, excluding pid 1.
+            kassert_eq!(base, 1);
+
+            // Soft limit 0 refuses both fork (link_child) and thread clone (fork_current & link_thread) with EAGAIN.
+            kassert_eq!(process.rlimit(RlimitKind::Nproc, Some(Rlimit::new(0, 0).unwrap())), Ok(Rlimit::INFINITY));
+            let thread_req = clone_flags(0x10f00, 0).unwrap();
+            kassert_eq!(fork_current(thread_req, 0, 0, 0, 0, &Default::default()), Err(errno::EAGAIN));
+
+            let caller = current_thread();
+            for _ in 0..2 {
+                let dummy = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&process)));
+                let refused_thread = {
+                    let mut table = PROCS.lock();
+                    let mut state = process.signal.lock();
+                    let init = state.thread_init(caller.tid(), thread_req);
+                    let signals = state.prepare_thread(&dummy, init).map_err(|_| "prepare thread")?;
+                    table.link_thread(&dummy, signals, &mut state)
+                };
+                kassert_eq!(refused_thread, Err(errno::EAGAIN));
+                // Cancelled slot is reused on every refused attempt rather than leaking.
+                kassert_eq!(process.signal.lock().slot_count(), 2);
+            }
+            PROCS.lock().check()?;
+
+            let new = Process::copy_for_fork(&process, ProcessClone::FORK.bits()).map_err(|_| "copy fork")?;
+            let dummy_child = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&new.process)));
+            kassert_eq!(PROCS.lock().link_child(&caller, &dummy_child, ProcessClone::FORK), Err(errno::EAGAIN));
+            drop(new);
+
+            // Finite limit (base + 1) allows one child, refuses a second while live OR
+            // an unreaped zombie, and allows another once reaped.
+            kassert!(process.rlimit(RlimitKind::Nproc, Some(Rlimit::new(base + 1, 10).unwrap())).is_ok());
+            let release = Arc::new(VforkDone::new());
+            let wait = Arc::clone(&release);
+            let (child_pid, parked) = ktest_fork_child(move || {
+                wait.wait();
+                record_thread_exit(UserExit::Exited(0));
+                let _ = take_current();
+            })?;
+            let handle = parked.start();
+
+            // While child is live (count == base + 1): both thread clone and process fork fail with EAGAIN.
+            kassert_eq!(fork_current(thread_req, 0, 0, 0, 0, &Default::default()), Err(errno::EAGAIN));
+            let new = Process::copy_for_fork(&process, ProcessClone::FORK.bits()).map_err(|_| "copy live")?;
+            let extra = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&new.process)));
+            kassert_eq!(PROCS.lock().link_child(&caller, &extra, ProcessClone::FORK), Err(errno::EAGAIN));
+            drop(new);
+
+            // Let child exit without reaping: zombie still counts against RLIMIT_NPROC.
+            release.complete();
+            handle.join();
+            kassert_eq!(fork_current(thread_req, 0, 0, 0, 0, &Default::default()), Err(errno::EAGAIN));
+            let new = Process::copy_for_fork(&process, ProcessClone::FORK.bits()).map_err(|_| "copy zombie")?;
+            let extra = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&new.process)));
+            kassert_eq!(PROCS.lock().link_child(&caller, &extra, ProcessClone::FORK), Err(errno::EAGAIN));
+            drop(new);
+
+            // Reaping the zombie drops count back to base.
+            let report = wait_child(wait4_request(child_pid as i32, 0).map_err(|_| "wait4 req")?)
+                .map_err(|_| "wait4")?
+                .ok_or("reaped child")?;
+            kassert_eq!(report.pid(), child_pid);
+            kassert_eq!(PROCS.lock().nproc_task_count() as u64, base);
+
+            // Under the same finite limit (base + 1), a sibling thread succeeds, blocks the
+            // next fork with EAGAIN, and frees its slot on exit/join so a fork succeeds after.
+            let thread_done = Arc::new(VforkDone::new());
+            let thread_wait = Arc::clone(&thread_done);
+            let (_sibling, sibling_parked) = ktest_sibling(move || {
+                thread_wait.wait();
+                record_thread_exit(UserExit::Exited(0));
+            })?;
+            let sibling_handle = sibling_parked.start();
+            kassert_eq!(PROCS.lock().nproc_task_count() as u64, base + 1);
+            let new = Process::copy_for_fork(&process, ProcessClone::FORK.bits()).map_err(|_| "copy with sibling")?;
+            let extra = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&new.process)));
+            kassert_eq!(PROCS.lock().link_child(&caller, &extra, ProcessClone::FORK), Err(errno::EAGAIN));
+            drop(new);
+            kassert_eq!(fork_current(thread_req, 0, 0, 0, 0, &Default::default()), Err(errno::EAGAIN));
+            thread_done.complete();
+            sibling_handle.join();
+            kassert_eq!(PROCS.lock().nproc_task_count() as u64, base);
+
+            let (second_pid, second_parked) = ktest_fork_child(move || {
+                record_thread_exit(UserExit::Exited(0));
+                let _ = take_current();
+            })?;
+            kassert!(second_pid != 0);
+            kassert_eq!(ktest_reap(second_pid, second_parked.start())?, 0);
+
+            // Soft limit == base refuses even a single thread or child (caller already counts as base).
+            kassert!(process.rlimit(RlimitKind::Nproc, Some(Rlimit::new(base, 10).unwrap())).is_ok());
+            kassert_eq!(fork_current(thread_req, 0, 0, 0, 0, &Default::default()), Err(errno::EAGAIN));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn rlimit_nproc_and_nofile_inherit_across_fork_and_exec() {
+        use crate::kassert_eq;
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        in_test_process(|_| {
+            let parent = current_process();
+            let parent_nproc = Rlimit::new(4, 8).unwrap();
+            let parent_nofile = Rlimit::new(16, 32).unwrap();
+            kassert_eq!(parent.rlimit(RlimitKind::Nproc, Some(parent_nproc)), Ok(Rlimit::INFINITY));
+            kassert_eq!(parent.rlimit(RlimitKind::Nofile, Some(parent_nofile)), Ok(Rlimit::DEFAULT_NOFILE));
+
+            // Child inherits both limits; modifying child's limits leaves parent untouched.
+            let observed = Arc::new(SpinLock::new(None));
+            let out = Arc::clone(&observed);
+            let (child_pid, parked) = ktest_fork_child(move || {
+                let me = current_process();
+                let seen = (me.rlimit(RlimitKind::Nproc, None).unwrap(), me.rlimit(RlimitKind::Nofile, None).unwrap());
+                me.rlimit(RlimitKind::Nproc, Some(Rlimit::new(2, 4).unwrap())).unwrap();
+                me.rlimit(RlimitKind::Nofile, Some(Rlimit::new(6, 12).unwrap())).unwrap();
+                *out.lock() = Some(seen);
+                record_thread_exit(UserExit::Exited(0));
+                let _ = take_current();
+            })?;
+            kassert_eq!(ktest_reap(child_pid, parked.start())?, 0);
+            kassert_eq!(observed.lock().take(), Some((parent_nproc, parent_nofile)));
+            kassert_eq!(parent.rlimit(RlimitKind::Nproc, None), Ok(parent_nproc));
+            kassert_eq!(parent.rlimit(RlimitKind::Nofile, None), Ok(parent_nofile));
+
+            // Both limits survive execve.
+            kassert_eq!(ktest_exec(), 0);
+            kassert_eq!(parent.rlimit(RlimitKind::Nproc, None), Ok(parent_nproc));
+            kassert_eq!(parent.rlimit(RlimitKind::Nofile, None), Ok(parent_nofile));
             Ok(())
         })?
     }

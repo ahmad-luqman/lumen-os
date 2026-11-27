@@ -23,7 +23,7 @@ use lumen_vfs::{MAX_FDS, PollGuard, PollMask, PollWaker};
 
 use super::at::{FromReg, UserPtr, reg};
 use super::fd::current_io;
-use super::{DEFAULT_RLIMIT_NOFILE, copy_pod_from_user, copy_pod_to_user, finish};
+use super::{copy_pod_from_user, copy_pod_to_user, finish};
 use crate::linux::process::{self, ConsoleIo, IoFile, KernelFile};
 use crate::linux::signal::{RestartBlock, interrupted_with};
 use crate::linux::{errno, general};
@@ -406,7 +406,7 @@ fn write_revents(fds_ptr: u64, entries: &[RawPollFd]) -> Result<(), u32> {
 /// false). Writes back each entry's `revents` even on signal interruption,
 /// returning `EFAULT` if the user array is unwritable.
 fn run_poll(fds_ptr: u64, nfds: u32, timeout: WaitTimeout, restartable: bool) -> Result<u64, u32> {
-    if u64::from(nfds) > DEFAULT_RLIMIT_NOFILE {
+    if u64::from(nfds) > process::current_process().nofile_soft() as u64 {
         return Err(errno::EINVAL);
     }
     let cnt = nfds as usize;
@@ -1225,7 +1225,7 @@ crate::ktest!(
             kassert!(read_fd_set_has(xset_va, path_fd.raw())?);
 
             // Error cases across poll, ppoll, select, pselect6.
-            kassert_eq!(sys_poll(fds_va, DEFAULT_RLIMIT_NOFILE + 1, 0), neg_errno(errno::EINVAL));
+            kassert_eq!(sys_poll(fds_va, MAX_FDS as u64 + 1, 0), neg_errno(errno::EINVAL));
             kassert_eq!(sys_poll(unmapped, 1, 0), neg_errno(errno::EFAULT));
             kassert_eq!(sys_poll(0, 0, 0), 0);
 

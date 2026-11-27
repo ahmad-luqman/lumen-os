@@ -37,6 +37,99 @@ impl ThreadInit {
     pub const ROOT: Self = Self { blocked: Blocked::EMPTY, alt_stack: AltStack::DISABLED };
 }
 
+/// Which per-process resource limit [`Process::rlimit`] reads or updates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RlimitKind {
+    Stack,
+    Nproc,
+    Nofile,
+}
+
+/// A validated soft/hard resource limit pair (`soft <= hard`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rlimit {
+    soft: u64,
+    hard: u64,
+}
+
+impl Rlimit {
+    /// Unlimited (`RLIM_INFINITY` for both soft and hard).
+    pub const INFINITY: Self = Self { soft: u64::MAX, hard: u64::MAX };
+
+    /// Default `RLIMIT_NOFILE`: both soft and hard equal the FD table ceiling.
+    pub const DEFAULT_NOFILE: Self = Self { soft: lumen_vfs::MAX_FDS as u64, hard: lumen_vfs::MAX_FDS as u64 };
+
+    /// Refuse a soft limit greater than the hard limit; infinity is `u64::MAX`.
+    pub const fn new(soft: u64, hard: u64) -> Option<Self> {
+        if soft <= hard { Some(Self { soft, hard }) } else { None }
+    }
+
+    pub const fn soft(self) -> u64 {
+        self.soft
+    }
+
+    pub const fn hard(self) -> u64 {
+        self.hard
+    }
+}
+
+/// Per-process resource limits stored on [`SignalState`], inherited as a unit
+/// across `fork` and preserved across `execve`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Rlimits {
+    stack: lumen_vm::StackLimit,
+    nproc: Rlimit,
+    nofile: Rlimit,
+}
+
+impl Rlimits {
+    pub(super) const DEFAULT: Self =
+        Self { stack: lumen_vm::StackLimit::DEFAULT, nproc: Rlimit::INFINITY, nofile: Rlimit::DEFAULT_NOFILE };
+
+    pub(super) const fn nproc(self) -> Rlimit {
+        self.nproc
+    }
+
+    pub(super) const fn nofile(self) -> Rlimit {
+        self.nofile
+    }
+
+    /// Read or atomically replace `kind`, returning the previous pair.
+    /// Enforces `hard <= MAX_FDS` (`EPERM`, matching Linux's `sysctl_nr_open`
+    /// ceiling) on `RLIMIT_NOFILE` writes so no kernel caller can store an
+    /// out-of-range limit.
+    pub(super) fn exchange(&mut self, kind: RlimitKind, new: Option<Rlimit>) -> Result<Rlimit, u32> {
+        match kind {
+            RlimitKind::Stack => {
+                let old = Rlimit { soft: self.stack.soft(), hard: self.stack.hard() };
+                if let Some(new) = new {
+                    self.stack = lumen_vm::StackLimit::new(new.soft, new.hard).expect("Rlimit guarantees soft <= hard");
+                }
+                Ok(old)
+            }
+            RlimitKind::Nproc => {
+                let old = self.nproc;
+                if let Some(new) = new {
+                    self.nproc = new;
+                }
+                Ok(old)
+            }
+            RlimitKind::Nofile => {
+                if let Some(new) = new
+                    && new.hard > lumen_vfs::MAX_FDS as u64
+                {
+                    return Err(errno::EPERM);
+                }
+                let old = self.nofile;
+                if let Some(new) = new {
+                    self.nofile = new;
+                }
+                Ok(old)
+            }
+        }
+    }
+}
+
 /// Dispositions, queues and the first group-end decision, serialized by Process::signal.
 pub struct SignalState {
     /// Per-signal dispositions, shared by every thread.
@@ -51,7 +144,7 @@ pub struct SignalState {
     /// First-wins end decision; Process::exit records its diagnostic.
     group_exit: Option<GroupEnd>,
     pub(super) exec_waiter: Option<u32>,
-    pub(super) rlimit_stack: lumen_vm::StackLimit,
+    pub(super) rlimits: Rlimits,
     pub(super) ctty: Option<Arc<crate::tty::Tty>>,
     group_stop: Option<GroupStop>,
     stop_generation: u64,
@@ -156,7 +249,7 @@ impl SignalState {
             preferred: None,
             group_exit: None,
             exec_waiter: None,
-            rlimit_stack: lumen_vm::StackLimit::DEFAULT,
+            rlimits: Rlimits::DEFAULT,
             ctty: None,
             group_stop: None,
             stop_generation: 0,
@@ -186,7 +279,7 @@ impl SignalState {
         Some(core::mem::replace(&mut self.actions[signal.index()], action))
     }
     pub(super) fn fork_copy(&self) -> Self {
-        Self { actions: self.actions, rlimit_stack: self.rlimit_stack, ctty: self.ctty.clone(), ..Self::new() }
+        Self { actions: self.actions, rlimits: self.rlimits, ctty: self.ctty.clone(), ..Self::new() }
     }
     pub(super) fn fatal_signal(&self) -> Option<Signal> {
         match self.group_exit {

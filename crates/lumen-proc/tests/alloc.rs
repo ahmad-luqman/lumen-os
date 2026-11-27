@@ -285,7 +285,7 @@ fn the_calls_that_neither_allocate_nor_free_dont() {
         assert_eq!(t.getsid(c, b as i32), Ok(INIT));
         assert!(t.tcsetpgrp(c, tty, INIT as i32, Sigttou::Delivered).is_ok());
         let _ = (t.is_orphaned_pgrp(INIT), t.is_busy(INIT), t.pgrp_members(INIT).count(), t.children(INIT).len());
-        let _ = (t.threads(b).len(), t.len(), t.is_empty());
+        let _ = (t.threads(b).len(), t.len(), t.is_empty(), t.nproc_task_count(), t.allows_new_task(10));
         // A refused removal: the leader's tid.
         assert!(t.remove_thread(b, b).is_err());
     });

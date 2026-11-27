@@ -387,6 +387,22 @@ impl ProcTree {
         self.procs.is_empty()
     }
 
+    /// How many extant tasks across the whole tree count toward `RLIMIT_NPROC`:
+    /// every process other than kernel-owned [`INIT_PID`] (live or unreaped
+    /// zombie), plus every non-leader thread. Lumen has a single UID, so all
+    /// user tasks share one tree-wide count. Neither allocates nor frees.
+    pub fn nproc_task_count(&self) -> usize {
+        let init = usize::from(self.procs.contains_key(&INIT_PID));
+        (self.procs.len() - init) + self.tids.len()
+    }
+
+    /// Whether creating one more task stays within `soft_limit`
+    /// (`nproc_task_count() + 1 <= soft_limit`, matching Linux's `RLIMIT_NPROC`
+    /// overlimit check across the whole tree). Neither allocates nor frees.
+    pub fn allows_new_task(&self, soft_limit: u64) -> bool {
+        (self.nproc_task_count() as u64) < soft_limit
+    }
+
     /// Whether `pid` is in the tree (live or zombie).
     pub fn contains(&self, pid: u32) -> bool {
         self.procs.contains_key(&pid)

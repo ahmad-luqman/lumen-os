@@ -194,3 +194,16 @@ tests = [
     "scenario:test_linux_proc::test_sessions_and_process_groups",
     "ktest:lumen_kernel::linux::syscall::task::sessions_and_process_groups_dispatch",
 ]
+
+[[feature]]
+name = "RLIMIT_NPROC and RLIMIT_NOFILE enforcement, prlimit64 writes, and fork/exec inheritance"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "cargo:lumen-proc",
+    "ktest:lumen_kernel::linux::syscall::sys::tests::prlimit_nofile_enforces_each_allocation_path",
+    "ktest:lumen_kernel::linux::syscall::sys::tests::prlimit_nproc_read_write_and_validation",
+    "ktest:lumen_kernel::linux::process::rlimit_nproc_enforces_fork_clone_and_reap",
+    "ktest:lumen_kernel::linux::process::rlimit_nproc_and_nofile_inherit_across_fork_and_exec",
+    "scenario:test_conformance::test_musl_libc_test_core",
+]

@@ -25,8 +25,8 @@ fn pipe2(fds: UserPtr, flags: OpenFlags) -> Result<u64, u32> {
     if flags.0 & !allowed != 0 {
         return Err(errno::EINVAL);
     }
-    let r_slot = process::reserve_current_fd(0).map_err(vfs)?;
-    let w_slot = process::reserve_current_fd(0).map_err(vfs)?;
+    let r_slot = process::reserve_current_fd().map_err(vfs)?;
+    let w_slot = process::reserve_current_fd().map_err(vfs)?;
     let (read_file, write_file) = pipe::new_pipe(flags.has_nonblock())?;
     let pair = [r_slot.fd(), w_slot.fd()];
     // Copy the pair to user space before installing either descriptor so a
@@ -41,7 +41,7 @@ fn pipe2(fds: UserPtr, flags: OpenFlags) -> Result<u64, u32> {
 
 /// `dup(oldfd)` (32): lowest free descriptor, `FD_CLOEXEC` clear.
 pub(super) fn sys_dup(oldfd: Fd) -> u64 {
-    finish(process::dup_current_fd_from(oldfd.raw(), 0, false).map(|new| new as u64).map_err(vfs))
+    finish(process::dup_current_fd_lowest(oldfd.raw()).map(|new| new as u64).map_err(vfs))
 }
 
 /// `dup2(oldfd, newfd)` (33): duplicate onto `newfd` (`FD_CLOEXEC` clear;

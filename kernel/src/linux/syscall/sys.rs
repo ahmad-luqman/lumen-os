@@ -320,16 +320,16 @@ mod tests {
                 write_words(ptr, limits).map_err(|_| "limits")?;
                 kassert_eq!(super::super::proc::sys_prlimit64(0, 3, KTEST_USER_VA, KTEST_USER_VA + 16), 0);
                 kassert_eq!(
-                    process::current_process().stack_limit(None),
-                    lumen_vm::StackLimit::new(limits[0], limits[1]).unwrap()
+                    process::current_process().rlimit(process::RlimitKind::Stack, None),
+                    Ok(process::Rlimit::new(limits[0], limits[1]).unwrap())
                 );
                 kassert_eq!(super::super::proc::sys_prlimit64(0, 3, 0, KTEST_USER_VA), 0);
                 kassert_eq!(words::<2>()?, limits);
                 write_words(ptr, [2, 1]).map_err(|_| "bad limits")?;
                 kassert_eq!(super::super::proc::sys_prlimit64(0, 3, KTEST_USER_VA, 0), neg_errno(errno::EINVAL));
                 kassert_eq!(
-                    process::current_process().stack_limit(None),
-                    lumen_vm::StackLimit::new(limits[0], limits[1]).unwrap()
+                    process::current_process().rlimit(process::RlimitKind::Stack, None),
+                    Ok(process::Rlimit::new(limits[0], limits[1]).unwrap())
                 );
                 kassert_eq!(super::super::proc::sys_prlimit64(0, 3, 1, 0), neg_errno(errno::EFAULT));
                 kassert_eq!(super::super::proc::sys_prlimit64(u32::MAX as u64, 3, 0, 0), neg_errno(errno::ESRCH));
@@ -438,6 +438,180 @@ mod tests {
                 drop((file, root, fs));
                 kassert_eq!(sys_sysinfo(ptr), 0);
                 kassert_eq!(words::<14>()?[7], before);
+                Ok(())
+            })?
+        }
+    );
+
+    crate::ktest!(
+        fn prlimit_nofile_enforces_each_allocation_path() {
+            use super::super::{at, fd, lock, pipe, poll, proc};
+            use lumen_vfs::OpenFlags;
+            in_test_process(|_| {
+                let ptr = reg(KTEST_USER_VA + 2048);
+                let out_va = KTEST_USER_VA + 2048 + 16;
+                let pipe_va = KTEST_USER_VA + 2048 + 32;
+                let read_pair = |va: u64| -> Result<[u64; 2], &'static str> {
+                    let mut out = [0u64; 2];
+                    for (i, word) in out.iter_mut().enumerate() {
+                        let mut bytes = [0u8; 8];
+                        user::copy_from_user(&mut bytes, va + i as u64 * 8).map_err(|_| "read rlimit")?;
+                        *word = u64::from_ne_bytes(bytes);
+                    }
+                    Ok(out)
+                };
+                let max_fds = lumen_vfs::MAX_FDS as u64;
+
+                // Default RLIMIT_NOFILE is [MAX_FDS, MAX_FDS].
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), 0, out_va), 0);
+                kassert_eq!(read_pair(out_va)?, [max_fds, max_fds]);
+
+                // soft > hard -> EINVAL (precedes EPERM even above MAX_FDS); > MAX_FDS -> EPERM.
+                write_words(ptr, [max_fds + 2, max_fds + 1]).map_err(|_| "write bad")?;
+                kassert_eq!(
+                    proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), ptr.addr(), 0),
+                    neg_errno(errno::EINVAL)
+                );
+                write_words(ptr, [max_fds, max_fds + 1]).map_err(|_| "write high")?;
+                kassert_eq!(
+                    proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), ptr.addr(), 0),
+                    neg_errno(errno::EPERM)
+                );
+                write_words(ptr, [u64::MAX, u64::MAX]).map_err(|_| "write inf")?;
+                kassert_eq!(
+                    proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), ptr.addr(), 0),
+                    neg_errno(errno::EPERM)
+                );
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), 0, out_va), 0);
+                kassert_eq!(read_pair(out_va)?, [max_fds, max_fds]);
+
+                // Lower soft limit to 5, hard to 10; old_limit returns previous [1024, 1024].
+                write_words(ptr, [5, 10]).map_err(|_| "write [5, 10]")?;
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), ptr.addr(), out_va), 0);
+                kassert_eq!(read_pair(out_va)?, [max_fds, max_fds]);
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), 0, out_va), 0);
+                kassert_eq!(read_pair(out_va)?, [5, 10]);
+
+                // Stdio occupies 0, 1, 2: open gets 3, openat gets 4, next fails EMFILE without creating a file.
+                let null = fd::ktest_user_path(0, b"/dev/null")?;
+                let creat_path = fd::ktest_user_path(1, b"/tmp/nofile-ktest-emfile")?;
+                let rd = OpenFlags::from_bits(OpenFlags::O_RDONLY);
+                let creat = OpenFlags::from_bits(OpenFlags::O_WRONLY | OpenFlags::O_CREAT);
+                kassert_eq!(fd::sys_open(null, rd, at::reg(0)), 3);
+                kassert_eq!(fd::sys_openat(Dirfd::Cwd, null, rd, at::reg(0)), 4);
+                kassert_eq!(fd::sys_open(null, rd, at::reg(0)), neg_errno(errno::EMFILE));
+                kassert_eq!(fd::sys_openat(Dirfd::Cwd, null, rd, at::reg(0)), neg_errno(errno::EMFILE));
+                kassert_eq!(fd::sys_open(creat_path, creat, at::reg(0o644)), neg_errno(errno::EMFILE));
+                kassert!(matches!(
+                    crate::vfs::resolve_path_from_root("/tmp/nofile-ktest-emfile"),
+                    Err(VfsError::NoEnt)
+                ));
+
+                // dup, fcntl(F_DUPFD*), dup2, dup3 at limit 5.
+                kassert_eq!(pipe::sys_dup(at::reg(1)), neg_errno(errno::EMFILE));
+                kassert_eq!(lock::sys_fcntl(at::reg(1), general::F_DUPFD, 0), neg_errno(errno::EMFILE));
+                kassert_eq!(lock::sys_fcntl(at::reg(1), general::F_DUPFD_CLOEXEC, 3), neg_errno(errno::EMFILE));
+                kassert_eq!(lock::sys_fcntl(at::reg(1), general::F_DUPFD, 5), neg_errno(errno::EINVAL));
+                kassert_eq!(lock::sys_fcntl(at::reg(1), general::F_DUPFD_CLOEXEC, 5), neg_errno(errno::EINVAL));
+                kassert_eq!(pipe::sys_dup2(at::reg(1), at::reg(5)), neg_errno(errno::EBADF));
+                kassert_eq!(
+                    pipe::sys_dup3(at::reg(1), at::reg(5), OpenFlags::from_bits(OpenFlags::O_CLOEXEC)),
+                    neg_errno(errno::EBADF)
+                );
+                // dup2 displacing an existing slot below limit still succeeds when full.
+                kassert_eq!(pipe::sys_dup2(at::reg(1), at::reg(4)), 4);
+                // poll checks nfds against the live soft RLIMIT_NOFILE.
+                kassert_eq!(poll::sys_poll(ptr.addr(), 6, 0), neg_errno(errno::EINVAL));
+
+                // pipe / pipe2 require 2 free slots; with 1 free slot (fd 4) they return EMFILE without leaking it.
+                kassert_eq!(fd::sys_close(at::reg(4)), 0);
+                kassert_eq!(pipe::sys_pipe(reg(pipe_va)), neg_errno(errno::EMFILE));
+                kassert_eq!(
+                    pipe::sys_pipe2(reg(pipe_va), OpenFlags::from_bits(OpenFlags::O_CLOEXEC)),
+                    neg_errno(errno::EMFILE)
+                );
+                kassert_eq!(fd::sys_open(null, rd, at::reg(0)), 4);
+
+                // With 2 free slots (3, 4), pipe2 succeeds and next pipe returns EMFILE.
+                kassert_eq!(fd::sys_close(at::reg(3)), 0);
+                kassert_eq!(fd::sys_close(at::reg(4)), 0);
+                kassert_eq!(pipe::sys_pipe2(reg(pipe_va), OpenFlags::from_bits(OpenFlags::O_CLOEXEC)), 0);
+                let mut pair = [0u8; 8];
+                user::copy_from_user(&mut pair, pipe_va).map_err(|_| "pipe fds")?;
+                kassert_eq!(
+                    [
+                        i32::from_ne_bytes(pair[0..4].try_into().unwrap()),
+                        i32::from_ne_bytes(pair[4..8].try_into().unwrap())
+                    ],
+                    [3, 4]
+                );
+                kassert_eq!(pipe::sys_pipe(reg(pipe_va)), neg_errno(errno::EMFILE));
+
+                // Lowering soft limit below open fds keeps them usable (including dup2(fd, fd))
+                // while refusing new allocations.
+                write_words(ptr, [3, 10]).map_err(|_| "write [3, 10]")?;
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), ptr.addr(), 0), 0);
+                kassert_eq!(lock::sys_fcntl(at::reg(4), general::F_GETFD, 0), u64::from(general::FD_CLOEXEC));
+                kassert_eq!(pipe::sys_dup2(at::reg(4), at::reg(4)), 4);
+                kassert_eq!(pipe::sys_dup3(at::reg(4), at::reg(4), OpenFlags::from_bits(0)), neg_errno(errno::EINVAL));
+                kassert_eq!(pipe::sys_dup(at::reg(4)), neg_errno(errno::EMFILE));
+                kassert_eq!(fd::sys_close(at::reg(4)), 0);
+                kassert_eq!(fd::sys_close(at::reg(3)), 0);
+
+                // Soft limit 0: open/pipe/dup return EMFILE; fcntl(F_DUPFD, 0) returns EINVAL;
+                // dup2(0, 1)/dup3(0, 1, 0) return EBADF; dup2(0, 0) still returns 0.
+                write_words(ptr, [0, 10]).map_err(|_| "write [0, 10]")?;
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), ptr.addr(), 0), 0);
+                kassert_eq!(fd::sys_open(null, rd, at::reg(0)), neg_errno(errno::EMFILE));
+                kassert_eq!(fd::sys_openat(Dirfd::Cwd, null, rd, at::reg(0)), neg_errno(errno::EMFILE));
+                kassert_eq!(pipe::sys_pipe(reg(pipe_va)), neg_errno(errno::EMFILE));
+                kassert_eq!(pipe::sys_pipe2(reg(pipe_va), OpenFlags::from_bits(0)), neg_errno(errno::EMFILE));
+                kassert_eq!(pipe::sys_dup(at::reg(0)), neg_errno(errno::EMFILE));
+                kassert_eq!(lock::sys_fcntl(at::reg(0), general::F_DUPFD, 0), neg_errno(errno::EINVAL));
+                kassert_eq!(lock::sys_fcntl(at::reg(0), general::F_DUPFD_CLOEXEC, 0), neg_errno(errno::EINVAL));
+                kassert_eq!(pipe::sys_dup2(at::reg(0), at::reg(1)), neg_errno(errno::EBADF));
+                kassert_eq!(pipe::sys_dup3(at::reg(0), at::reg(1), OpenFlags::from_bits(0)), neg_errno(errno::EBADF));
+                kassert_eq!(pipe::sys_dup2(at::reg(0), at::reg(0)), 0);
+                kassert_eq!(poll::sys_poll(ptr.addr(), 1, 0), neg_errno(errno::EINVAL));
+                kassert_eq!(poll::sys_poll(0, 0, 0), 0);
+
+                // Raising back to MAX_FDS succeeds and allows allocation again.
+                write_words(ptr, [max_fds, max_fds]).map_err(|_| "write max")?;
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NOFILE), ptr.addr(), 0), 0);
+                kassert_eq!(fd::sys_open(null, rd, at::reg(0)), 3);
+                kassert_eq!(fd::sys_close(at::reg(3)), 0);
+                Ok(())
+            })?
+        }
+    );
+
+    crate::ktest!(
+        fn prlimit_nproc_read_write_and_validation() {
+            use super::super::proc;
+            in_test_process(|_| {
+                let ptr = reg(KTEST_USER_VA);
+                let out_va = KTEST_USER_VA + 16;
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NPROC), 0, KTEST_USER_VA), 0);
+                kassert_eq!(words::<2>()?, [u64::MAX, u64::MAX]);
+
+                write_words(ptr, [5, 4]).map_err(|_| "bad nproc")?;
+                kassert_eq!(
+                    proc::sys_prlimit64(0, u64::from(general::RLIMIT_NPROC), KTEST_USER_VA, 0),
+                    neg_errno(errno::EINVAL)
+                );
+                kassert_eq!(
+                    process::current_process().rlimit(process::RlimitKind::Nproc, None),
+                    Ok(process::Rlimit::INFINITY)
+                );
+
+                write_words(ptr, [0, 3]).map_err(|_| "set nproc")?;
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NPROC), KTEST_USER_VA, out_va), 0);
+                kassert_eq!(
+                    process::current_process().rlimit(process::RlimitKind::Nproc, None),
+                    Ok(process::Rlimit::new(0, 3).unwrap())
+                );
+                kassert_eq!(proc::sys_prlimit64(0, u64::from(general::RLIMIT_NPROC), 0, KTEST_USER_VA), 0);
+                kassert_eq!(words::<2>()?, [0, 3]);
                 Ok(())
             })?
         }
