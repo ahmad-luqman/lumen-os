@@ -271,7 +271,7 @@ deps-dev: ## Download the Alpine developer image's pinned packages (tools/alpine
 $(BUILD)/alpine-dev.ext4: tools/mkrootfs-dev.sh tools/alpine-lock.py tools/ext4-signed-hash.sh $(BUILD)/deps/alpine-packages/.lock $(BUILD)/deps/alpine-minirootfs/.version $(LINUX_TEST_BINS)
 	tools/mkrootfs-dev.sh $@
 
-rootfs-dev: $(BUILD)/alpine-dev.ext4 ## Build the deterministic Alpine developer image (gcc, g++, make, git, sqlite3, vim) for M8's gates
+rootfs-dev: $(BUILD)/alpine-dev.ext4 ## Build the deterministic Alpine developer image (gcc, g++, make, git, sqlite3, vim, curl, python3, ruby) for M8/M9's gates
 
 # zig, pinned, for C cross-builds only (#345): the kernel, the apps and the
 # Rust test binaries keep rustc + rust-lld. The script checks its own stamp

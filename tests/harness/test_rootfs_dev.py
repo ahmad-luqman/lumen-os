@@ -8,7 +8,8 @@ built here, `file://` mirrors, stub `curl` and `gh`), with no network. Two
 parts read what `make deps-dev` and `make rootfs-dev` leave in build/: the
 check that no locked package carries an unhandled install script, and the
 last group, on the built image, `build/alpine-dev.ext4`. Each skips without
-them locally and fails under CI, which builds both.
+them locally and fails under CI, which builds both. Tests requiring OpenSSL
+>= 3 likewise skip locally when it is unavailable and fail under CI.
 """
 
 from __future__ import annotations
@@ -23,10 +24,13 @@ import json
 import os
 import re
 import shutil
+import ssl
+import stat
 import subprocess
 import sys
 import tarfile
 import threading
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -890,18 +894,20 @@ def _built_or_skip(what: Path, ready: bool, make: str) -> None:
 
 def test_the_locked_packages_carry_no_unhandled_install_scripts():
     """Every package in tools/alpine-packages.lock that build/deps holds
-    carries only scripts HANDLED_SCRIPTS lists (none at #344's lock), so
+    carries exactly the scripts HANDLED_SCRIPTS lists, so
     the image needs nothing a script would have done. Skipped locally
     without the fetched packages, failed under CI (which fetches them)."""
     apk_dir = BUILD_DIR / "deps/alpine-packages"
     lock = al.parse_lock(LOCK.read_text())
     ready = all((apk_dir / p.filename).is_file() for p in lock.packages)
     _built_or_skip(apk_dir, ready, "make deps-dev")
+    seen = set()
     for pkg in lock.packages:
         data = (apk_dir / pkg.filename).read_bytes()
         assert hashlib.sha256(data).hexdigest() == pkg.sha256, pkg.filename
         for script in al.split_apk(data).scripts:
-            assert (pkg.name, *script) in al.HANDLED_SCRIPTS, (pkg.name, script)
+            seen.add((pkg.name, *script))
+    assert seen == set(al.HANDLED_SCRIPTS)
 
 
 def test_stage_refusals(tmp_path):
@@ -2488,7 +2494,10 @@ def _mkrootfs_dev_tree(tmp_path: Path) -> Path:
     return repo
 
 
-def _mkrootfs_dev(repo: Path, out: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+def _mkrootfs_dev(
+    repo: Path, out: Path, tmp_path: Path, *, umask: int = -1
+) -> subprocess.CompletedProcess[str]:
+    _openssl()
     env = {**os.environ, "LUMEN_PYTHON": sys.executable, "TMPDIR": str(tmp_path)}
     return subprocess.run(
         ["bash", str(repo / "tools/mkrootfs-dev.sh"), str(out)],
@@ -2496,6 +2505,7 @@ def _mkrootfs_dev(repo: Path, out: Path, tmp_path: Path) -> subprocess.Completed
         text=True,
         check=False,
         env=env,
+        umask=umask,
     )
 
 
@@ -2881,42 +2891,17 @@ def test_dev_image_passes_e2fsck():
 
 
 @needs_image
-def test_dev_image_has_the_gate_tools():
-    _, debugfs = _e2fsprogs()
-    assert set(GATE_TOOLS) <= rootfs.debugfs_names(DEV_IMAGE, "/usr/bin", tool=debugfs)
+def test_dev_image_has_the_gate_tools(dev_root):
+    for tool in GATE_TOOLS:
+        _exe(dev_root, f"usr/bin/{tool}")
 
 
 @needs_image
-def test_dev_image_gate_tools_are_dynamic_elfs_resolving_inside_it(tmp_path):
-    """Each gate tool's PT_INTERP and DT_NEEDED resolve inside the image:
-    /lib, /usr/lib and /usr/bin dumped out of it with debugfs."""
-    _, debugfs = _e2fsprogs()
-    root = tmp_path / "root"
-    (root / "usr").mkdir(parents=True)
-    usr = root / "usr"
-    for request in (
-        f"rdump /lib {root}",
-        f"rdump /usr/lib /usr/bin /usr/libexec /usr/include {usr}",
-    ):
-        proc = subprocess.run(
-            [str(debugfs), "-R", request, str(DEV_IMAGE)],
-            capture_output=True,
-            text=True,
-            check=False,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-        # rdump restores owners, which only root may: those lines aside,
-        # any stderr line but the banner is an error.
-        errors = [
-            line
-            for line in proc.stderr.splitlines()
-            if line
-            and not line.startswith("debugfs ")
-            and "Operation not permitted while changing ownership" not in line
-        ]
-        assert proc.returncode == 0 and not errors, proc.stderr
+def test_dev_image_gate_tools_are_dynamic_elfs_resolving_inside_it(dev_root):
+    """Each gate tool's PT_INTERP and DT_NEEDED resolve inside the image."""
+    usr = dev_root / "usr"
     for tool in GATE_TOOLS:
-        interp, needed = rootfs.validate_dynamic_elf(root / "usr/bin" / tool, root)
+        interp, needed = rootfs.validate_dynamic_elf(_exe(dev_root, f"usr/bin/{tool}"), dev_root)
         assert interp == rootfs.DEFAULT_INTERP
         assert "libc.musl-x86_64.so.1" in needed, tool
     # What the drivers run: cc1 and cc1plus (isl, mpc, mpfr, gmp, zlib,
@@ -2929,9 +2914,9 @@ def test_dev_image_gate_tools_are_dynamic_elfs_resolving_inside_it(tmp_path):
         usr / "bin/as",
         usr / "bin/ld",
     ):
-        interp, needed = rootfs.validate_dynamic_elf(prog, root)
+        interp, needed = rootfs.validate_dynamic_elf(prog, dev_root)
         assert interp == rootfs.DEFAULT_INTERP, prog
-    _, needed = rootfs.validate_dynamic_elf(libexec / "cc1plus", root)
+    _, needed = rootfs.validate_dynamic_elf(libexec / "cc1plus", dev_root)
     assert {"libisl.so.23", "libmpc.so.3", "libmpfr.so.6", "libgmp.so.10"} <= set(needed)
     # What a compile and link need besides programs: musl-dev's crt files
     # and headers, libstdc++'s headers and library, libgcc.
@@ -2945,7 +2930,7 @@ def test_dev_image_gate_tools_are_dynamic_elfs_resolving_inside_it(tmp_path):
         f"usr/lib/gcc/x86_64-alpine-linux-musl/{libexec.name}/crtbegin.o",
         f"usr/lib/gcc/x86_64-alpine-linux-musl/{libexec.name}/libgcc.a",
     ):
-        assert (root / path).exists(), path
+        assert rootfs._resolve_in_rootfs(dev_root, path) is not None, path
 
 
 @needs_image
@@ -2953,6 +2938,7 @@ def test_dev_image_builds_the_same_twice(tmp_path):
     """Two fresh builds give the same bytes, and the same as
     build/alpine-dev.ext4: the image the other tests read is what the
     current scripts and lock build, not a stale one."""
+    _openssl()
     first, second = tmp_path / "first.ext4", tmp_path / "second.ext4"
     for out in (first, second):
         proc = subprocess.run(
@@ -2964,3 +2950,484 @@ def test_dev_image_builds_the_same_twice(tmp_path):
         assert proc.returncode == 0, proc.stderr
     assert al.sha256_file(first) == al.sha256_file(second)
     assert al.sha256_file(first) == al.sha256_file(DEV_IMAGE), "rebuild it: `make rootfs-dev`"
+
+
+@pytest.fixture(scope="module")
+def dev_root(tmp_path_factory):
+    """The actual developer image, including symlinks, dumped without executing it."""
+    _built_or_skip(DEV_IMAGE, DEV_IMAGE.is_file(), "make rootfs-dev")
+    _, debugfs = _e2fsprogs()
+    root = tmp_path_factory.mktemp("dev-root")
+    proc = subprocess.run(
+        [str(debugfs), "-R", f"rdump / {root}", str(DEV_IMAGE)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    errors = [
+        line
+        for line in proc.stderr.splitlines()
+        if line
+        and not line.startswith("debugfs ")
+        and "Operation not permitted while changing ownership" not in line
+    ]
+    assert proc.returncode == 0 and not errors, proc.stderr
+    return root
+
+
+def _exe(root, path):
+    binary = rootfs._resolve_in_rootfs(root, path)
+    assert binary is not None and binary.stat().st_mode & 0o111, path
+    return binary
+
+
+def _glob_in_rootfs(root, pattern):
+    """Require matching nonempty files, resolving their symlinks inside the guest."""
+    matches = list(root.glob(pattern))
+    assert matches, pattern
+    resolved = []
+    for path in matches:
+        target = rootfs._resolve_in_rootfs(root, path.relative_to(root).as_posix())
+        assert target is not None and target.stat().st_size, path
+        resolved.append(target)
+    return resolved
+
+
+def _assert_elf_closure(root, binary, *, expect_interp=True):
+    """Every DT_NEEDED edge reaches an ELF inside this image."""
+    pending = [(binary, expect_interp)]
+    seen = set()
+    while pending:
+        path, executable = pending.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        # Alpine packages legitimately use libgcc_s; Lumen-built programs
+        # keep validate_dynamic_elf's stricter default policy.
+        _, needed = rootfs.validate_dynamic_elf(
+            path,
+            root,
+            expect_interp=executable,
+            forbidden_needed=rootfs.FORBIDDEN_NEEDED - {"libgcc_s.so.1"},
+        )
+        for soname in needed:
+            resolved = rootfs.resolve_soname(root, soname)
+            assert resolved is not None, (path, soname)
+            pending.append((resolved, False))
+
+
+@pytest.mark.parametrize("tool", ["curl", "python3", "ruby"])
+def test_dev_image_has_the_m9_runtimes(dev_root, tool):
+    """M9's executables use the image's musl loader and a complete library closure."""
+    binary = _exe(dev_root, f"usr/bin/{tool}")
+    interp, needed = rootfs.validate_dynamic_elf(binary, dev_root)
+    assert interp == rootfs.DEFAULT_INTERP, tool
+    assert "libc.musl-x86_64.so.1" in needed, tool
+    _assert_elf_closure(dev_root, binary)
+
+
+def test_dev_image_has_the_m9_extension_build_tools(dev_root):
+    """Headers, offline build helpers and the gate imports' shared objects are installed."""
+    for tool in ("gcc", "make", "as", "ld", "gem"):
+        _exe(dev_root, f"usr/bin/{tool}")
+    for pattern in (
+        "usr/include/python3.*/Python.h",
+        "usr/include/python3.*/pyconfig.h",
+        "usr/lib/python3.*/config-*/Makefile",
+        "usr/lib/python3.*/site-packages/setuptools/__init__.py",
+        "usr/lib/python3.*/asyncio/__init__.py",
+        "usr/lib/python3.*/sqlite3/__init__.py",
+        "usr/lib/python3.*/ssl.py",
+        "usr/lib/python3.*/encodings/__init__.py",
+        "usr/lib/python3.*/encodings/aliases.py",
+        "usr/lib/python3.*/encodings/utf_8.py",
+        "usr/lib/python3.*/os.py",
+        "usr/lib/python3.*/site.py",
+        "usr/include/ruby-*/ruby.h",
+        "usr/include/ruby-*/*/ruby/config.h",
+        "usr/lib/ruby/*/mkmf.rb",
+        "usr/lib/ruby/*/*/rbconfig.rb",
+        "usr/lib/ruby/*/net/http.rb",
+        "usr/lib/ruby/*/rubygems.rb",
+    ):
+        _glob_in_rootfs(dev_root, pattern)
+    for pattern in (
+        "usr/lib/python3.*/lib-dynload/_asyncio*.so",
+        "usr/lib/python3.*/lib-dynload/_sqlite3*.so",
+        "usr/lib/python3.*/lib-dynload/_ssl*.so",
+        "usr/lib/python3.*/lib-dynload/_socket*.so",
+        "usr/lib/python3.*/lib-dynload/_ctypes*.so",
+        "usr/lib/python3.*/lib-dynload/_struct*.so",
+        "usr/lib/ruby/*/*/openssl.so",
+        "usr/lib/ruby/*/*/socket.so",
+        "usr/lib/ruby/*/*/psych.so",
+        "usr/lib/ruby/*/*/enc/encdb.so",
+        "usr/lib/ruby/*/*/enc/trans/transdb.so",
+    ):
+        for path in _glob_in_rootfs(dev_root, pattern):
+            _assert_elf_closure(dev_root, path, expect_interp=False)
+
+
+def test_dev_image_has_the_ca_store_and_m9_fixture_directories(dev_root):
+    """The CA bundle and hashed directory trust the installed roots; A4 has its destinations."""
+    _assert_ca_store(dev_root, _openssl())
+    assert rootfs._resolve_in_rootfs(dev_root, "/etc/ssl/cert.pem") == (
+        dev_root / "etc/ssl/certs/ca-certificates.crt"
+    )
+    for path in ("etc/ssl", "etc/apk/keys", "usr/local/share/ca-certificates"):
+        assert stat.S_ISDIR((dev_root / path).lstat().st_mode), path
+        assert stat.S_IMODE((dev_root / path).lstat().st_mode) == 0o755, path
+    # This lane preserves Alpine's files; #453 installs the fixture values
+    # once #450 defines them. No host DNS or localhost configuration leaks in.
+    mini = BUILD_DIR / "deps/alpine-minirootfs"
+    for name in ("hosts", "resolv.conf"):
+        original = mini / "etc" / name
+        installed = dev_root / "etc" / name
+        if original.exists():
+            assert installed.read_bytes() == original.read_bytes(), name
+        else:
+            assert not installed.exists(), name
+
+
+def _openssl():
+    """Require the same OpenSSL >= 3 as the builder; missing locally skips, CI fails."""
+    try:
+        return al.find_openssl()
+    except al.LockError as exc:
+        if os.environ.get("CI"):
+            pytest.fail(str(exc))
+        pytest.skip(str(exc))
+
+
+def _assert_ca_store(root, openssl):
+    """Check the bundle and exact links against independently parsed configuration.
+
+    The minirootfs bundle is byte-identical to the generated bundle at this lock;
+    the fixture test, which starts without a bundle, covers the actual write.
+    """
+    sources = [
+        root / "usr/share/ca-certificates" / entry
+        for raw in (root / "etc/ca-certificates.conf").read_text(encoding="utf-8").splitlines()
+        if (entry := raw.strip()) and not entry.startswith(("#", "!"))
+    ]
+    assert list((root / "usr/local/share/ca-certificates").iterdir()) == []
+    assert sources
+    certs = root / "etc/ssl/certs"
+    expected_pems = {"ca-cert-" + p.stem.replace(" ", "_") + ".pem": p for p in sources}
+    assert {p.name for p in certs.glob("*.pem")} == set(expected_pems)
+    for name, source in expected_pems.items():
+        link = certs / name
+        assert link.is_symlink(), name
+        assert os.readlink(link) == "/" + source.relative_to(root).as_posix()
+        assert rootfs._resolve_in_rootfs(root, f"etc/ssl/certs/{name}") == source
+
+    # Compare multiplicities: SSLContext.get_ca_certs and sets hide duplicates.
+    expected_der = Counter(ssl.PEM_cert_to_DER_cert(p.read_text()) for p in sources)
+    bundle = certs / "ca-certificates.crt"
+    pem_blocks = re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", bundle.read_text(), re.DOTALL
+    )
+    assert Counter(ssl.PEM_cert_to_DER_cert(p) for p in pem_blocks) == expected_der
+    hashes = {}
+    hash_sources = {}
+    for source in sources:
+        value = subprocess.run(
+            [str(openssl), "x509", "-in", str(source), "-noout", "-subject_hash"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        der = ssl.PEM_cert_to_DER_cert(source.read_text())
+        hashes.setdefault(value, set()).add(der)
+        hash_sources.setdefault(value, source)
+    links = [p for p in certs.iterdir() if re.fullmatch(r"[0-9a-f]{8}\.\d+", p.name)]
+    assert all(len(cert_der) == 1 for cert_der in hashes.values()), "subject-hash collision"
+    assert {p.name for p in links} == {f"{value}.0" for value in hashes}
+    actual_der = Counter()
+    for link in links:
+        assert link.is_symlink(), link
+        resolved = rootfs._resolve_in_rootfs(root, f"etc/ssl/certs/{link.name}")
+        assert resolved == hash_sources[link.name.split(".")[0]], link
+        der = ssl.PEM_cert_to_DER_cert(resolved.read_text())
+        assert der in hashes[link.name.split(".")[0]], link
+        actual_der[der] += 1
+    assert actual_der == Counter({der: 1 for der in expected_der})
+    # Absolute guest links cannot be followed on the host. Layout is checked
+    # above through the guest resolver; verify trust using the explicit bundle.
+    proc = subprocess.run(
+        [
+            str(openssl),
+            "verify",
+            "-no-CApath",
+            "-no-CAstore",
+            "-no_check_time",
+            "-CAfile",
+            str(bundle),
+            *(str(p) for p in sources),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.count(": OK") == len(sources), proc.stdout
+
+
+@pytest.fixture
+def ca_tree(tmp_path):
+    openssl = _openssl()
+    root = tmp_path / "root"
+    sources = root / "usr/share/ca-certificates/mozilla"
+    sources.mkdir(parents=True)
+    (root / "etc/ssl/certs").mkdir(parents=True)
+    (root / "usr/local/share/ca-certificates").mkdir(parents=True)
+    for name, serial in (("first", "1"), ("sécond", "2"), ("excluded", "3"), ("collision", "4")):
+        subject = "first" if name == "collision" else name
+        subprocess.run(
+            [
+                str(openssl),
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-subj",
+                f"/CN={subject}",
+                "-set_serial",
+                serial,
+                "-days",
+                "1",
+                "-keyout",
+                str(tmp_path / "key.pem"),
+                "-out",
+                str(sources / f"{name}.crt"),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    second = sources / "sécond.crt"
+    second.write_bytes(second.read_bytes().rstrip(b"\n"))
+    shutil.copyfile(sources / "first.crt", sources / "duplicate.crt")
+    (root / "etc/ca-certificates.conf").write_text(
+        "# fixture roots\n\nmozilla/first.crt\n!mozilla/excluded.crt\n"
+        "mozilla/sécond.crt\nmozilla/duplicate.crt",
+        encoding="utf-8",
+    )
+    lock = al.Lock("3.21.10", (al.Locked("ca-certificates", "1-r0", "main", "0" * 64),))
+    return root, lock, openssl
+
+
+def test_ca_store_matches_alpine_configuration_order_with_exclusions_and_duplicates(ca_tree):
+    """Configured order controls the bundle and the first duplicate's hash link."""
+    root, lock, openssl = ca_tree
+    al.ca_store(root, lock, openssl)
+    _assert_ca_store(root, openssl)
+    certs = root / "etc/ssl/certs"
+    assert not (certs / "ca-cert-excluded.pem").is_symlink()
+    sources = root / "usr/share/ca-certificates/mozilla"
+    assert (certs / "ca-certificates.crt").read_bytes() == b"".join(
+        (sources / name).read_bytes() + b"\n"
+        for name in ("first.crt", "sécond.crt", "duplicate.crt")
+    )
+
+
+def test_ca_store_refuses_subject_hash_collisions(ca_tree):
+    """Alpine c_rehash overwrites .0 in directory order; refuse that ambiguity."""
+    root, lock, openssl = ca_tree
+    (root / "etc/ca-certificates.conf").write_text(
+        "mozilla/first.crt\nmozilla/collision.crt\n", encoding="utf-8"
+    )
+    with pytest.raises(al.LockError, match="CA subject-hash collision") as exc:
+        al.ca_store(root, lock, openssl)
+    assert "usr/share/ca-certificates/mozilla/first.crt" in str(exc.value)
+    assert "usr/share/ca-certificates/mozilla/collision.crt" in str(exc.value)
+    assert not (root / "etc/ssl/certs/ca-certificates.crt").exists()
+
+
+@pytest.mark.parametrize("entry", ["certificate.crt", "subdirectory"])
+def test_ca_store_refuses_local_certificate_entries(ca_tree, entry):
+    root, lock, openssl = ca_tree
+    local = root / "usr/local/share/ca-certificates" / entry
+    if entry.endswith(".crt"):
+        shutil.copyfile(root / "usr/share/ca-certificates/mozilla/first.crt", local)
+    else:
+        local.mkdir()
+    with pytest.raises(al.LockError, match="usr/local/share/ca-certificates must be empty") as exc:
+        al.ca_store(root, lock, openssl)
+    assert entry in str(exc.value)
+    assert list((root / "etc/ssl/certs").iterdir()) == []
+
+
+def test_ca_store_refuses_an_empty_configuration(ca_tree):
+    root, lock, openssl = ca_tree
+    (root / "etc/ca-certificates.conf").write_text("# none\n!mozilla/first.crt\n")
+    with pytest.raises(al.LockError, match="no configured CA certificates"):
+        al.ca_store(root, lock, openssl)
+
+
+def test_ca_store_requires_configuration_only_when_package_is_locked(ca_tree):
+    root, lock, openssl = ca_tree
+    (root / "etc/ca-certificates.conf").unlink()
+    with pytest.raises(al.LockError, match="missing etc/ca-certificates.conf"):
+        al.ca_store(root, lock, openssl)
+    al.ca_store(root, al.Lock("3.21.10", ()), openssl)
+    assert not (root / "etc/ssl/certs/ca-certificates.crt").exists()
+
+
+@pytest.mark.parametrize("damage", ["none", "changed", "extra", "missing", "symlink"])
+def test_stage_pins_the_ca_update_hook_and_refuses_other_hooks(tmp_path, damage):
+    mini, apks, dest = tmp_path / "mini", tmp_path / "apks", tmp_path / "stage"
+    _stub_minirootfs(mini)
+    shutil.copytree(mini, dest, symlinks=True)
+    body = b"#!/bin/sh\nexec /usr/bin/c_rehash /etc/ssl/certs\n"
+    entries = [("etc/ca-certificates/update.d", "d", None, 0o755)]
+    if damage != "missing":
+        entries.append(
+            (al.CA_HOOK, "f", body + (b"# changed\n" if damage == "changed" else b""), 0o755)
+        )
+    if damage == "extra":
+        entries.append(("etc/ca-certificates/update.d/new-hook", "f", b"#!/bin/sh\n", 0o755))
+    if damage == "symlink":
+        entries[-1] = (al.CA_HOOK, "l", "/bin/busybox", 0o777)
+    lock = al.parse_lock(_fixture_lock(apks, apks={"ca-certificates-1-r0": _apk(entries)}))
+    if damage == "none":
+        al.stage(lock, apks, mini, dest)
+    else:
+        with pytest.raises(al.LockError, match="unhandled CA update hook|missing .*certhash"):
+            al.stage(lock, apks, mini, dest)
+
+
+@pytest.mark.parametrize(
+    "version", ["OpenSSL 1.1.1", "LibreSSL 3.3.6", "OpenSSL 3.5.9", "OpenSSL 4.1.0"]
+)
+def test_openssl_requires_version_three_or_newer(monkeypatch, version):
+    monkeypatch.setattr(
+        al.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, version, "")
+    )
+    if version.startswith(("OpenSSL 3.", "OpenSSL 4.")):
+        assert al.find_openssl({"LUMEN_OPENSSL": "/chosen/openssl"}) == Path("/chosen/openssl")
+    else:
+        with pytest.raises(al.LockError, match="OpenSSL >= 3.*invalid LUMEN_OPENSSL"):
+            al.find_openssl({"LUMEN_OPENSSL": "/chosen/openssl"})
+
+
+def test_openssl_discovery_precedence_and_missing_tool(monkeypatch):
+    called = []
+    available = {"/override", "/brew1/openssl", "/brew2/openssl", "/path/openssl"}
+
+    def run(cmd, **kwargs):
+        called.append(cmd[0])
+        if cmd[0] not in available:
+            raise FileNotFoundError("executable missing")
+        return subprocess.CompletedProcess(cmd, 0, "OpenSSL 3.5.9", "")
+
+    monkeypatch.setattr(al, "OPENSSL_DIRS", ("/brew1", "/brew2"))
+    monkeypatch.setattr(al.subprocess, "run", run)
+    assert al.find_openssl({"LUMEN_OPENSSL": "/override"}) == Path("/override")
+    assert called == ["/override"]
+    for expected in ("/brew1/openssl", "/brew2/openssl", "/path/openssl"):
+        assert al.find_openssl({"PATH": "/path"}) == Path(expected)
+        available.remove(expected)
+    with pytest.raises(al.LockError, match="OpenSSL >= 3") as exc:
+        al.find_openssl({"PATH": "/path"})
+    for candidate in ("/brew1/openssl", "/brew2/openssl", "/path/openssl"):
+        assert f"{candidate}: executable missing" in str(exc.value)
+    with pytest.raises(al.LockError, match="invalid LUMEN_OPENSSL") as exc:
+        al.find_openssl({"LUMEN_OPENSSL": "/missing"})
+    assert "/missing: executable missing" in str(exc.value)
+
+
+@pytest.mark.parametrize("ci", [False, True])
+def test_openssl_missing_skips_locally_but_fails_in_ci(monkeypatch, ci):
+    monkeypatch.setenv("CI", "1" if ci else "")
+
+    def missing():
+        raise al.LockError("OpenSSL >= 3 is required")
+
+    monkeypatch.setattr(al, "find_openssl", missing)
+    with pytest.raises((pytest.fail.Exception, pytest.skip.Exception), match="OpenSSL >= 3") as exc:
+        _openssl()
+    assert exc.type is (pytest.fail.Exception if ci else pytest.skip.Exception)
+
+
+def test_mkrootfs_dev_rejects_missing_ca_configuration(tmp_path):
+    _e2fsprogs()
+    repo = _mkrootfs_dev_tree(tmp_path)
+    entries = [(al.CA_HOOK, "f", b"#!/bin/sh\nexec /usr/bin/c_rehash /etc/ssl/certs\n", 0o755)]
+    lock = _fixture_lock(
+        repo / "build/deps/alpine-packages", apks={"ca-certificates-1-r0": _apk(entries)}
+    )
+    (repo / "tools/alpine-packages.lock").write_text(lock)
+    out = tmp_path / "missing-conf.ext4"
+    proc = _mkrootfs_dev(repo, out, tmp_path)
+    assert proc.returncode != 0
+    assert "missing etc/ca-certificates.conf for locked ca-certificates" in proc.stderr
+    assert not out.exists()
+
+
+def test_mkrootfs_dev_checks_openssl_before_staging(tmp_path):
+    _e2fsprogs()
+    repo = _mkrootfs_dev_tree(tmp_path)
+    out = tmp_path / "missing-openssl.ext4"
+    proc = subprocess.run(
+        ["bash", str(repo / "tools/mkrootfs-dev.sh"), str(out)],
+        env={
+            **os.environ,
+            "LUMEN_PYTHON": sys.executable,
+            "TMPDIR": str(tmp_path),
+            "LUMEN_OPENSSL": str(tmp_path / "no-openssl"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "OpenSSL >= 3 is required" in proc.stderr
+    assert not list(tmp_path.glob("lumen-rootfs-dev*"))
+    assert not out.exists()
+
+
+def test_mkrootfs_dev_fixture_directories_ignore_host_umask(tmp_path):
+    _, debugfs = _e2fsprogs()
+    repo = _mkrootfs_dev_tree(tmp_path)
+    out = tmp_path / "restricted-umask.ext4"
+    proc = _mkrootfs_dev(repo, out, tmp_path, umask=0o077)
+    assert proc.returncode == 0, proc.stderr
+    for directory in (
+        "/etc/ssl",
+        "/etc/ssl/certs",
+        "/etc/apk",
+        "/etc/apk/keys",
+        "/usr/local/share",
+        "/usr/local/share/ca-certificates",
+    ):
+        assert "Mode:  0755" in rootfs.debugfs(out, f"stat {directory}", tool=debugfs)
+
+
+def test_openssl_discovery_skips_unsuitable_candidates_and_reports_failures(monkeypatch):
+    calls = []
+    results = {
+        "/brew1/openssl": (0, "LibreSSL 3.3.6", ""),
+        "/brew2/openssl": (1, "", "cannot load libcrypto"),
+        "/path/openssl": (0, "OpenSSL 3.5.9", ""),
+    }
+
+    def run(cmd, **kwargs):
+        calls.append(cmd[0])
+        return subprocess.CompletedProcess(cmd, *results[cmd[0]])
+
+    monkeypatch.setattr(al, "OPENSSL_DIRS", ("/brew1", "/brew2"))
+    monkeypatch.setattr(al.subprocess, "run", run)
+    assert al.find_openssl({"PATH": "/path"}) == Path("/path/openssl")
+    assert calls == list(results)
+    results["/path/openssl"] = (0, "OpenSSL 1.1.1", "")
+    with pytest.raises(al.LockError) as exc:
+        al.find_openssl({"PATH": "/path"})
+    message = str(exc.value)
+    assert "/brew1/openssl: unsupported version: LibreSSL 3.3.6" in message
+    assert "/brew2/openssl: exit 1: cannot load libcrypto" in message
+    assert "/path/openssl: unsupported version: OpenSSL 1.1.1" in message

@@ -270,3 +270,26 @@ tests = [
     "harness:test_ci_config::test_syscall_census_workflow_is_pinned",
     "harness:test_census_dns::*",
 ]
+
+[[feature]]
+name = "M9 developer image (#452): pinned curl, Python and Ruby musl executables with their library closures, C-extension/native-gem build files present, a CA bundle and hashed trust store, and directories for #453's fixture CA and apk key; deterministic rebuilds cover the expanded image"
+milestone = "M9"
+tests = [
+    "harness:test_rootfs_dev::test_ca_store_matches_alpine_configuration_order_with_exclusions_and_duplicates",
+    "harness:test_rootfs_dev::test_ca_store_refuses_subject_hash_collisions",
+    "harness:test_rootfs_dev::test_ca_store_refuses_local_certificate_entries[*]",
+    "harness:test_rootfs_dev::test_ca_store_refuses_an_empty_configuration",
+    "harness:test_rootfs_dev::test_ca_store_requires_configuration_only_when_package_is_locked",
+    "harness:test_rootfs_dev::test_mkrootfs_dev_rejects_missing_ca_configuration",
+    "harness:test_rootfs_dev::test_mkrootfs_dev_checks_openssl_before_staging",
+    "harness:test_rootfs_dev::test_mkrootfs_dev_fixture_directories_ignore_host_umask",
+    "harness:test_rootfs_dev::test_stage_pins_the_ca_update_hook_and_refuses_other_hooks[*]",
+    "harness:test_rootfs_dev::test_openssl_requires_version_three_or_newer[*]",
+    "harness:test_rootfs_dev::test_openssl_discovery_precedence_and_missing_tool",
+    "harness:test_rootfs_dev::test_openssl_discovery_skips_unsuitable_candidates_and_reports_failures",
+    "harness:test_rootfs_dev::test_openssl_missing_skips_locally_but_fails_in_ci[*]",
+    "harness:test_rootfs_dev::test_dev_image_has_the_m9_runtimes[*]",
+    "harness:test_rootfs_dev::test_dev_image_has_the_m9_extension_build_tools",
+    "harness:test_rootfs_dev::test_dev_image_has_the_ca_store_and_m9_fixture_directories",
+    "harness:test_rootfs_dev::test_dev_image_builds_the_same_twice",
+]

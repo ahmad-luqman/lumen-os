@@ -12,7 +12,7 @@ make deps            # pinned Limine + OVMF + Alpine busybox + Alpine minirootfs
 make build           # the apps (build/apps/<name>.wasm, test apps build/apps/tests/), Linux binaries, then both kernels
 make rootfs          # deterministic Alpine minirootfs ext4 image (build/alpine-rootfs.ext4) + M7/M8 Linux binaries
 make deps-dev        # pinned Alpine developer packages (tools/alpine-packages.lock, sha256-checked)
-make rootfs-dev      # deterministic Alpine developer image (build/alpine-dev.ext4: gcc, g++, make, git, sqlite3, vim)
+make rootfs-dev      # deterministic Alpine M8/M9 developer image (build/alpine-dev.ext4: gcc, g++, make, git, sqlite3, vim, curl, python3, ruby)
 make deps-zig        # pinned zig C cross-compiler for host-built Linux test binaries (sha256-checked)
 make libc-test       # fetch musl libc-test (pinned commit) and build it with zig into build/libc-test/
 make app NAME=foo    # a new app: apps/foo copied from apps/template (tools/new-app.sh); `make build` bundles it
@@ -48,7 +48,7 @@ and `e2fsck` in the same directory; on macOS `brew install e2fsprogs` is
 keg-only and discovered via `/opt/homebrew/opt/e2fsprogs/sbin`,
 `/usr/local/opt/e2fsprogs/sbin`, or `LUMEN_E2FSPROGS_SBIN` so a partial
 `mke2fs`-only `$PATH` entry like Android SDK never hijacks it; on Ubuntu/Debian
-`apt-get install e2fsprogs`), `uv`, `make`, `curl`, and `gdb` for `make debug`
+`apt-get install e2fsprogs`), OpenSSL ≥ 3 for `make rootfs-dev` (Homebrew `openssl@3` or `LUMEN_OPENSSL`), `uv`, `make`, `curl`, and `gdb` for `make debug`
 (its scenario is skipped without it; a `LUMEN_GDB` that can't be found fails it).
 
 ## Hard rules
