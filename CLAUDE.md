@@ -572,8 +572,8 @@ one is its own PR that updates that doc first.
   `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` they
   make up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
   (ARCHITECTURE section 8, "Stays `-ENOSYS` in M8")), `unmap_past`
-  (#378; `meta.rs`'s `unmap_past_size_now`, a failed `O_TRUNC`'s unmap,
-  #414) and the shared copy helpers, `time.rs` (`RawTimespec`,
+  (#378; `meta.rs`'s `unmap_past_size_now`, the unmap after any failed
+  truncate: `truncate`, `ftruncate`, `O_TRUNC`, #414) and the shared copy helpers, `time.rs` (`RawTimespec`,
   `read_timespec`, `write_timespec`, `ERESTARTNOHAND`, #383, shared by `futex`,
   `poll` and `signal` (`rt_sigtimedwait`)), and a module per cluster holding its handlers (`fd`,
   `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, with #255's
