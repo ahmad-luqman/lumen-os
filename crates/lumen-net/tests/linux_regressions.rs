@@ -72,9 +72,9 @@ fn reuseaddr_listen_checks_other_listeners_and_allows_restart() {
     for id in [first, second] {
         s.bind(id, req, Preps::None, at(0)).unwrap();
     }
-    s.listen(first, 0, &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(0)).unwrap();
+    s.listen(first, 0, sizes(), &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(0)).unwrap();
     assert_eq!(
-        s.listen(second, 0, &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(0)),
+        s.listen(second, 0, sizes(), &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(0)),
         Err(NetError::AddrInUse)
     );
     let _c = connect(&mut s, b, IpEndpoint::new(addr(false), 1234), 0);
@@ -82,13 +82,13 @@ fn reuseaddr_listen_checks_other_listeners_and_allows_restart() {
     steps(&mut s, &mut now, 8);
     let (a, _) = s.accept(first).unwrap();
     s.close(first, false, at(now));
-    s.listen(second, 0, &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(now)).unwrap();
+    s.listen(second, 0, sizes(), &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(now)).unwrap();
     s.close(second, false, at(now));
     s.close(a, false, at(now));
     steps(&mut s, &mut now, 8);
     let third = s.open(Family::V4, Proto::Tcp).unwrap();
     s.bind(third, req, Preps::None, at(now)).unwrap();
-    s.listen(third, 0, &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(now)).unwrap();
+    s.listen(third, 0, sizes(), &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(now)).unwrap();
 }
 #[test]
 fn receive_queue_precedes_reset_error_but_send_reports_error_first() {
@@ -340,7 +340,7 @@ fn preparations_match_operations_and_late_ethernet_attachment() {
     let n = s.preps_needed(l, PrepFor::Listen(2));
     assert_eq!(n, 6);
     let mut ps = (0..n).map(|_| prepare_tcp(b, sizes()).unwrap()).collect::<Vec<_>>().into_iter();
-    s.listen(l, 2, &mut ps, at(0)).unwrap();
+    s.listen(l, 2, sizes(), &mut ps, at(0)).unwrap();
     assert_eq!(ps.len(), 0);
 }
 #[test]

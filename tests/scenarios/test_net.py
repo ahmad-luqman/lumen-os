@@ -62,6 +62,8 @@ def test_net_without_entropy_keeps_raw_diagnostics(boot):
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     state = run(m, "net")
+    assert "net: stack failed\n" in state, state
+    assert "INFO  net: stack disabled: no entropy source can answer later; raw diagnostics retained" in m.output
     assert "link up (Up), mtu 1500" in state
     assert "127.0.0.1/8" not in state and "::1/128" not in state, state
     assert (

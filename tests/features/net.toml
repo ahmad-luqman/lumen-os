@@ -82,7 +82,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Stack review regressions: deadlines survive failed Ethernet, refill failures recover by episode, stale registrations cannot replace live sockets, and selftest keeps failure reasons"
+name = "Stack review regressions: the idle cap expires loopback TIME-WAIT with failed Ethernet, refill failures recover by episode, stale registrations cannot replace live sockets, and selftest keeps failure reasons"
 milestone = "M9"
 tests = [
     "cargo:lumen-net",
@@ -98,3 +98,14 @@ tests = [
 name = "Network idle wait bounds a silent device without delaying earlier timers (made-up deadlines)"
 milestone = "M9"
 tests = ["ktest:lumen_kernel::net::stack::idle_wait_preserves_earlier_timers_and_bounds_silent_devices"]
+
+[[feature]]
+name = "Network worker chooses deadlines by device state; partial refills retain their episode; live listener diagnostics and replies arriving after a timed-out wait"
+milestone = "M9"
+tests = [
+    "cargo:lumen-net",
+    "ktest:lumen_kernel::net::stack::worker_deadline_selection_preserves_timers_for_every_device_state",
+    "ktest:lumen_kernel::net::stack::partial_listener_refill_keeps_the_failure_episode",
+    "ktest:lumen_kernel::net::stack::net_diagnostics_report_open_listener_and_memory",
+    "ktest:lumen_kernel::net::virtio_net::stack_selftest_reports_a_reply_after_the_wait_deadline",
+]

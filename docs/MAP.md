@@ -25,6 +25,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   family-aware ingress selection, the SYN backlog filter and reset
   classification. `stack.rs`: `Stack`,
   generational `SockId` entries, bounded LISTEN pools, accept queues,
+  #474/#501 listener-owned `BufSizes` checked against explicit preparations
+  and `lib.rs::worker_deadline` for device-state deadline selection,
   event-based `changed` (including packet metadata capacity), per-state
   timers, orphan cleanup, shutdown readiness, datagram tickets, wildcard
   receive fairness, TCP tuple uniqueness and listener precedence,
@@ -564,19 +566,27 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   declines a second NIC even after `take_device`, which transfers ownership
   to its stack; RX budget exhaustion rings `BELL` for another poll; #474 adds
   `VirtioNet`, which asserts TX lengths and observes the worker-driven ARP
-  selftest, and routes IRQ kicks and shell diagnostics to the stack) and
+  selftest with typed outcomes retained past a waiter timeout, and routes
+  IRQ kicks and shell diagnostics to the stack; `rng::can_retry_seed`
+  reports whether an existing entropy source can still answer;
+  `virtio::Doorbell::note_missed_info` counts polling recovery without a
+  warning for an IRQ still in flight) and
   `net/stack.rs` (#474: `NetStack::inner`, boot-reserved weak socket table,
   fixed SocketSets (499,712 bytes each on x86-64) and shared buffer budget;
-  fixed boot heap delta 6,171,136 bytes in ktest, plus 196,608 bytes of worker
-  vectors, excluding the worker stack/NIC DMA; port-use counts are `u16`,
-  independent RNG seeds (INFO and deferred initialization without a seeded pool),
+  about 6.2 MB fixed boot storage measured at #501, plus 196,608 bytes of
+  worker vectors (included in the current boot log), excluding the worker
+  stack/NIC DMA; port-use counts are `u16`, independent RNG seeds, INFO and
+  deferred initialization only while an entropy source can still answer;
+  startup reserves the vectors and spawns before device handoff/publication,
   the sole `net` polling thread,
   post-lock readiness notifications, deadline-preserving idle polling,
-  generation-checked registrations, listener refill failure episodes, and socket/TIME-WAIT
-  diagnostics), `net/inet.rs` (#474: `InetSocket`, `Proto` arms for C3/C4/C6,
+  generation-checked registrations, whole-shortfall refill failure episodes, and socket/TIME-WAIT
+  diagnostics, with ktests for nonzero listener counts/memory, partial refill
+  recovery, relative waits and device-state deadline selection), `net/inet.rs` (#474: `InetSocket`, fixed `Proto` delegations for C3/C4/C6,
   Lock 0 I/O locks, options leaf and `KernelPollHead`, readiness mapping;
   `net/tcp.rs`, `udp.rs`, `icmp.rs` own their protocol state and delegated
-  operations, so C4/C3/C6 do not edit shared dispatch), and
+  operations and constructors; C4/C3/C6 append their family/type/protocol
+  constructor selection only in `sock.rs::create_socket`), and
   `net/sock.rs` (#472: the generic socket file object: `SockKind`,
   `ShutdownHow`, `UserSpan`/`UserIovec`, `InFlightFile`, `SendIo` (with
   `named`), `RecvIo`, `RecvDone`, `SockOps` (with required `disconnect`),

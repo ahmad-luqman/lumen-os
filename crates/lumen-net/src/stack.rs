@@ -13,7 +13,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint};
 enum Role {
     Fresh,
     Active,
-    Listener(usize),
+    Listener { backlog: usize, sizes: BufSizes },
     Pool(SockId),
     Queued(SockId, u64),
     Orphan,
@@ -105,7 +105,6 @@ struct Entry {
     keep_probes: u32,
     icmp_destinations: [Destinations; 2],
     raw_ident: Option<u16>,
-    listen_sizes: Option<BufSizes>,
 }
 // ICMP metadata in smoltcp contains only the source. Keep one destination
 // alongside each of its eight receive slots, including queued alias traffic.
@@ -182,7 +181,6 @@ impl Entry {
             keep_probes: 0,
             icmp_destinations: [Destinations::default(); 2],
             raw_ident: None,
-            listen_sizes: None,
         }
     }
 }
@@ -611,7 +609,7 @@ impl<D: NetDevice> Stack<D> {
                 }
                 return Err(NetError::Already);
             }
-            if matches!(e.role, Role::Listener(_)) {
+            if matches!(e.role, Role::Listener { .. }) {
                 return Err(NetError::IsConn);
             }
         }
@@ -954,7 +952,7 @@ impl<D: NetDevice> Stack<D> {
         let listener = self
             .live_entries()
             .filter(|e| {
-                if !matches!(e.role, Role::Listener(_)) {
+                if !matches!(e.role, Role::Listener { .. }) {
                     return false;
                 }
                 let req = e.bound.unwrap();
@@ -967,7 +965,7 @@ impl<D: NetDevice> Stack<D> {
         let Some(e) = listener else {
             return Syn::NoOwner;
         };
-        let Role::Listener(backlog) = e.role else {
+        let Role::Listener { backlog, .. } = e.role else {
             unreachable!();
         };
         let in_flight = self
@@ -1366,8 +1364,8 @@ impl<D: NetDevice> Stack<D> {
         self.now = now;
         let e = self.entry(id)?;
         let state = if e.proto == Proto::Tcp { self.tcp_ref(id).ok().map(tcp::Socket::state) } else { None };
-        if matches!(e.role, Role::Listener(_)) || state == Some(tcp::State::SynSent) {
-            if matches!(e.role, Role::Listener(_)) && how == Shut::Wr {
+        if matches!(e.role, Role::Listener { .. }) || state == Some(tcp::State::SynSent) {
+            if matches!(e.role, Role::Listener { .. }) && how == Shut::Wr {
                 return Ok(());
             }
             self.close_children(id, now);
@@ -1424,7 +1422,7 @@ impl<D: NetDevice> Stack<D> {
         let Ok(e) = self.entry(id) else {
             return;
         };
-        if matches!(e.role, Role::Listener(_)) {
+        if matches!(e.role, Role::Listener { .. }) {
             self.close_children(id, now);
             self.remove(id, false, self.now);
         } else if e.proto == Proto::Tcp && e.handles.iter().any(Option::is_some) {
@@ -1501,7 +1499,7 @@ impl<D: NetDevice> Stack<D> {
             return Readiness { hup: true, error: true, ..Readiness::default() };
         };
         let mut r = Readiness { error: e.error.is_some(), ..Readiness::default() };
-        if let Role::Listener(_) = e.role {
+        if let Role::Listener { .. } = e.role {
             r.readable = self.queued(id) != 0;
             return r;
         }
@@ -1619,7 +1617,7 @@ impl<D: NetDevice> Stack<D> {
             }
         }
         let e = self.entry(id)?;
-        if matches!(e.role, Role::Listener(_)) {
+        if matches!(e.role, Role::Listener { .. }) {
             let options = e.options;
             for pos in 0..self.live.len() {
                 let child = self.entries[self.live[pos]].as_mut().unwrap();
@@ -1802,6 +1800,7 @@ impl<D: NetDevice> Stack<D> {
         &mut self,
         id: SockId,
         backlog: usize,
+        sizes: BufSizes,
         pool: &mut dyn Iterator<Item = TcpPrep>,
         now: Instant,
     ) -> Result<(), NetError> {
@@ -1809,7 +1808,7 @@ impl<D: NetDevice> Stack<D> {
         if e.proto != Proto::Tcp {
             return Err(NetError::OpNotSupp);
         }
-        if !matches!(e.role, Role::Fresh | Role::Listener(_)) {
+        if !matches!(e.role, Role::Fresh | Role::Listener { .. }) {
             return Err(NetError::Inval);
         }
         let req = e.bound.unwrap_or(self.unbound_req(id)?);
@@ -1838,17 +1837,9 @@ impl<D: NetDevice> Stack<D> {
         }
         // Linux v6.12 net/ipv4/inet_connection_sock.c:1245-1254 clones
         // listener state. Lumen fixes actual capacities at the first listen.
-        let sizes = self
-            .entry(id)?
-            .listen_sizes
-            .or_else(|| {
-                prepared
-                    .iter()
-                    .flatten()
-                    .next()
-                    .map(|p| BufSizes { rx: p.socket.recv_capacity(), tx: p.socket.send_capacity() })
-            })
-            .ok_or(NetError::Inval)?;
+        // Relisten callers prepare with listener_sizes(id), even if SO_*BUF
+        // options changed meanwhile. Existing children retain their buffers.
+        let sizes = self.listener_sizes(id).unwrap_or(sizes);
         if prepared
             .iter()
             .flatten()
@@ -1867,8 +1858,7 @@ impl<D: NetDevice> Stack<D> {
             }
             return Err(err);
         }
-        self.entry_mut(id)?.role = Role::Listener(backlog);
-        self.entry_mut(id)?.listen_sizes = Some(sizes);
+        self.entry_mut(id)?.role = Role::Listener { backlog, sizes };
         let mut n = 0;
         for (i, iface) in IfaceId::ALL.into_iter().enumerate() {
             for _ in 0..needed[i] {
@@ -1934,13 +1924,16 @@ impl<D: NetDevice> Stack<D> {
     }
     /// Actual transport capacities fixed by the first successful listen.
     pub fn listener_sizes(&self, id: SockId) -> Option<BufSizes> {
-        self.entry(id).ok().filter(|e| matches!(e.role, Role::Listener(_)))?.listen_sizes
+        match self.entry(id).ok()?.role {
+            Role::Listener { sizes, .. } => Some(sizes),
+            _ => None,
+        }
     }
     fn shortfall(&self, id: SockId, iface: IfaceId) -> usize {
         let Ok(e) = self.entry(id) else {
             return 0;
         };
-        let Role::Listener(backlog) = e.role else {
+        let Role::Listener { backlog, .. } = e.role else {
             return 0;
         };
         if self.queued(id) > backlog || !self.coverage(e.bound.unwrap().addr)[iface.index()] {
@@ -1976,7 +1969,7 @@ impl<D: NetDevice> Stack<D> {
     }
     /// Detaches the oldest completed child only after its peer endpoint is available.
     pub fn accept(&mut self, id: SockId) -> Result<(SockId, IpEndpoint), NetError> {
-        if !matches!(self.entry(id)?.role, Role::Listener(_)) {
+        if !matches!(self.entry(id)?.role, Role::Listener { .. }) {
             return Err(NetError::Inval);
         }
         let child = self
@@ -2481,6 +2474,27 @@ mod diagnostic_tests {
         stack.ports.time_wait(id, now + Duration::from_millis(1), None);
         stack.needs_poll = false;
         assert_eq!(stack.poll_at_while_eth_blocked(now), Some(now + Duration::from_millis(1)));
+    }
+    #[test]
+    fn worker_deadline_selection_preserves_timers_for_every_device_state() {
+        let mut stack = Stack::<Device>::try_new(Loopback::try_new(65535, 16).unwrap(), Instant::ZERO, 474).unwrap();
+        let now = Instant::from_secs(5);
+        let timer = now + Duration::from_millis(7);
+        let egress = now - Duration::from_secs(1);
+        stack.next_poll = [Some(timer), Some(egress)];
+        // Made-up B2 states: usable+full, broken, not ready, usable+free.
+        for (state, usable, full, expected) in [
+            ("full", true, true, timer),
+            ("broken", false, false, timer),
+            ("not ready", false, true, timer),
+            ("free", true, false, egress),
+        ] {
+            assert_eq!(
+                worker_deadline(usable, full, stack.poll_at(now), stack.poll_at_while_eth_blocked(now)),
+                Some(expected),
+                "{state}"
+            );
+        }
     }
     #[test]
     fn diagnostics_follow_the_attached_device_and_address_configuration() {

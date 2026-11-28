@@ -13,6 +13,12 @@ pub struct IcmpState {
     pub raw: bool,
 }
 impl IcmpState {
+    /// Constructs the protocol state before registering a socket.
+    #[allow(dead_code, reason = "protocol constructors land in C3/C4/C6")]
+    pub fn new(raw: bool) -> Self {
+        Self { raw }
+    }
+
     pub(super) fn bind(&self, _socket: &InetSocket, _addr: &SockAddr) -> Result<(), u32> {
         Err(errno::EOPNOTSUPP)
     }

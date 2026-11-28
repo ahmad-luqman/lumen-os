@@ -1234,15 +1234,27 @@ impl Doorbell {
     /// deadline with no ring ([`MissedRule`]): its interrupt never came.
     /// Counted; the first time, a warning naming the device.
     pub fn note_missed(&self, addr: Option<PciAddr>) {
+        self.note_missed_at(addr, log::Level::Warn);
+    }
+
+    /// Counts a poll that found work without a ring, at INFO: a continuously
+    /// polling owner cannot distinguish a lost IRQ from one still in flight.
+    pub fn note_missed_info(&self, addr: Option<PciAddr>) {
+        self.note_missed_at(addr, log::Level::Info);
+    }
+
+    fn note_missed_at(&self, addr: Option<PciAddr>, level: log::Level) {
         if self.missed.fetch_add(1, Ordering::Relaxed) != 0 {
             return;
         }
         match addr {
-            Some(addr) => warn!(
-                target: "virtio",
+            Some(addr) => log::log!(
+                target: "virtio", level,
                 "{addr}: the device answered but its MSI-X interrupt never came (said once)"
             ),
-            None => warn!(target: "virtio", "a device answered but its MSI-X interrupt never came (said once)"),
+            None => {
+                log::log!(target: "virtio", level, "a device answered but its MSI-X interrupt never came (said once)")
+            }
         }
     }
 

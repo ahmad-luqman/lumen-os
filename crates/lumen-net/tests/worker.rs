@@ -11,7 +11,7 @@ fn listener_refills_keep_first_listen_buffer_capacities() {
     s.bind(l, BindReq { addr: Some(addr(false)), port: 1234, ..BindReq::default() }, Preps::None, Instant::ZERO)
         .unwrap();
     let mut initial = [prepare_tcp(b, sizes).unwrap()].into_iter();
-    s.listen(l, 0, &mut initial, Instant::ZERO).unwrap();
+    s.listen(l, 0, sizes, &mut initial, Instant::ZERO).unwrap();
     assert_eq!(s.listener_sizes(l), Some(sizes));
     let client = connect(&mut s, b, IpEndpoint::new(addr(false), 1234), 0);
     let mut now = 0;
@@ -26,10 +26,18 @@ fn listener_refills_keep_first_listen_buffer_capacities() {
     assert_eq!(b.used(), used);
     assert!(s.refill(l, IfaceId::Lo, prepare_tcp(b, s.listener_sizes(l).unwrap()).unwrap(), Instant::ZERO).unwrap());
     assert_eq!(b.used(), used + sizes.rx + sizes.tx);
-    // Relisten cannot change the capacities inherited by future children.
+    // Wrong preparations still fail even with an explicit sizes argument.
+    // Linux v6.12 net/ipv4/af_inet.c:199-203 updates an existing listener's
+    // backlog. C4 must prepare from listener_sizes, not changed SO_*BUF.
     let mut wrong = [prepare_tcp(b, BufSizes { rx: 8, tx: 8 }).unwrap()].into_iter();
-    assert_eq!(s.listen(l, 1, &mut wrong, Instant::ZERO), Err(NetError::Inval));
+    assert_eq!(s.listen(l, 1, sizes, &mut wrong, Instant::ZERO), Err(NetError::Inval));
     assert_eq!(s.listener_sizes(l), Some(sizes));
+    let changed_options = BufSizes { rx: 8, tx: 8 };
+    let mut additional = [prepare_tcp(b, s.listener_sizes(l).unwrap()).unwrap()].into_iter();
+    s.listen(l, 1, changed_options, &mut additional, Instant::ZERO).unwrap();
+    assert_eq!(s.listener_sizes(l), Some(sizes));
+    assert_eq!(s.preps_needed(l, PrepFor::Listen(1)), 0);
+    assert_eq!(b.used(), used + 2 * (sizes.rx + sizes.tx));
     for id in [client, child, l] {
         s.close(id, true, Instant::from_millis(now));
     }

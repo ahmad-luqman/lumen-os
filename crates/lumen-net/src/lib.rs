@@ -410,3 +410,10 @@ pub(crate) fn family_ok(v6: bool, only: bool, addr: IpAddress) -> bool {
 pub(crate) fn loopback_addr(v6: bool) -> IpAddress {
     if v6 { IpAddress::Ipv6(Ipv6Address::LOCALHOST) } else { IpAddress::v4(127, 0, 0, 1) }
 }
+
+/// Selects the worker deadline from this round's device state. Unusable or
+/// full Ethernet uses the deadline with past-due Ethernet egress filtered
+/// out; that deadline still includes loopback and transport timers.
+pub fn worker_deadline(usable: bool, full: bool, normal: Option<Instant>, blocked: Option<Instant>) -> Option<Instant> {
+    if !usable || full { blocked } else { normal }
+}

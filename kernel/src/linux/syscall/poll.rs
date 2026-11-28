@@ -1361,7 +1361,7 @@ crate::ktest!(
             use crate::net::inet::{InetSocket, Proto, TcpState};
             use lumen_net::Readiness;
             let socket =
-                InetSocket::new(lumen_sockabi::Family::Inet, Proto::Tcp(TcpState)).map_err(|_| "inet socket")?;
+                InetSocket::new(lumen_sockabi::Family::Inet, Proto::Tcp(TcpState::new())).map_err(|_| "inet socket")?;
             let file = crate::net::sock::new_socket_file(socket.clone(), false).map_err(|_| "inet file")?;
             let fd = ktest_install_file(file)?;
             let inet_cases = [

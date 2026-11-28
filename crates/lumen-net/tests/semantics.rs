@@ -555,7 +555,7 @@ fn reuseport_selects_first_bound_listener_and_never_spreads_excess_syns() {
     }
     // Deliberately reverse both SockId order and smoltcp slot order.
     for id in [later, first] {
-        s.listen(id, 0, &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), Instant::ZERO).unwrap();
+        s.listen(id, 0, sizes(), &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), Instant::ZERO).unwrap();
     }
     let c = connect(&mut s, b, IpEndpoint::new(addr(false), 1234), 0);
     let mut now = 0;
@@ -576,7 +576,7 @@ fn listen_pool_cap_relisten_and_independent_family_overlap() {
     let l = listener(&mut s, b, None, false, false, 1234, SOMAXCONN);
     assert_eq!(s.socket_count(), LISTEN_POOL_MAX);
     assert_eq!(b.used(), LISTEN_POOL_MAX * 8192);
-    s.listen(l, 0, &mut std::iter::empty(), Instant::ZERO).unwrap();
+    s.listen(l, 0, sizes(), &mut std::iter::empty(), Instant::ZERO).unwrap();
     assert_eq!(s.socket_count(), 1);
     assert_eq!(b.used(), 8192);
     let v6 = s.open(Family::V6, Proto::Tcp).unwrap();
@@ -725,7 +725,7 @@ fn udp_length_errors_precede_missing_destination_only_at_linux_outer_limit() {
     let data = vec![0; 65536];
     assert_eq!(s.send(u, &data, None, Preps::None, Instant::ZERO), Err(NetError::MsgSize));
     assert_eq!(s.send(u, &data[..65535], None, Preps::None, Instant::ZERO), Err(NetError::DestAddrReq));
-    assert_eq!(s.listen(u, 0, &mut std::iter::empty(), Instant::ZERO), Err(NetError::OpNotSupp));
+    assert_eq!(s.listen(u, 0, sizes(), &mut std::iter::empty(), Instant::ZERO), Err(NetError::OpNotSupp));
     let u = bind_udp(&mut s, b, Some(addr(false)), 2000, false);
     assert_eq!(
         s.send(u, &data[..4097], Some(IpEndpoint::new(addr(false), 2001)), Preps::None, Instant::ZERO),

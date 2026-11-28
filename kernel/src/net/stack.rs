@@ -10,14 +10,32 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 #[cfg(feature = "ktest")]
 use core::sync::atomic::AtomicU64;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-#[cfg(feature = "ktest")]
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use lumen_net::BufSizes;
 use lumen_net::{
     Budget, EthConfig, IfaceId, Instant, Loopback, NET_ENTRIES, NET_SOCKETS, NetError, SockId, Stack, prepare_tcp,
 };
 
 static STACK: AtomicPtr<NetStack> = AtomicPtr::new(core::ptr::null_mut());
+#[repr(u8)]
+enum Startup {
+    Waiting,
+    Failed,
+    Up,
+}
+static STARTUP: AtomicU8 = AtomicU8::new(Startup::Waiting as u8);
+static STARTED: WaitQueue = WaitQueue::new();
+
+pub(super) fn startup_status() -> &'static str {
+    match STARTUP.load(Ordering::Acquire) {
+        n if n == Startup::Up as u8 => "up",
+        n if n == Startup::Failed as u8 => "failed",
+        _ => "waiting for entropy",
+    }
+}
+
+type Notifications = Vec<(Arc<InetSocket>, bool)>;
+type Shortfalls = Vec<(SockId, IfaceId, usize, BufSizes)>;
 #[cfg(feature = "ktest")]
 static TEST_NOW: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -50,9 +68,11 @@ struct Entry {
 
 const IDLE_POLL_NS: u64 = 100_000_000;
 
-fn idle_deadline(now_ns: u64, next: Option<Instant>) -> u64 {
-    next.map_or(u64::MAX, |t| (t.total_micros().max(0) as u64).saturating_mul(1000))
-        .min(now_ns.saturating_add(IDLE_POLL_NS))
+fn idle_deadline(now_ns: u64, time: Instant, next: Option<Instant>) -> u64 {
+    let delta = next.map_or(u64::MAX, |next| {
+        (next.total_micros().saturating_sub(time.total_micros()).max(0) as u64).saturating_mul(1000)
+    });
+    now_ns.saturating_add(delta.min(IDLE_POLL_NS))
 }
 
 fn reserved<T>(capacity: usize) -> Result<Vec<T>, NetError> {
@@ -162,15 +182,24 @@ impl NetStack {
     }
     /// Registers a live identity once; stale callers cannot replace its generation.
     pub fn register(&self, id: SockId, sock: &Arc<InetSocket>) {
+        if !self.register_current(id, sock) {
+            log::warn!(target: "net", "register called with absent socket {id:?}");
+            debug_assert!(false, "register requires a live stack identity");
+        }
+    }
+    // The rejection is separately testable without invoking the public
+    // contract's debug assertion (kernel tests cannot catch a panic).
+    fn register_current(&self, id: SockId, sock: &Arc<InetSocket>) -> bool {
         let mut inner = self.lock();
         assert_eq!(id, sock.id());
         if !inner.stack.contains(id) {
-            return;
+            return false;
         }
         if let Some(entry) = &inner.entries[id.index()] {
             assert!(entry.id != id || entry.sock.strong_count() == 0, "socket registered twice");
         }
         inner.entries[id.index()] = Some(Entry { id, sock: Arc::downgrade(sock), warned: false });
+        true
     }
     /// Removes a released socket without disturbing a recycled generation.
     pub fn unregister(&self, id: SockId) {
@@ -200,15 +229,16 @@ impl NetStack {
         }
     }
     fn refill_succeeded(&self, id: SockId) {
-        if let Some(entry) = self.lock().entries[id.index()].as_mut().filter(|entry| entry.id == id) {
+        let mut inner = self.lock();
+        if inner.stack.shortfalls().iter().any(|(listener, _, _)| *listener == id) {
+            return;
+        }
+        if let Some(entry) = inner.entries[id.index()].as_mut().filter(|entry| entry.id == id) {
             entry.warned = false;
         }
     }
-    fn run(&self) -> ! {
-        // Each changed ID appears once, and there are at most two shortfalls
-        // per ID. These vectors never grow while inner is held.
-        let mut notifications = Vec::with_capacity(NET_ENTRIES);
-        let mut shortfalls = Vec::with_capacity(2 * NET_ENTRIES);
+    fn run(&self, mut notifications: Notifications, mut shortfalls: Shortfalls) -> ! {
+        // Reserved before spawn; neither vector grows while inner is held.
         let mut seen = virtio_net::BELL.rings();
         let mut deadline = 0;
         loop {
@@ -220,7 +250,7 @@ impl NetStack {
             // visible at the next wait. B2 also rings after 16 bad RX entries.
             self.kicked.store(false, Ordering::Release);
             let silent_deadline = !woke && started < deadline;
-            let (more, next, answered, before_poll) = {
+            let (more, next, time, now_ns, answered, before_poll, after_poll) = {
                 let mut inner = self.lock();
                 // Sample immediately before looking at the device, including
                 // IRQs that arrived while acquisition of inner was blocked.
@@ -229,11 +259,16 @@ impl NetStack {
                 if let Some(device) = inner.stack.device_mut() {
                     device.selftest_step();
                 }
+                let now_ns = crate::time::now_ns();
                 let time = now();
                 let round = inner.stack.poll_round(time);
-                let blocked = inner.stack.device_mut().is_some_and(|device| !device.usable() || device.tx_full());
-                let next =
-                    if blocked { inner.stack.poll_at_while_eth_blocked(time) } else { inner.stack.poll_at(time) };
+                let (usable, full) = inner.stack.device_mut().map_or((true, false), |d| (d.usable(), d.tx_full()));
+                let next = lumen_net::worker_deadline(
+                    usable,
+                    full,
+                    inner.stack.poll_at(time),
+                    inner.stack.poll_at_while_eth_blocked(time),
+                );
                 let answered = inner.stack.device_mut().map(|device| device.completions()) != before;
                 let NetInner { stack, entries } = &mut *inner;
                 for id in stack.changed() {
@@ -241,18 +276,25 @@ impl NetStack {
                         let current = sock.id() == *id;
                         // Even a mismatched last Arc must be dropped outside
                         // inner: InetSocket::drop takes this lock again.
+                        debug_assert!(notifications.len() < notifications.capacity());
                         notifications.push((sock, current));
                     }
                 }
                 for &(id, iface, count) in stack.shortfalls() {
                     if let Some(sizes) = stack.listener_sizes(id) {
+                        debug_assert!(shortfalls.len() < shortfalls.capacity());
                         shortfalls.push((id, iface, count, sizes));
                     }
                 }
-                (round.more, next, answered, before_poll)
+                // A ring during the round is an answered interrupt, not a
+                // missed one. Keep before_poll as seen so it prompts a recheck.
+                let after_poll = virtio_net::BELL.rings();
+                (round.more, next, time, now_ns, answered, before_poll, after_poll)
             };
-            if silent_deadline && before_poll == seen && answered {
-                virtio_net::BELL.note_missed(None);
+            if silent_deadline && before_poll == seen && after_poll == seen && answered {
+                // The IRQ can still be in flight after the final sample. This
+                // recovery observation must not make a healthy boot warn.
+                virtio_net::BELL.note_missed_info(None);
             }
             seen = before_poll;
             for (sock, current) in notifications.drain(..) {
@@ -282,7 +324,7 @@ impl NetStack {
             self.rounds.fetch_add(1, Ordering::SeqCst);
             // Immediate receive work wins over Ethernet backpressure. An
             // expired egress deadline on a full TX queue must not busy-loop.
-            deadline = if more || installed { 0 } else { idle_deadline(crate::time::now_ns(), next) };
+            deadline = if more || installed { 0 } else { idle_deadline(now_ns, time, next) };
         }
     }
 }
@@ -303,8 +345,11 @@ pub fn init() {
         Ok(seeds) => start(seeds),
         Err(why) => {
             log::info!(target: "net", "stack waiting for entropy: {why}");
-            // RDRAND may seed on retry. A failed virtio-rng probe consumes
-            // its device, but a pool seeded by any later source also works.
+            if !crate::rng::can_retry_seed() {
+                STARTUP.store(Startup::Failed as u8, Ordering::Release);
+                log::info!(target: "net", "stack disabled: no entropy source can answer later; raw diagnostics retained");
+                return;
+            }
             if sched::spawn("net-init", || {
                 loop {
                     let _ = sched::sleep(1_000_000_000);
@@ -312,10 +357,16 @@ pub fn init() {
                         start(seeds);
                         return;
                     }
+                    if !crate::rng::can_retry_seed() {
+                        STARTUP.store(Startup::Failed as u8, Ordering::Release);
+                        log::info!(target: "net", "stack disabled: no entropy source can answer later; raw diagnostics retained");
+                        return;
+                    }
                 }
             })
             .is_err()
             {
+                STARTUP.store(Startup::Failed as u8, Ordering::Release);
                 log::error!(target: "net", "cannot start entropy retry thread");
             }
         }
@@ -327,12 +378,13 @@ fn start((lo_seed, eth_seed): (u64, u64)) {
     let result = (|| {
         let budget = boxed(Budget::for_usable_memory(crate::mm::frame::counts().owned * 4096))?;
         let budget = Box::leak(budget);
-        let net = NetStack::new(budget, lo_seed)?;
-        boxed(net)
+        let net = boxed(NetStack::new(budget, lo_seed)?)?;
+        Ok::<_, NetError>((net, reserved(NET_ENTRIES)?, reserved(2 * NET_ENTRIES)?))
     })();
-    let net = match result {
+    let (net, notifications, shortfalls) = match result {
         Ok(net) => net,
         Err(error) => {
+            STARTUP.store(Startup::Failed as u8, Ordering::Release);
             log::error!(target: "net", "network fixed storage unavailable: {error:?}; raw diagnostics retained");
             return;
         }
@@ -340,30 +392,45 @@ fn start((lo_seed, eth_seed): (u64, u64)) {
     // Deferred startup can overlap frees by other threads; this diagnostic
     // delta must never turn successful allocation into an overflow panic.
     let fixed_bytes = crate::mm::heap::stats().used.saturating_sub(before);
-    log::info!(target: "net", "fixed boot storage {fixed_bytes} bytes (excluding worker and NIC DMA)");
-    if let Some(device) = virtio_net::take_device() {
-        // B4 chooses DHCP/static/off. Until then attach an unconfigured NIC;
-        // the ARP diagnostic remains independent of address configuration.
-        let mut inner = net.lock();
-        inner
-            .stack
-            .attach_eth(
-                VirtioNet::new(device),
-                EthConfig::Static {
-                    addr: lumen_net::Ipv4Cidr::new(lumen_net::Ipv4Address::UNSPECIFIED, 0),
-                    router: None,
-                },
-                now(),
-                eth_seed,
-            )
-            .expect("attach Ethernet");
-        inner.stack.configure_eth(None, None).expect("unconfigured Ethernet");
+    log::info!(target: "net", "fixed boot storage {fixed_bytes} bytes (including worker vectors; excluding thread and NIC DMA)");
+    // The closure owns the stack and vectors. If spawn fails it is dropped,
+    // leaving DEVICE untouched. Only the successfully spawned owner takes
+    // the device and publishes the stack; init waits for that publication.
+    if let Err(error) = sched::spawn("net", move || {
+        if let Some(device) = virtio_net::take_device() {
+            // B4 chooses DHCP/static/off. Until then attach an unconfigured NIC;
+            // the ARP diagnostic remains independent of address configuration.
+            // attach_eth cannot fail here: this fresh stack owns both reserved
+            // sets, one IPv4 address fits, and router=None never adds a route.
+            // configure_eth(None, None) cannot fail after the successful attach.
+            let mut inner = net.lock();
+            inner
+                .stack
+                .attach_eth(
+                    VirtioNet::new(device),
+                    EthConfig::Static {
+                        addr: lumen_net::Ipv4Cidr::new(lumen_net::Ipv4Address::UNSPECIFIED, 0),
+                        router: None,
+                    },
+                    now(),
+                    eth_seed,
+                )
+                .expect("attach Ethernet");
+            inner.stack.configure_eth(None, None).expect("unconfigured Ethernet");
+        }
+        let net = Box::leak(net);
+        assert!(STACK.compare_exchange(core::ptr::null_mut(), net, Ordering::Release, Ordering::Relaxed).is_ok());
+        let net: &'static NetStack = net;
+        STARTUP.store(Startup::Up as u8, Ordering::Release);
+        STARTED.wake_all();
+        log::info!(target: "net", "lo 127.0.0.1/8 ::1/128; socket sets {SET_STORAGE_BYTES} bytes; memory limit {}", net.budget.limit());
+        net.run(notifications, shortfalls);
+    }) {
+        STARTUP.store(Startup::Failed as u8, Ordering::Release);
+        log::error!(target: "net", "cannot spawn net thread: {error:?}; raw diagnostics retained");
+        return;
     }
-    let net = Box::leak(net);
-    assert!(STACK.compare_exchange(core::ptr::null_mut(), net, Ordering::Release, Ordering::Relaxed).is_ok());
-    let net: &'static NetStack = net;
-    let _ = sched::spawn("net", move || net.run()).expect("spawn net thread");
-    log::info!(target: "net", "lo 127.0.0.1/8 ::1/128; socket sets {SET_STORAGE_BYTES} bytes; memory limit {}", net.budget.limit());
+    STARTED.wait_until(|| STARTUP.load(Ordering::Acquire) == Startup::Up as u8);
 }
 
 /// Snapshot diagnostics under inner; formatting and output may allocate and
@@ -374,7 +441,10 @@ pub(super) fn command(net: &NetStack, ctx: &mut crate::shell::Ctx<'_>) {
         let mut inner = net.lock();
         let entries = inner.entries.iter().filter(|entry| entry.is_some()).count();
         let stack = &mut inner.stack;
-        ports.extend(stack.time_wait_ports());
+        for port in stack.time_wait_ports() {
+            debug_assert!(ports.len() < ports.capacity());
+            ports.push(port);
+        }
         let addresses = [IfaceId::Lo, IfaceId::Eth0]
             .map(|iface| core::array::from_fn::<_, 2, _>(|i| stack.interface_addresses(iface).get(i).copied()));
         (stack.device_mut().map(|d| d.snapshot()), stack.socket_count(), entries, addresses)
@@ -507,7 +577,7 @@ mod test_support {
         }
     }
     pub fn socket(v6: bool) -> Result<Arc<InetSocket>, &'static str> {
-        InetSocket::new(family(v6), Proto::Tcp(TcpState)).map_err(|_| "open TCP")
+        InetSocket::new(family(v6), Proto::Tcp(TcpState::new())).map_err(|_| "open TCP")
     }
     pub fn address(v6: bool) -> IpAddress {
         if v6 { IpAddress::Ipv6(lumen_net::Ipv6Address::LOCALHOST) } else { IpAddress::v4(127, 0, 0, 1) }
@@ -521,7 +591,8 @@ mod test_support {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| "prepare pool")?
             .into_iter();
-        sock.with(|s, id| s.listen(id, 3, &mut pool, now())).map_err(|_| "listen")?;
+        let sizes = sock.buffer_sizes();
+        sock.with(|s, id| s.listen(id, 3, sizes, &mut pool, now())).map_err(|_| "listen")?;
         Ok(sock)
     }
     pub fn connect(listener: &InetSocket, v6: bool) -> Result<Arc<InetSocket>, &'static str> {
@@ -537,7 +608,12 @@ mod test_support {
     pub fn accept(listener: &InetSocket, v6: bool) -> Result<Arc<InetSocket>, &'static str> {
         wait("accept", listener, || readiness(listener).readable);
         let (id, _) = listener.with(|s, id| s.accept(id)).map_err(|_| "accept")?;
-        Ok(InetSocket::from_id(id, family(v6), Proto::Tcp(TcpState), listener.buffer_sizes()))
+        Ok(InetSocket::from_id(
+            id,
+            family(v6),
+            Proto::Tcp(TcpState::new()),
+            listener.query(|s, id| s.listener_sizes(id)).ok_or("listener sizes")?,
+        ))
     }
     pub fn echo(from: &InetSocket, to: &InetSocket, tag: u8) -> crate::ktest::TestResult {
         let mut sent = 0;
@@ -721,7 +797,7 @@ crate::ktest!(
         kassert_eq!(old_id.index(), new.id().index());
         kassert!(old_id != new.id());
         net.unregister(old_id);
-        net.register(old_id, &old);
+        kassert!(!net.register_current(old_id, &old));
         net.refill_failed(old_id, NetError::NoBufs);
         let inner = net.lock();
         let entry = inner.entries[new.id().index()].as_ref().ok_or("lost new entry")?;
@@ -821,7 +897,8 @@ crate::ktest!(
             let _ = sched::sleep(1_000_000);
         }
         clock.advance(deadline);
-        // No kick or synthetic interrupt: the worker's timer wait must run it.
+        // No kick or synthetic interrupt: advancing this frozen clock does
+        // not reschedule the real wait. The 100 ms idle cap must recheck it.
         log::info!(target: "net-test", "waiting for loopback TIME-WAIT expiry with failed Ethernet");
         while net.with(|s| s.time_wait_ports().any(|(p, _)| p == port)) {
             let _ = sched::sleep(10_000_000);
@@ -835,12 +912,125 @@ crate::ktest!(
 crate::ktest!(
     fn idle_wait_preserves_earlier_timers_and_bounds_silent_devices() {
         use crate::kassert_eq;
-        let now = 1_000_000_000;
-        kassert_eq!(idle_deadline(now, None), now + IDLE_POLL_NS);
-        kassert_eq!(idle_deadline(now, Some(Instant::from_millis(1001))), now + 1_000_000);
-        kassert_eq!(idle_deadline(now, Some(Instant::from_secs(5))), now + IDLE_POLL_NS);
-        kassert_eq!(idle_deadline(now, Some(Instant::ZERO)), 0);
-        kassert_eq!(idle_deadline(u64::MAX - 1, None), u64::MAX);
+        // Deliberately unrelated clock origins: a frozen stack clock must
+        // not turn a future timer into a past-due real-time busy loop.
+        let now = 90_000_000_000;
+        let time = Instant::from_secs(1);
+        kassert_eq!(idle_deadline(now, time, None), now + IDLE_POLL_NS);
+        kassert_eq!(idle_deadline(now, time, Some(Instant::from_millis(1001))), now + 1_000_000);
+        kassert_eq!(idle_deadline(now, time, Some(Instant::from_secs(5))), now + IDLE_POLL_NS);
+        kassert_eq!(idle_deadline(now, time, Some(Instant::ZERO)), now);
+        kassert_eq!(idle_deadline(u64::MAX - 1, time, None), u64::MAX);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn net_diagnostics_report_open_listener_and_memory() {
+        use crate::shell::{Captured, Ctx};
+        use crate::{kassert, kassert_eq};
+        use test_support::*;
+        resources_return_to((0, 0));
+        let listener = listener(false)?;
+        let net = NetStack::get();
+        let mut out = Captured::default();
+        let history = lumen_shell::History::new(1);
+        command(net, &mut Ctx::new(&mut out, false, &history));
+        let used = net.budget().used();
+        kassert!(used > 0);
+        kassert_eq!(net.with(|s| s.socket_count()), 4);
+        kassert!(out.text.contains(&alloc::format!(
+            "net: open sockets 1, transport slots 4, refill failures {}, socket memory {}/{}",
+            net.refill_failures.load(Ordering::Relaxed),
+            used,
+            net.budget().limit()
+        )));
+        drop(listener);
+        resources_return_to((0, 0));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn partial_listener_refill_keeps_the_failure_episode() {
+        use crate::{kassert, kassert_eq};
+        use lumen_net::{BindReq, Family, Preps, Proto};
+        static BUDGET: Budget = Budget::new(1024 * 1024);
+        let net = NetStack::new(&BUDGET, 501).map_err(|_| "test stack")?;
+        let sizes = BufSizes { rx: 64, tx: 64 };
+        let prep = prepare_tcp(&BUDGET, sizes).map_err(|_| "initial prep")?;
+        let id = net
+            .with(|s| {
+                let id = s.open(Family::V4, Proto::Tcp)?;
+                s.bind(
+                    id,
+                    BindReq { addr: Some(test_support::address(false)), ..BindReq::default() },
+                    Preps::None,
+                    now(),
+                )?;
+                s.listen(id, 0, sizes, &mut [prep].into_iter(), now())?;
+                Ok::<_, NetError>(id)
+            })
+            .map_err(|_| "listen")?;
+        // Reserve a two-slot target before consuming the pool through
+        // connections. All mutations use real listener bookkeeping.
+        let additional = prepare_tcp(&BUDGET, sizes).map_err(|_| "additional prep")?;
+        net.with(|s| s.listen(id, 1, sizes, &mut [additional].into_iter(), now())).map_err(|_| "relisten")?;
+        // With no kernel socket registered, install only the bookkeeping
+        // entry needed by the warning latch; its generation is the live ID.
+        net.lock().entries[id.index()] = Some(Entry { id, sock: Weak::new(), warned: true });
+        // A live shortfall is produced by two real connections and accepts.
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let prep = prepare_tcp(&BUDGET, sizes).map_err(|_| "client prep")?;
+            let client = net
+                .with(|s| {
+                    let client = s.open(Family::V4, Proto::Tcp)?;
+                    let remote = s.local_endpoint(id).ok_or(NetError::Inval)?;
+                    assert_eq!(
+                        s.connect(client, remote, Some(lumen_net::ConnectPrep::Tcp(prep)), now()),
+                        Err(NetError::InProgress)
+                    );
+                    Ok::<_, NetError>(client)
+                })
+                .map_err(|_| "client")?;
+            clients.push(client);
+        }
+        for _ in 0..16 {
+            net.with(|s| {
+                s.poll_round(now());
+            });
+        }
+        for _ in 0..2 {
+            net.with(|s| s.accept(id)).map_err(|_| "accept")?;
+        }
+        kassert_eq!(net.with(|s| s.shortfalls().iter().map(|(_, _, n)| n).sum::<usize>()), 2);
+        for remaining in [1, 0] {
+            let prep = prepare_tcp(&BUDGET, sizes).map_err(|_| "refill prep")?;
+            kassert_eq!(net.with(|s| s.refill(id, IfaceId::Lo, prep, now())), Ok(true));
+            net.refill_succeeded(id);
+            kassert_eq!(net.lock().entries[id.index()].as_ref().unwrap().warned, remaining != 0);
+        }
+        kassert!(net.with(|s| s.shortfalls().is_empty()));
+        drop(net);
+        kassert_eq!(BUDGET.used(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn worker_deadline_selection_preserves_timers_for_every_device_state() {
+        use crate::kassert_eq;
+        let egress = Instant::from_secs(4);
+        let timer = Instant::from_secs(6);
+        for (usable, full, expected) in [
+            (true, true, timer),   // usable but full
+            (false, false, timer), // broken
+            (false, true, timer),  // not ready
+            (true, false, egress), // usable with a free TX slot
+        ] {
+            kassert_eq!(lumen_net::worker_deadline(usable, full, Some(egress), Some(timer)), Some(expected));
+        }
         Ok(())
     }
 );

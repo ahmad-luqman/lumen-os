@@ -194,6 +194,13 @@ impl fmt::Display for Sources {
     }
 }
 
+/// Whether an existing source can still seed an empty pool. Device probing
+/// precedes net initialization; failed probes and absent hardware cannot
+/// recover without hotplug, which is not supported.
+pub fn can_retry_seed() -> bool {
+    matches!(RDRAND.load(Ordering::Relaxed), RDRAND_PENDING | RDRAND_IN_USE) || VIRTIO.load(Ordering::Relaxed)
+}
+
 pub fn sources() -> Sources {
     Sources { rdrand: RDRAND.load(Ordering::Relaxed) == RDRAND_IN_USE, virtio: VIRTIO.load(Ordering::Relaxed) }
 }

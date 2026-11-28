@@ -86,7 +86,7 @@ fn tcp_specific_listener_precedes_an_earlier_wildcard() {
             let id = s.open(if v6 { Family::V6 } else { Family::V4 }, Proto::Tcp).unwrap();
             s.bind(id, BindReq { addr: local, port: 1234, reuse_port: true, ..BindReq::default() }, Preps::None, at(0))
                 .unwrap();
-            s.listen(id, 0, &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(0)).unwrap();
+            s.listen(id, 0, sizes(), &mut [prepare_tcp(b, sizes()).unwrap()].into_iter(), at(0)).unwrap();
             listeners.push(id);
         }
         let c = connect(&mut s, b, IpEndpoint::new(addr(v6), 1234), 0);

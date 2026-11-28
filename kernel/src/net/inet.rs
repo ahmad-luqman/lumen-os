@@ -1,5 +1,8 @@
 //! Internet socket identity, readiness and protocol dispatch (M9 B3, #474).
-//! Protocol syscall semantics are supplied by C3 (UDP), C4 (TCP), C6 (ICMP).
+//! Protocol syscall semantics and socket() constructors belong in udp.rs
+//! (C3), tcp.rs (C4), and icmp.rs (C6). Their shared append point is the
+//! family/type/protocol match in sock::create_socket; Proto dispatch stays
+//! fixed. Accept constructs children with lumen-net's listener_sizes(id).
 
 use super::sock::{RecvDone, RecvIo, SendIo, ShutdownHow, SockKind, SockOps};
 use super::stack::{NetStack, now};

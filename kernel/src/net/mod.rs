@@ -3,6 +3,10 @@
 //! `sock` owns the generic socket file object ([`sock::SockOps`], `sockfs` on
 //! dev `0:8`, [`sock::InFlightFile`], [`sock::block_on`]) shared by every
 //! socket family (C1 `AF_UNIX`, C3 UDP, C4 TCP, C6 ICMP).
+//! `virtio_net` owns the NIC and ARP diagnostics; `stack` owns startup,
+//! serialized stack access and the polling worker. `inet` owns identities,
+//! readiness and common protocol dispatch. `tcp`, `udp` and `icmp` own
+//! protocol state, constructors and the delegated SockOps implementations.
 
 pub mod sock;
 

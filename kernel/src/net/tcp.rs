@@ -9,8 +9,15 @@ use lumen_sockabi::{OptVal, SockAddr, SockOpt};
 /// Owns protocol-specific interior mutability. Send/receive sequencing is
 /// provided by InetSocket's Lock 0 locks; state leaf locks must not enclose
 /// user copies, allocation-sensitive stack work, or blocking waits.
+#[derive(Default)]
 pub struct TcpState;
 impl TcpState {
+    /// Constructs the protocol state before registering a socket.
+    #[allow(dead_code, reason = "protocol constructors land in C3/C4/C6")]
+    pub fn new() -> Self {
+        Self
+    }
+
     pub(super) fn bind(&self, _socket: &InetSocket, _addr: &SockAddr) -> Result<(), u32> {
         Err(errno::EOPNOTSUPP)
     }
