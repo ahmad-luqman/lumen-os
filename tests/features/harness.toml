@@ -293,3 +293,43 @@ tests = [
     "harness:test_rootfs_dev::test_dev_image_has_the_ca_store_and_m9_fixture_directories",
     "harness:test_rootfs_dev::test_dev_image_builds_the_same_twice",
 ]
+
+[[feature]]
+name = "M9 offline network fixture (#453): restricted IPv4 slirp, per-run Unix-socket TCP services, HTTP/HTTPS with a per-run CA and signed pinned apk index, image-copy configuration replacement with inherited apk keys replaced by only the run key, local hosts and run-only CAfile/hashed-CApath trust; verified packages shared without copying; composable services, no idle deadlines, half-closes, guest-safe relay diagnostics and preserved service logs; packet injection checks DHCP and TCP guestfwd: UDP is dropped; TCP outside guestfwd is reset"
+milestone = "M9"
+tests = [
+    "harness:test_netfix::test_https_server_trusts_only_the_run_ca",
+    "harness:test_netfix::test_apk_index_signed_by_the_run_key",
+    "harness:test_netfix::test_parallel_fixtures_share_no_host_port",
+    "harness:test_netfix::test_guestfwd_relay_preserves_parallel_streams_and_half_close",
+    "harness:test_netfix::test_bad_package_hash_cleans_up_before_serving",
+    "harness:test_netfix::test_fixture_shutdown_closes_idle_clients",
+    "harness:test_netfix::test_prepare_image_installs_local_routes_and_run_trust_only_in_copy",
+    "harness:test_netfix::test_repository_serves_the_pinned_package_cache",
+    "harness:test_qemu::test_net_scenarios_are_restricted[*]",
+    "harness:test_qemu::test_service_paths_are_quoted_and_qemu_commas_escaped",
+    "harness:test_qemu::test_service_ports_are_valid_and_unique[*]",
+    "harness:test_qemu::test_qemu_has_user_networking",
+    "harness:test_qemu::test_missing_slirp_has_an_actionable_error",
+    "harness:test_qemu::test_restricted_slirp_drops_outbound_tcp_and_udp",
+    "harness:test_netfix::test_relay_drains_guest_after_server_eof",
+    "harness:test_netfix::test_relay_sender_error_is_logged_and_fails",
+    "harness:test_netfix::test_service_exceptions_fail_fixture_and_preserve_logs",
+    "harness:test_netfix::test_index_rejects_wrong_identity_or_arch[*]",
+    "harness:test_netfix::test_missing_package_cache_names_make_deps_dev",
+    "harness:test_netfix::test_service_mapping_is_composable_and_repository_shares_https",
+    "harness:test_qemu::test_relay_failure_logs_without_sending_diagnostics_to_guest",
+    "harness:test_qemu::test_unrestricted_requires_a_network_device",
+    "harness:test_qemu::test_probe_uses_shared_netdev_without_host_forwards",
+    "harness:test_qemu::test_service_socket_paths_accept_103_bytes[*]",
+    "harness:test_netfix::test_relay_http_response_then_guest_close_is_not_an_error[*]",
+    "harness:test_netfix::test_relay_with_unwritable_log_still_carries_traffic",
+    "harness:test_netfix::test_relay_receiver_disconnects_and_failures[*]",
+    "harness:test_netfix::test_fixture_shutdown_tolerates_tls_worker_races[*]",
+    "harness:test_netfix::test_service_failures_annotate_the_body_exception",
+    "harness:test_qemu::test_services_require_port_path_pairs[*]",
+    "harness:test_qemu::test_qemu_services_require_enabled_networking",
+    "harness:test_netfix::test_relay_sender_expected_disconnects_are_informational[*]",
+    "harness:test_netfix::test_fixture_honors_openssl_override_without_path",
+    "harness:test_netfix::test_fixture_missing_openssl_override_is_actionable",
+]

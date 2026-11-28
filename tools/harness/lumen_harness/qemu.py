@@ -32,16 +32,18 @@ import itertools
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any, Self
+from typing import IO, Any, NamedTuple, Self
 
 from PIL import Image
 
@@ -55,6 +57,16 @@ from .qmp import QmpClient, QmpError, button_args, pointer_move_args, qcodes_for
 EXIT_SUCCESS = (0x10 << 1) | 1  # 33
 EXIT_FAILURE = (0x11 << 1) | 1  # 35
 EXIT_CRASH = (0x12 << 1) | 1  # 37
+
+# Outside slirp's gateway, DNS proxy, and default DHCP leases.
+SERVICE_ADDRESS = "10.0.2.100"
+
+
+class Service(NamedTuple):
+    """A guest TCP port and its private host Unix socket."""
+
+    port: int
+    path: Path
 
 
 def qemu_binary() -> str:
@@ -233,8 +245,15 @@ class QemuOptions:
     # virtio-9p sharing this host folder, mount tag `SHARE_TAG`.
     share_dir: Path | None = None
     extra: list[str] = field(default_factory=list)
+    # False disables isolation for the user backend (when net_forwards is set).
+    net_restrict: bool = True
+    # Guest TCP port -> Unix socket via a fresh helper; requires net_forwards
+    # (an empty mapping enables networking without any host forwards).
+    net_services: tuple[tuple[int, Path], ...] = ()
 
     def __post_init__(self) -> None:
+        if self.net_services and self.net_forwards is None:
+            raise ValueError("net_services requires net_forwards (use {} for no host forwards)")
         if self.sound_wav and self.host_audio:
             raise ValueError("sound_wav and host_audio: one virtio-sound device, recorded or heard")
         if self.blk_readonly and not self.blk_image:
@@ -266,6 +285,69 @@ def _opt(value: object) -> str:
     """A value inside a QEMU `key=value,...` option: commas doubled, or QEMU
     would read the rest of a path with one as more options."""
     return str(value).replace(",", ",,")
+
+
+def _user_netdev(o: QemuOptions) -> str:
+    """The shared slirp configuration for machines and Ethernet probes."""
+    # Empty guest address means the first DHCP lease, 10.0.2.15.
+    forwards = "".join(
+        f",hostfwd=tcp:127.0.0.1:{host}-:{guest}" for guest, host in (o.net_forwards or {}).items()
+    )
+    # IPv6 is always off for now; M9 B4 adds it.
+    forwards += f",restrict={'on' if o.net_restrict else 'off'},ipv6=off"
+    for port, path in o.net_services:
+        command = shlex.join(
+            [
+                sys.executable,
+                "-W",
+                "ignore",  # Suppress compile-time warnings before the relay redirects fd 2.
+                str(Path(__file__).with_name("netfix.py")),
+                "--relay",
+                str(path),
+                "--log",
+                str(path.parent / "relay.log"),
+            ]
+        )
+        forwards += f",guestfwd=tcp:{SERVICE_ADDRESS}:{port}-cmd:{_opt(command)}"
+    return f"user,id=lumen-net{forwards}"
+
+
+def require_user_network() -> None:
+    """Fail clearly when this QEMU lacks the slirp backend required by net scenarios."""
+    binary = qemu_binary()
+    result = subprocess.run(
+        [binary, "-netdev", "help"], capture_output=True, text=True, timeout=10, check=False
+    )
+    if result.returncode or "user" not in (result.stdout + result.stderr).split():
+        raise RuntimeError(
+            f"{binary}: user networking (libslirp) unavailable; "
+            "install a QEMU with slirp support (Ubuntu: qemu-system-x86). "
+            f"-netdev help said: {result.stdout}{result.stderr}"
+        )
+
+
+def user_network_probe_args(wire_fd: int, qmp_path: Path, devices: Devices) -> list[str]:
+    """Connect the normal user backend to a test's Ethernet socket, without a CPU.
+
+    The socket carries QEMU's four-byte big-endian length followed by a frame.
+    This lets harness tests exercise slirp before Lumen has a network driver.
+    Host forwards are dropped: the probe exercises guest-to-host services only.
+    """
+    options = QemuOptions(
+        iso=Path("unused"),
+        vars_file=Path("unused"),
+        net_forwards={},
+        net_restrict=devices.restrict,
+        net_services=devices.services,
+    )
+    return [
+        qemu_binary(), "-machine", "none", "-display", "none", "-nodefaults",
+        "-qmp", f"unix:{qmp_path},server=on,wait=off",
+        "-netdev", _user_netdev(options),
+        "-netdev", f"socket,id=lumen-wire,fd={wire_fd}",
+        "-netdev", "hubport,id=lumen-user-port,hubid=0,netdev=lumen-net",
+        "-netdev", "hubport,id=lumen-wire-port,hubid=0,netdev=lumen-wire",
+    ]  # fmt: skip
 
 
 def device_args(o: QemuOptions) -> list[str]:
@@ -310,16 +392,10 @@ def device_args(o: QemuOptions) -> list[str]:
             "-device", f"virtio-blk-pci,id={ids['blk']},drive=lumen-disk",
         ]  # fmt: skip
     if o.net_forwards is not None:
-        # The empty guest address is slirp's default, 10.0.2.15: the first
-        # DHCP lease, which the guest must use (by DHCP or set statically)
-        # for the forwards to reach it.
-        forwards = "".join(
-            f",hostfwd=tcp:127.0.0.1:{host}-:{guest}" for guest, host in o.net_forwards.items()
-        )
         # `romfile=` (empty): no iPXE option ROM is loaded; nothing here boots
         # from the network.
         args += [
-            "-netdev", f"user,id=lumen-net{forwards}",
+            "-netdev", _user_netdev(o),
             "-device", f"virtio-net-pci,id={ids['net']},netdev=lumen-net,romfile=",
         ]  # fmt: skip
     if o.share_dir:
@@ -371,13 +447,17 @@ class Devices:
     blk_image: Path | None = None
     # Attach the virtio-blk drive read-only (`readonly=on`); needs `blk_mib` or `blk_image`.
     blk_readonly: bool = False
-    # virtio-net on user networking (implied by `forward`).
+    # virtio-net on user networking (implied by forward or services).
     net: bool = False
     # Guest TCP ports reachable from the host, each on a free host port.
     forward: tuple[int, ...] = ()
     # virtio-9p sharing a folder, `Machine.share_dir` (empty when the
     # artifacts directory is fresh, as scenarios' are).
     share: bool = False
+    # False disables network isolation; requires a network device.
+    restrict: bool = True
+    # Each service implies net. Ports live at SERVICE_ADDRESS, not on the host.
+    services: tuple[tuple[int, Path], ...] = ()
 
     def __post_init__(self) -> None:
         if self.blk_mib is not None and self.blk_image is not None:
@@ -402,6 +482,24 @@ class Devices:
         if len(set(forward)) != len(forward):
             raise ValueError(f"forward={forward!r}: a port is forwarded twice")
         object.__setattr__(self, "forward", forward)
+        try:
+            pairs = tuple(self.services)
+            if any(not isinstance(pair, (tuple, list)) or len(pair) != 2 for pair in pairs):
+                raise ValueError("not pairs")
+            services = tuple(Service(port, Path(path).absolute()) for port, path in pairs)
+        except (TypeError, ValueError) as error:
+            raise ValueError("services: expected (port, path) pairs") from error
+        if any(not (_is_int(port) and 1 <= port <= 65535) for port, _ in services):
+            raise ValueError("services: expected TCP ports (1 to 65535)")
+        if len({port for port, _ in services}) != len(services):
+            raise ValueError("services: a port is forwarded twice")
+        if any("\x00" in str(path) or "\n" in str(path) for _, path in services):
+            raise ValueError("services: socket paths must not contain NUL or newline")
+        if any(len(os.fsencode(path)) >= 104 for _, path in services):
+            raise ValueError("services: Unix socket paths must be shorter than 104 bytes")
+        object.__setattr__(self, "services", services)
+        if not self.restrict and not self.wants_net:
+            raise ValueError("restrict=False disables isolation and requires a network device")
 
     @property
     def wants_blk(self) -> bool:
@@ -409,7 +507,7 @@ class Devices:
 
     @property
     def wants_net(self) -> bool:
-        return self.net or bool(self.forward)
+        return self.net or bool(self.forward) or bool(self.services)
 
     @classmethod
     def every(cls) -> Devices:
@@ -791,6 +889,8 @@ class Machine:
             net_forwards=dict(self.forwards) if d.wants_net else None,
             share_dir=self.share_dir if d.share else None,
             extra=self.extra_args,
+            net_restrict=d.restrict,
+            net_services=d.services,
         )
 
     def _read_loop(self, stream: IO[bytes], log: IO[bytes], keep: bytearray | None) -> None:

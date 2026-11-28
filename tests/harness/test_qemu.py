@@ -4,15 +4,21 @@ and what each run records about its environment."""
 import math
 import os
 import re
+import shlex
+import socket
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Self
 
 import pytest
 from lumen_harness import REPO_ROOT, qemu
 from lumen_harness.__main__ import debug_options, find_gdb, gdb_binary, gdb_command, run_options
+from lumen_harness.netfix import SERVICE_PORTS, NetFixture
 from lumen_harness.qemu import (
     DEFAULT_MEMORY,
     Devices,
@@ -24,6 +30,7 @@ from lumen_harness.qemu import (
     qemu_version,
     timeout_scale,
 )
+from lumen_harness.qmp import QmpClient, QmpError
 from PIL import Image
 from qemu_fakes import fake_qemu, opts
 
@@ -133,8 +140,6 @@ def test_the_screen_size_is_taken_once(tmp_path, monkeypatch):
 
 
 def test_machine_event_failures_show_the_serial_output(tmp_path):
-    from lumen_harness.qmp import QmpError
-
     m = Machine(Path("x.iso"), tmp_path)
     m._buf += b"last words from the guest\n"
 
@@ -672,3 +677,334 @@ def test_rtc_keeps_utc():
     # the host's clock in UTC.
     args = qemu_args(opts())
     assert args[args.index("-rtc") + 1] == "base=utc"
+
+
+@pytest.mark.parametrize("mode", ["net", "forward", "services"])
+def test_net_scenarios_are_restricted(tmp_path, mode):
+    services = ((80, Path("/tmp/http.sock")), (443, Path("/tmp/https.sock")))
+    devices = {
+        "net": Devices(net=True),
+        "forward": Devices(forward=(22,)),
+        "services": Devices(services=services),
+    }[mode]
+    machine = Machine(Path("x.iso"), tmp_path, devices=devices)
+    args = qemu_args(machine.options(Path("v.fd")))
+    net = args[args.index("-netdev") + 1]
+    assert ",restrict=on,ipv6=off" in net
+    if mode == "services":
+        for port, path in services:
+            assert f",guestfwd=tcp:10.0.2.100:{port}-cmd:" in net
+            assert f"--relay {path}" in net
+        assert net.count("guestfwd=") == 2
+    else:
+        assert "guestfwd=" not in net
+    assert "user,id=lumen-net,restrict=on,ipv6=off" in qemu_args(opts(net_forwards={}))
+
+
+def test_service_paths_are_quoted_and_qemu_commas_escaped(tmp_path):
+    path = Path("/tmp/a,b with 'quotes'.sock")
+    machine = Machine(Path("x.iso"), tmp_path, devices=Devices(services=((80, path),)))
+    args = qemu_args(machine.options(Path("v.fd")))
+    net = args[args.index("-netdev") + 1]
+    assert "a,,b" in net
+    command = net.split("-cmd:", 1)[1].replace(",,", ",")
+    argv = shlex.split(command)
+    assert argv[:3] == [sys.executable, "-W", "ignore"]
+    assert argv[-4:] == [
+        "--relay",
+        str(path),
+        "--log",
+        str(path.parent / "relay.log"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "services",
+    [
+        ((0, "/a"),),
+        ((True, "/a"),),
+        ((65536, "/a"),),
+        ((80, "/a"), (80, "/b")),
+        ((80, "/a\nb"),),
+        ((80, "/a\0b"),),
+        ((80, "/" + "a" * 103),),
+        ((80, "/" + "é" * 52),),
+    ],
+)
+def test_service_ports_are_valid_and_unique(services):
+    with pytest.raises(ValueError, match="services"):
+        Devices(services=services)
+
+
+def test_qemu_has_user_networking():
+    # Runs on Ubuntu CI as well as Homebrew; no silent skip for a QEMU
+    # package built without libslirp.
+    qemu.require_user_network()
+
+
+def test_missing_slirp_has_an_actionable_error(tmp_path, monkeypatch):
+    binary = fake_qemu(tmp_path, 'echo "Available netdev backend types: socket"')
+    monkeypatch.setenv("LUMEN_QEMU", str(binary))
+    with pytest.raises(RuntimeError, match=r"user networking \(libslirp\).*qemu-system-x86"):
+        qemu.require_user_network()
+
+
+def _checksum(data):
+    data += bytes(len(data) % 2)
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    while total >> 16:
+        total = (total & 65535) + (total >> 16)
+    return ~total & 65535
+
+
+_SOURCE = socket.inet_aton("10.0.2.15")
+_GUEST_MAC = bytes.fromhex("525400123456")
+_HOST_MAC = bytes.fromhex("52550a000202")
+
+
+def _ip_packet(destination, protocol, payload, ip_source=_SOURCE):
+    header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        20 + len(payload),
+        1,
+        0,
+        64,
+        protocol,
+        0,
+        ip_source,
+        socket.inet_aton(destination),
+    )
+    header = header[:10] + struct.pack("!H", _checksum(header)) + header[12:]
+    return _HOST_MAC + _GUEST_MAC + b"\x08\x00" + header + payload
+
+
+def _tcp(destination, port, seq=100, ack=0, flags=2, payload=b"", source_port=40000):
+    header = struct.pack("!HHIIBBHHH", source_port, port, seq, ack, 5 << 4, flags, 65535, 0, 0)
+    pseudo = (
+        _SOURCE
+        + socket.inet_aton(destination)
+        + struct.pack("!BBH", 0, 6, len(header) + len(payload))
+    )
+    header = header[:16] + struct.pack("!H", _checksum(pseudo + header + payload)) + header[18:]
+    return _ip_packet(destination, 6, header + payload)
+
+
+def _l4_start(frame):
+    return 14 + (frame[14] & 15) * 4
+
+
+def _tcp_payload(frame):
+    start = _l4_start(frame)
+    data_start = start + (frame[start + 12] >> 4) * 4
+    ip_end = 14 + struct.unpack("!H", frame[16:18])[0]
+    return frame[data_start:ip_end]
+
+
+class _Probe:
+    def __init__(self, wire, control):
+        self.wire, self.control = wire, control
+
+    def send(self, frame):
+        self.wire.sendall(struct.pack("!I", len(frame)) + frame)
+
+    def read_exact(self, count):
+        data = b""
+        while len(data) < count:
+            chunk = self.wire.recv(count - len(data))
+            assert chunk, "QEMU closed the Ethernet wire"
+            data += chunk
+        return data
+
+    def receive(self):
+        (size,) = struct.unpack("!I", self.read_exact(4))
+        assert 14 <= size <= 65536
+        return self.read_exact(size)
+
+    def service_reply(self):
+        for _ in range(32):
+            frame = self.receive()
+            assert frame[12:14] == b"\x08\x00"
+            assert frame[23] == 6
+            if frame[26:30] == socket.inet_aton(qemu.SERVICE_ADDRESS):
+                return frame
+            assert frame[26:30] in (socket.inet_aton("1.1.1.1"), socket.inet_aton("10.0.2.2"))
+            assert frame[_l4_start(frame) + 13] & 0x16 == 0x14  # RST|ACK, no SYN
+        pytest.fail("no guestfwd reply among 32 frames")
+
+    def connect(self, port):
+        """Complete the guest's TCP handshake; return the server's next sequence."""
+        self.send(_tcp(qemu.SERVICE_ADDRESS, port))
+        synack = self.service_reply()
+        assert synack[26:30] == socket.inet_aton(qemu.SERVICE_ADDRESS)
+        start = _l4_start(synack)
+        sport, dport, sequence, ack = struct.unpack("!HHII", synack[start : start + 12])
+        assert (sport, dport, ack, synack[start + 13] & 0x12) == (port, 40000, 101, 0x12)
+        self.send(_tcp(qemu.SERVICE_ADDRESS, port, seq=101, ack=sequence + 1, flags=0x10))
+        return sequence + 1
+
+    def arp(self):
+        arp = struct.pack("!HHBBH", 1, 0x800, 6, 4, 1)
+        arp += _GUEST_MAC + _SOURCE + bytes(6) + socket.inet_aton("10.0.2.2")
+        self.send(bytes([255]) * 6 + _GUEST_MAC + b"\x08\x06" + arp)
+        assert self.receive()[12:14] == b"\x08\x06"
+
+
+@contextmanager
+def _slirp_probe(devices):
+    with tempfile.TemporaryDirectory(prefix="lumen-wire-", dir="/tmp") as short:
+        wire, peer = socket.socketpair()
+        with wire, peer:
+            wire.settimeout(60)
+            args = qemu.user_network_probe_args(peer.fileno(), Path(short) / "qmp", devices)
+            proc = subprocess.Popen(
+                args, pass_fds=(peer.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            peer.close()
+            control = None
+            try:
+                control = QmpClient.connect(Path(short) / "qmp", timeout=60)
+                yield _Probe(wire, control)
+            finally:
+                if control:
+                    control.close()
+                proc.kill()
+                _, errors = proc.communicate(timeout=60)
+            # An error in the body propagates past this assertion, preserving
+            # the actual failure instead of masking it with QEMU's stderr.
+            assert errors in (b"", b"qemu-system-x86_64: warning: hub 0 with no nics\n"), (
+                errors.decode(errors="replace")
+            )
+
+
+def test_restricted_slirp_drops_outbound_tcp_and_udp(packages):
+    """UDP is dropped; TCP outside guestfwd is reset.
+
+    Check installed QEMU: Homebrew locally, Ubuntu QEMU 8.2.2 in CI.
+    """
+    # Verified libslirp sources, v4.7.0 and master:
+    # src/udp.c:udp_input (:146-168 in both) handles DHCP/TFTP before dropping
+    # restricted UDP, before allocating/forwarding any DNS proxy socket.
+    # src/tcp_input.c (:403-419 in v4.7.0; :383-399 in master) rejects
+    # destinations outside guestfwd_list with RST under restrict=on.
+    # https://gitlab.freedesktop.org/slirp/libslirp/-/blob/v4.7.0/src/udp.c#L146
+    # https://gitlab.freedesktop.org/slirp/libslirp/-/blob/9741541ae91b1b4aa34288045b7e8e5039c8aa42/src/udp.c#L146
+    # https://gitlab.freedesktop.org/slirp/libslirp/-/blob/v4.7.0/src/tcp_input.c#L403
+    # https://gitlab.freedesktop.org/slirp/libslirp/-/blob/9741541ae91b1b4aa34288045b7e8e5039c8aa42/src/tcp_input.c#L383
+    with NetFixture(**packages) as net, _slirp_probe(Devices(services=net.services)) as probe:
+        probe.arp()
+        # DHCP is the permitted UDP control: a real offer proves that
+        # the rejected DNS probes below are not just malformed IP/UDP.
+        bootp = struct.pack("!BBBBIHH", 1, 1, 6, 0, 0x12345678, 0, 0x8000)
+        bootp += bytes(16) + _GUEST_MAC + bytes(10 + 64 + 128)
+        bootp += bytes.fromhex("638253633501013703010306ff")
+        discover = struct.pack("!HHHH", 68, 67, 8 + len(bootp), 0) + bootp
+        probe.send(_ip_packet("255.255.255.255", 17, discover, bytes(4)))
+        offer = probe.receive()
+        assert offer[23] == 17
+        udp_start = _l4_start(offer)
+        assert struct.unpack("!HH", offer[udp_start : udp_start + 4]) == (67, 68)
+        reply = offer[udp_start + 8 :]
+        assert reply[0] == 2 and reply[4:8] == bytes.fromhex("12345678")
+        assert reply[16:20] == _SOURCE  # default DHCP lease, 10.0.2.15
+        assert reply[236:240] == bytes.fromhex("63825363")
+        assert b"\x35\x01\x02" in reply[240:]  # DHCP OFFER
+
+        probe.send(_tcp("1.1.1.1", 443, source_port=41000))
+        probe.send(_tcp("10.0.2.2", 443, source_port=41001))
+        # UDP DNS to the proxy, plus UDP to an otherwise allowed
+        # guestfwd address. Zero UDP checksum is valid for IPv4.
+        query = bytes.fromhex("123401000001000000000000") + b"\x05lumen\x04test\0\0\1\0\1"
+        udp = struct.pack("!HHHH", 41002, 53, 8 + len(query), 0) + query
+        probe.send(_ip_packet("10.0.2.3", 17, udp))
+        probe.send(_ip_packet(qemu.SERVICE_ADDRESS, 17, udp))
+
+        sequence = probe.connect(SERVICE_PORTS["echo"])
+        message = b"slirp forwarded this connection"
+        probe.send(
+            _tcp(
+                qemu.SERVICE_ADDRESS,
+                SERVICE_PORTS["echo"],
+                seq=101,
+                ack=sequence,
+                flags=0x18,
+                payload=message,
+            )
+        )
+        echoed = b""
+        while len(echoed) < len(message):
+            frame = probe.service_reply()
+            assert frame[23] == 6 and frame[26:30] == socket.inet_aton(qemu.SERVICE_ADDRESS)
+            echoed += _tcp_payload(frame)
+        assert echoed == message
+        table = probe.control.command("human-monitor-command", **{"command-line": "info usernet"})
+        assert "40000" in table  # live guestfwd positive control
+        assert "41000" not in table and "41001" not in table and "41002" not in table
+        assert "1.1.1.1" not in table and "UDP" not in table
+
+
+def test_relay_failure_logs_without_sending_diagnostics_to_guest(packages, tmp_path):
+    artifacts = tmp_path / "artifacts"
+    with NetFixture(**packages, artifacts=artifacts) as net:
+        # A real guestfwd command will fail to connect to this removed name.
+        net.socket("echo").unlink()
+        with _slirp_probe(Devices(services=net.services)) as probe:
+            probe.arp()
+            probe.connect(SERVICE_PORTS["echo"])
+            for _ in range(32):
+                frame = probe.service_reply()
+                assert _tcp_payload(frame) == b"", "relay diagnostics leaked into guest TCP"
+                if frame[_l4_start(frame) + 13] & 0x05:  # FIN or RST
+                    break
+            else:
+                pytest.fail("relay did not close the failed connection")
+        relay_log = net.relay_log.read_text()
+        assert "FileNotFoundError" in relay_log
+        assert re.search(
+            r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \d+ ERROR guestfwd relay failed", relay_log
+        )
+    assert "FileNotFoundError" in (artifacts / "relay.log").read_text()
+    assert (artifacts / "services.log").exists()
+
+
+def test_unrestricted_requires_a_network_device():
+    with pytest.raises(ValueError, match="requires a network device"):
+        Devices(restrict=False)
+    machine = Machine(Path("x.iso"), Path("/tmp"), devices=Devices(net=True, restrict=False))
+    args = qemu_args(machine.options(Path("v.fd")))
+    assert "restrict=off,ipv6=off" in args[args.index("-netdev") + 1]
+
+
+def test_probe_uses_shared_netdev_without_host_forwards():
+    devices = Devices(forward=(22,), services=((80, Path("/tmp/service.sock")),))
+    options = Machine(Path("x.iso"), Path("/tmp"), devices=devices).options(Path("v.fd"))
+    options.net_forwards = {22: 43210}
+    normal = qemu.device_args(options)
+    probe = qemu.user_network_probe_args(5, Path("/tmp/probe.qmp"), devices)
+    normal_net = normal[normal.index("-netdev") + 1]
+    assert ",hostfwd=tcp:127.0.0.1:43210-:22" in normal_net
+    assert probe[probe.index("-netdev") + 1] == normal_net.replace(
+        ",hostfwd=tcp:127.0.0.1:43210-:22", ""
+    )
+    assert "hostfwd" not in probe[probe.index("-netdev") + 1]
+
+
+@pytest.mark.parametrize("path", ["/" + "a" * 102, "/" + "é" * 51])
+def test_service_socket_paths_accept_103_bytes(path):
+    assert len(os.fsencode(path)) == 103
+    devices = Devices(services=((80, path),))
+    assert devices.services[0] == qemu.Service(80, Path(path))
+
+
+@pytest.mark.parametrize("services", [(80,), ((80,),), ((80, "/a", "extra"),), (None,), ("ab",)])
+def test_services_require_port_path_pairs(services):
+    with pytest.raises(ValueError, match=r"services: expected \(port, path\) pairs"):
+        Devices(services=services)
+
+
+def test_qemu_services_require_enabled_networking():
+    services = ((80, Path("/tmp/service.sock")),)
+    with pytest.raises(ValueError, match="net_services requires net_forwards"):
+        opts(net_services=services)
+    assert "guestfwd=tcp:" in qemu._user_netdev(opts(net_forwards={}, net_services=services))

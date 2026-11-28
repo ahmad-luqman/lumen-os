@@ -120,7 +120,7 @@ def test_cpu_model(tmp_path):
 def test_net_forwards_host_ports_on_loopback():
     assert device_args(opts(net_forwards={80: 5555, 22: 5556})) == [
         "-netdev",
-        "user,id=lumen-net,hostfwd=tcp:127.0.0.1:5555-:80,hostfwd=tcp:127.0.0.1:5556-:22",
+        "user,id=lumen-net,hostfwd=tcp:127.0.0.1:5555-:80,hostfwd=tcp:127.0.0.1:5556-:22,restrict=on,ipv6=off",
         "-device", "virtio-net-pci,id=lumen-nic,netdev=lumen-net,romfile=",
     ]  # fmt: skip
 
@@ -200,7 +200,7 @@ def test_devices_come_before_extra_args():
         (
             Devices(net=True),
             [
-                "-netdev", "user,id=lumen-net",
+                "-netdev", "user,id=lumen-net,restrict=on,ipv6=off",
                 "-device", "virtio-net-pci,id=lumen-nic,netdev=lumen-net,romfile=",
             ],
         ),
@@ -227,8 +227,16 @@ def test_every_turns_every_device_on():
     every = Devices.every()
     for f in dataclasses.fields(Devices):
         # blk_image: the alternative to blk_mib, which is on; blk_readonly:
-        # read-only option on blk; rng_rate and rng_no_msix: changes to rng.
-        if f.name in ("blk_image", "blk_readonly", "rng_rate", "rng_no_msix"):
+        # read-only option on blk; rng_rate and rng_no_msix: changes to rng;
+        # restrict/services: networking policy and fixture-specific forwards.
+        if f.name in (
+            "blk_image",
+            "blk_readonly",
+            "rng_rate",
+            "rng_no_msix",
+            "restrict",
+            "services",
+        ):
             continue
         assert getattr(every, f.name) != f.default, f.name
 
