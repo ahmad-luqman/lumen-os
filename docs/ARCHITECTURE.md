@@ -13448,7 +13448,10 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `gvisor-reference.yml` gates on it. The first per-case root run (below)
   re-records it, and may change those counts.
   - **The native reference is measured as D4 runs on Lumen:** one case per
-    process (`--gtest_filter=<case>`), as root. Its report records the
+    process (`--gtest_filter=<case>`), each in a fresh network namespace
+    with `lo` up (as gVisor's runner does, and as a Lumen boot starts
+    clean: without it, TCP pair helpers reuse ports a previous case left
+    in TIME_WAIT), as root. Its report records the
     uid, euid and capability masks, the mode, the zig version and the
     kernel, and `gvisor record` refuses a run that isn't complete,
     per-case and root.
