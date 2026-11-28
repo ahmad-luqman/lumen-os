@@ -32,6 +32,10 @@ impl<T> VfsLock<T> for StdLock<T> {
         self.0.lock().unwrap()
     }
 
+    fn try_lock(&self) -> Option<Self::Guard<'_>> {
+        self.0.try_lock().ok()
+    }
+
     fn get_mut(&mut self) -> &mut T {
         self.0.get_mut().unwrap()
     }
@@ -3701,6 +3705,16 @@ impl<T> VfsLock<T> for TestLock<T> {
         let inner = self.inner.lock().unwrap();
         TEST_LOCK9_HELD.with(|h| h.set(held | (1 << self.level)));
         TestLockGuard { level: self.level, inner }
+    }
+
+    fn try_lock(&self) -> Option<Self::Guard<'_>> {
+        let held = TEST_LOCK9_HELD.with(core::cell::Cell::get);
+        if held >> self.level != 0 {
+            return None;
+        }
+        let inner = self.inner.try_lock().ok()?;
+        TEST_LOCK9_HELD.with(|h| h.set(held | (1 << self.level)));
+        Some(TestLockGuard { level: self.level, inner })
     }
 
     fn get_mut(&mut self) -> &mut T {

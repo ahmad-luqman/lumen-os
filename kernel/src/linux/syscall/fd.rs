@@ -231,6 +231,7 @@ fn read_to_user(anon: &AnonObj, user_buf: u64, count: u64, nonblock: bool) -> Re
     }
     let bytes = anon.read_u64(nonblock)?.to_ne_bytes();
     match anon {
+        AnonObj::Epoll(_) => Err(errno::EINVAL),
         AnonObj::EventFd(_) => {
             copy_to_user(user_buf, &bytes).map_err(|_| errno::EFAULT)?;
             Ok(lumen_eventfd::IO_SIZE as u64)
@@ -280,8 +281,8 @@ fn write(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     if let Some(anon) = file.anon() {
         return match anon {
             AnonObj::EventFd(ev) => ev.write(buf.addr(), count, file.is_nonblock()),
-            // Linux v6.12 `fs/timerfd.c`: `timerfd_fops` has no write handler (`-EINVAL`).
-            AnonObj::TimerFd(_) => Err(errno::EINVAL),
+            // Linux v6.12: neither eventpoll_fops nor timerfd_fops has a write handler.
+            AnonObj::Epoll(_) | AnonObj::TimerFd(_) => Err(errno::EINVAL),
         };
     }
     if let Some(tty) = file.tty() {
@@ -388,6 +389,11 @@ fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     let _pos = file.lock_pos();
     file.require_readable().map_err(vfs)?;
+    // Like Linux v6.12 vfs_readv's FMODE_CAN_READ check, reject epoll
+    // before importing iovecs, including empty or faulting vectors.
+    if matches!(file.anon(), Some(AnonObj::Epoll(_))) {
+        return Err(errno::EINVAL);
+    }
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
     if let Some(sock) = file.sock() {
         return super::socket::readv_sock(&**sock, &iovs, file.is_nonblock());
@@ -431,6 +437,7 @@ fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
                 }
             }
             AnonObj::TimerFd(_) => partial(copied, errno::EFAULT),
+            AnonObj::Epoll(_) => Err(errno::EINVAL),
         };
     }
     if let Some(pipe) = file.pipe() {
@@ -505,7 +512,7 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     file.require_writable().map_err(vfs)?;
     // Linux v6.12 `fs/read_write.c` `vfs_writev` checks `FMODE_CAN_WRITE`
     // (`-EINVAL`) before `import_iovec`, so a non-writable anon file such as
-    // `timerfd` (`timerfd_fops` has no write handler) returns `-EINVAL` even
+    // epoll or timerfd (no write handler) returns `-EINVAL` even
     // for a faulting `iov` pointer.
     if file.anon().is_some_and(|anon| !anon.can_write()) {
         return Err(errno::EINVAL);
@@ -544,7 +551,7 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
                 }
                 Ok(total as u64)
             }
-            AnonObj::TimerFd(_) => Err(errno::EINVAL),
+            AnonObj::Epoll(_) | AnonObj::TimerFd(_) => Err(errno::EINVAL),
         };
     }
     if let Some(pipe) = file.pipe() {

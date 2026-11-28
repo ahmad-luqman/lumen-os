@@ -1,8 +1,8 @@
 //! `m9_io`: M9's ring-3 checks of `epoll`, `eventfd` and `timerfd`
 //! (`tests/scenarios/test_linux_io.py`; ARCHITECTURE section 15, "M9's tests").
 //!
-//! B0 (#471) built the skeleton; B6 (#477) adds the `evfd` mode; B5 and C8 add
-//! their epoll modes and checks.
+//! B5 (#476) supplies `epoll`, `epoll-pwait-blocked` and `send-sig`;
+//! B6 (#477) supplies `evfd`, including signal interruption and POLLOUT wakes.
 
 #![no_std]
 #![no_main]
@@ -18,15 +18,22 @@ use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use common::*;
 
-const USAGE: &str = "usage: m9_io <evfd>";
+const USAGE: &str = "usage: m9_io <evfd|epoll|epoll-pwait-blocked|send-sig>";
 
 const SYS_RT_SIGACTION: u64 = 13;
+const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_READV: u64 = 19;
+const SYS_WRITEV: u64 = 20;
+const SYS_DUP: u64 = 32;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_GETPID: u64 = 39;
 const SYS_FORK: u64 = 57;
 const SYS_WAIT4: u64 = 61;
 const SYS_KILL: u64 = 62;
 const SYS_FCNTL: u64 = 72;
+const SYS_RT_SIGPENDING: u64 = 127;
+const SYS_OPENAT: u64 = 257;
+const SYS_UNLINKAT: u64 = 263;
 const SYS_READLINKAT: u64 = 267;
 
 const AT_FDCWD: u64 = (-100i64) as u64;
@@ -35,37 +42,54 @@ const CLOCK_MONOTONIC: u64 = 1;
 const CLOCK_BOOTTIME: u64 = 7;
 const CLOCK_REALTIME_ALARM: u64 = 8;
 const CLOCK_BOOTTIME_ALARM: u64 = 9;
-
 const EFD_SEMAPHORE: u64 = 0x1;
 const EFD_NONBLOCK: u64 = 0x800;
 const EFD_CLOEXEC: u64 = 0x8_0000;
 const MAX_COUNTER: u64 = u64::MAX - 1;
-
 const TFD_NONBLOCK: u64 = 0x800;
 const TFD_CLOEXEC: u64 = 0x8_0000;
 const TFD_TIMER_ABSTIME: u64 = 0x1;
 const TFD_TIMER_CANCEL_ON_SET: u64 = 0x2;
-
 const F_GETFD: u64 = 1;
 const F_SETFL: u64 = 4;
 const FD_CLOEXEC: i64 = 1;
 const O_NONBLOCK: u64 = 0o4000;
 const O_CLOEXEC: u64 = 0o2000000;
-
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
 const POLL_INF: u64 = (-1i64) as u64;
-
 const SIGUSR1: u64 = 10;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 const SA_RESTORER: u64 = 0x0400_0000;
 const SA_RESTART: u64 = 0x1000_0000;
-
 const S_IFMT: u32 = 0o170_000;
-
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
+const ENOENT: i64 = -2;
+const EEXIST: i64 = -17;
+const O_RDWR: u64 = 2;
+const O_CREAT: u64 = 0o100;
+const O_TRUNC: u64 = 0o1000;
+const O_PATH: u64 = 0o10000000;
+const EPOLLIN: u32 = 0x0001;
+const EPOLLWAKEUP: u32 = 1 << 29;
+const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLLET: u32 = 1 << 31;
+const EPOLLEXCLUSIVE: u32 = 1 << 28;
+const EPOLL_CLOEXEC: u64 = 0o2_000_000;
+const EPOLL_CTL_ADD: u64 = 1;
+const EPOLL_CTL_DEL: u64 = 2;
+const EPOLL_CTL_MOD: u64 = 3;
+const SIG_SETMASK: u64 = 2;
+const TEMP_MASK: u64 = 1 << (12 - 1); // SIGUSR2, distinct from the caller's mask.
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct EpollEvent {
+    events: u32,
+    data: u64,
+}
 
 // `SA_RESTORER` trampoline invoking `rt_sigreturn` (nr 15) on x86-64.
 global_asm!(".global m9_io_sigreturn", "m9_io_sigreturn:", "mov eax, 15", "syscall", "ud2");
@@ -76,10 +100,13 @@ unsafe extern "C" {
     fn m9_io_sigreturn();
 }
 
+static USR1_MASK: AtomicU64 = AtomicU64::new(0);
+
 static SIG_HITS: AtomicU64 = AtomicU64::new(0);
 static SIG_ACK_FD: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn usr1_handler(_sig: c_int) {
+    USR1_MASK.store(get_sigmask().unwrap_or(u64::MAX), Ordering::SeqCst);
     SIG_HITS.fetch_add(1, Ordering::SeqCst);
     let fd = SIG_ACK_FD.load(Ordering::Acquire);
     if fd >= 0 {
@@ -89,7 +116,7 @@ extern "C" fn usr1_handler(_sig: c_int) {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct PollFd {
     fd: i32,
     events: i16,
@@ -602,6 +629,443 @@ fn check_signal_interruption() -> R {
     set_usr1_action(SIG_DFL, 0)
 }
 
+fn make_pipe() -> Result<(i32, i32), Fail> {
+    let mut fds = [0i32; 2];
+    eq("pipe2", sys(SYS_PIPE2, [fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
+    Ok((fds[0], fds[1]))
+}
+
+fn ep_create1(flags: u64) -> Result<i32, Fail> {
+    Ok(ok("epoll_create1", sys(SYS_EPOLL_CREATE1, [flags, 0, 0, 0, 0, 0]))? as i32)
+}
+
+fn ep_ctl(epfd: i32, op: u64, fd: i32, ev: Option<&EpollEvent>) -> i64 {
+    let ptr = ev.map_or(0, |e| e as *const EpollEvent as u64);
+    sys(SYS_EPOLL_CTL, [epfd as u64, op, fd as u64, ptr, 0, 0])
+}
+
+fn ep_wait(epfd: i32, out: &mut [EpollEvent], timeout_ms: i32) -> i64 {
+    sys(SYS_EPOLL_WAIT, [epfd as u64, out.as_mut_ptr() as u64, out.len() as u64, timeout_ms as u32 as u64, 0, 0])
+}
+
+fn write_all(fd: i32, data: &[u8]) -> R {
+    eq("write", sys(SYS_WRITE, [fd as u64, data.as_ptr() as u64, data.len() as u64, 0, 0, 0]), data.len() as i64)
+}
+
+fn read_n(fd: i32, buf: &mut [u8]) -> R {
+    eq("read", sys(SYS_READ, [fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0]), buf.len() as i64)
+}
+
+fn set_sigmask(mask: u64) -> R {
+    eq("rt_sigprocmask set", sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, &mask as *const _ as u64, 0, 8, 0, 0]), 0)
+}
+
+fn get_sigmask() -> Result<u64, Fail> {
+    let mut got = 0u64;
+    eq("rt_sigprocmask get", sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, 0, &mut got as *mut _ as u64, 8, 0, 0]), 0)?;
+    Ok(got)
+}
+
+fn check_lt_et_and_oneshot() -> R {
+    let ep = ep_create1(0)?;
+    let (r, w) = make_pipe()?;
+    let mut evs = [EpollEvent::default(); 4];
+    let mut buf = [0u8; 4];
+
+    // Level-triggered: reports repeatedly while unread data remains, stops once drained.
+    let lt = EpollEvent { events: EPOLLIN | EPOLLWAKEUP, data: 0x101 };
+    eq("add LT", ep_ctl(ep, EPOLL_CTL_ADD, r, Some(&lt)), 0)?;
+    eq("LT empty", ep_wait(ep, &mut evs, 0), 0)?;
+
+    write_all(w, b"ab")?;
+    eq("LT ready 1", ep_wait(ep, &mut evs, 0), 1)?;
+    eq("LT events 1", { evs[0].events } as i64, EPOLLIN as i64)?;
+    eq("LT data 1", { evs[0].data } as i64, 0x101)?;
+
+    // Partial read leaves 1 byte: LT must keep reporting.
+    read_n(r, &mut buf[..1])?;
+    eq("LT ready 2 after partial read", ep_wait(ep, &mut evs, 0), 1)?;
+    eq("LT events 2", { evs[0].events } as i64, EPOLLIN as i64)?;
+
+    // Drain remaining byte: LT stops reporting.
+    read_n(r, &mut buf[..1])?;
+    eq("LT drained", ep_wait(ep, &mut evs, 0), 0)?;
+
+    // Edge-triggered: reports once per new write even while unread bytes remain.
+    let et = EpollEvent { events: EPOLLIN | EPOLLET, data: 0x202 };
+    eq("mod ET", ep_ctl(ep, EPOLL_CTL_MOD, r, Some(&et)), 0)?;
+    eq("ET empty", ep_wait(ep, &mut evs, 0), 0)?;
+
+    write_all(w, b"xy")?;
+    eq("ET first report", ep_wait(ep, &mut evs, 0), 1)?;
+    eq("ET data", { evs[0].data } as i64, 0x202)?;
+    eq("ET quiet without new write", ep_wait(ep, &mut evs, 0), 0)?;
+
+    // A new write produces a fresh edge even though "xy" was not drained.
+    write_all(w, b"z")?;
+    eq("ET second edge", ep_wait(ep, &mut evs, 0), 1)?;
+    eq("ET quiet again", ep_wait(ep, &mut evs, 0), 0)?;
+    read_n(r, &mut buf[..3])?;
+
+    // One-shot: reports once, stays disarmed across new writes until MOD.
+    let os = EpollEvent { events: EPOLLIN | EPOLLONESHOT, data: 0x303 };
+    eq("mod ONESHOT", ep_ctl(ep, EPOLL_CTL_MOD, r, Some(&os)), 0)?;
+    write_all(w, b"1")?;
+    eq("ONESHOT first report", ep_wait(ep, &mut evs, 0), 1)?;
+    eq("ONESHOT data", { evs[0].data } as i64, 0x303)?;
+    eq("ONESHOT disarmed", ep_wait(ep, &mut evs, 0), 0)?;
+
+    // Even a fresh write does NOT re-arm a disarmed ONESHOT interest.
+    write_all(w, b"2")?;
+    eq("ONESHOT stays disarmed after write", ep_wait(ep, &mut evs, 0), 0)?;
+
+    // Re-arming with MOD immediately surfaces the pending readable pipe.
+    let os2 = EpollEvent { events: EPOLLIN | EPOLLONESHOT, data: 0x304 };
+    eq("rearm ONESHOT", ep_ctl(ep, EPOLL_CTL_MOD, r, Some(&os2)), 0)?;
+    eq("ONESHOT rearmed report", ep_wait(ep, &mut evs, 0), 1)?;
+    eq("ONESHOT rearmed data", { evs[0].data } as i64, 0x304)?;
+    read_n(r, &mut buf[..2])?;
+
+    close(r)?;
+    close(w)?;
+    close(ep)
+}
+
+fn check_epoll_ctl_errors_and_exclusive() -> R {
+    eq("epoll_create(0) EINVAL", sys(SYS_EPOLL_CREATE, [0; 6]), EINVAL)?;
+    eq("epoll_create(-1) EINVAL", sys(SYS_EPOLL_CREATE, [(-1i32) as u32 as u64, 0, 0, 0, 0, 0]), EINVAL)?;
+    let ep_old = ok("epoll_create(1)", sys(SYS_EPOLL_CREATE, [1, 0, 0, 0, 0, 0]))? as i32;
+    close(ep_old)?;
+
+    eq("epoll_create1 bad flags", sys(SYS_EPOLL_CREATE1, [1, 0, 0, 0, 0, 0]), EINVAL)?;
+    let ep = ep_create1(EPOLL_CLOEXEC)?;
+    // Linux v6.12 fs/eventpoll.c:1067-1076: no read or write handler.
+    // The merged anonymous-object I/O paths must reject epoll, including
+    // empty transfers and faulting iovec pointers (before importing them).
+    let mut io_buf = [0u8; 8];
+    for syscall in [SYS_READ, SYS_WRITE] {
+        for len in [0, 8] {
+            eq("epoll scalar I/O EINVAL", sys(syscall, [ep as u64, io_buf.as_mut_ptr() as u64, len, 0, 0, 0]), EINVAL)?;
+        }
+    }
+    for syscall in [SYS_READV, SYS_WRITEV] {
+        let iov = [io_buf.as_mut_ptr() as u64, io_buf.len() as u64];
+        eq("epoll vector I/O EINVAL", sys(syscall, [ep as u64, iov.as_ptr() as u64, 1, 0, 0, 0]), EINVAL)?;
+        eq("epoll empty vector EINVAL", sys(syscall, [ep as u64, 0, 0, 0, 0, 0]), EINVAL)?;
+        eq("epoll bad vector EINVAL", sys(syscall, [ep as u64, 1, 1, 0, 0, 0]), EINVAL)?;
+    }
+    eq("EPOLL_CLOEXEC set", sys(SYS_FCNTL, [ep as u64, F_GETFD, 0, 0, 0, 0]), FD_CLOEXEC)?;
+    let ep_dup = ok("dup(ep)", sys(SYS_DUP, [ep as u64, 0, 0, 0, 0, 0]))? as i32;
+
+    let (r, w) = make_pipe()?;
+    let reg_path = b"/tmp/m9-epoll-reg\0";
+    let reg = ok(
+        "open regular file",
+        sys(SYS_OPENAT, [AT_FDCWD, reg_path.as_ptr() as u64, O_RDWR | O_CREAT | O_TRUNC, 0o644, 0, 0]),
+    )? as i32;
+    let null_fd =
+        ok("open /dev/null", sys(SYS_OPENAT, [AT_FDCWD, b"/dev/null\0".as_ptr() as u64, O_RDWR, 0, 0, 0]))? as i32;
+    let opath = ok("open O_PATH", sys(SYS_OPENAT, [AT_FDCWD, b"/tmp\0".as_ptr() as u64, O_PATH, 0, 0, 0]))? as i32;
+
+    let ev = EpollEvent { events: EPOLLIN, data: 1 };
+
+    // Linux error order: -EPERM for non-pollable target even when epfd is not an epoll.
+    eq("reg on reg EPERM", ep_ctl(reg, EPOLL_CTL_ADD, reg, Some(&ev)), EPERM)?;
+    eq("reg on ep EPERM", ep_ctl(ep, EPOLL_CTL_ADD, reg, Some(&ev)), EPERM)?;
+    eq("/dev/null EPERM", ep_ctl(ep, EPOLL_CTL_ADD, null_fd, Some(&ev)), EPERM)?;
+    eq("closed fd EBADF", ep_ctl(ep, EPOLL_CTL_ADD, 999, Some(&ev)), EBADF)?;
+    eq("O_PATH fd EBADF", ep_ctl(ep, EPOLL_CTL_ADD, opath, Some(&ev)), EBADF)?;
+    eq("O_PATH epfd EBADF", ep_ctl(opath, EPOLL_CTL_ADD, r, Some(&ev)), EBADF)?;
+    eq("self add EINVAL", ep_ctl(ep, EPOLL_CTL_ADD, ep, Some(&ev)), EINVAL)?;
+    eq("dup(epfd) add EINVAL", ep_ctl(ep, EPOLL_CTL_ADD, ep_dup, Some(&ev)), EINVAL)?;
+    eq("non-epoll epfd EINVAL", ep_ctl(r, EPOLL_CTL_ADD, w, Some(&ev)), EINVAL)?;
+
+    // EPOLLEXCLUSIVE rules.
+    let ep2 = ep_create1(0)?;
+    let excl = EpollEvent { events: EPOLLIN | EPOLLEXCLUSIVE, data: 7 };
+    eq("EPOLLEXCLUSIVE on epoll target EINVAL", ep_ctl(ep, EPOLL_CTL_ADD, ep2, Some(&excl)), EINVAL)?;
+    let excl_os = EpollEvent { events: EPOLLIN | EPOLLEXCLUSIVE | EPOLLONESHOT, data: 7 };
+    eq("EPOLLEXCLUSIVE | EPOLLONESHOT EINVAL", ep_ctl(ep, EPOLL_CTL_ADD, r, Some(&excl_os)), EINVAL)?;
+    eq("EPOLLEXCLUSIVE ADD accepted", ep_ctl(ep, EPOLL_CTL_ADD, r, Some(&excl)), 0)?;
+    eq("EPOLLEXCLUSIVE dup ADD EEXIST", ep_ctl(ep, EPOLL_CTL_ADD, r, Some(&excl)), EEXIST)?;
+    eq("EPOLLEXCLUSIVE MOD with flag EINVAL", ep_ctl(ep, EPOLL_CTL_MOD, r, Some(&excl)), EINVAL)?;
+    eq("EPOLLEXCLUSIVE MOD existing EINVAL", ep_ctl(ep, EPOLL_CTL_MOD, r, Some(&ev)), EINVAL)?;
+    eq("EPOLLEXCLUSIVE DEL", ep_ctl(ep, EPOLL_CTL_DEL, r, None), 0)?;
+    eq("DEL absent ENOENT", ep_ctl(ep, EPOLL_CTL_DEL, r, None), ENOENT)?;
+    eq("MOD absent ENOENT", ep_ctl(ep, EPOLL_CTL_MOD, r, Some(&ev)), ENOENT)?;
+
+    for fd in [ep2, ep_dup, ep, r, w, reg, null_fd, opath] {
+        close(fd)?;
+    }
+    eq("unlink reg", sys(SYS_UNLINKAT, [AT_FDCWD, reg_path.as_ptr() as u64, 0, 0, 0, 0]), 0)
+}
+
+fn check_dup_fork_and_proc_fd() -> R {
+    let ep = ep_create1(0)?;
+
+    check_proc_fd_link(ep, b"anon_inode:[eventpoll]")?;
+
+    // Closing one dup keeps the interest; closing the last removes it.
+    let (r1, w) = make_pipe()?;
+    let r2 = ok("dup(r1)", sys(SYS_DUP, [r1 as u64, 0, 0, 0, 0, 0]))? as i32;
+    let ev = EpollEvent { events: EPOLLIN, data: 0xDEAD_BEEF };
+    eq("add r1", ep_ctl(ep, EPOLL_CTL_ADD, r1, Some(&ev)), 0)?;
+    close(r1)?;
+    eq("DEL closed r1 EBADF", ep_ctl(ep, EPOLL_CTL_DEL, r1, None), EBADF)?;
+
+    write_all(w, b"d")?;
+    let mut out = [EpollEvent::default(); 2];
+    eq("dup survives close(r1)", ep_wait(ep, &mut out, 0), 1)?;
+    eq("dup reports old data", { out[0].data } as i64, 0xDEAD_BEEF)?;
+    close(r2)?;
+    eq("last close removes interest", ep_wait(ep, &mut out, 0), 0)?;
+    close(w)?;
+
+    // `fork` shares the epoll description: child sees event on shared epoll
+    // and its DEL is visible to the parent.
+    let (fr, fw) = make_pipe()?;
+    let fev = EpollEvent { events: EPOLLIN, data: 0xF00D };
+    eq("add fork pipe", ep_ctl(ep, EPOLL_CTL_ADD, fr, Some(&fev)), 0)?;
+
+    let child = ok("fork", sys(SYS_FORK, [0; 6]))?;
+    if child == 0 {
+        let mut cev = [EpollEvent::default(); 2];
+        let n = ep_wait(ep, &mut cev, -1);
+        if n != 1 || { cev[0].data } != 0xF00D {
+            exit_group(11);
+        }
+        let mut b = [0u8; 1];
+        if sys(SYS_READ, [fr as u64, b.as_mut_ptr() as u64, 1, 0, 0, 0]) != 1 || b[0] != b'k' {
+            exit_group(12);
+        }
+        if ep_ctl(ep, EPOLL_CTL_DEL, fr, None) != 0 {
+            exit_group(13);
+        }
+        exit_group(0);
+    }
+
+    // The scenario observes this child blocked in ps before releasing the
+    // parent with a line of input. No timeout can hide a lost notification.
+    say!("epoll-wake: pid={child} fork-ready");
+    read_n(0, &mut [0u8; 2])?;
+    write_all(fw, b"k")?;
+    wait_child(child)?;
+    // Child deleted `fr` from the shared epoll set, so another write must not appear.
+    write_all(fw, b"m")?;
+    eq("shared epoll reflects child DEL", ep_wait(ep, &mut out, 0), 0)?;
+
+    close(fr)?;
+    close(fw)?;
+    close(ep)
+}
+
+fn check_nested_epoll_and_poll() -> R {
+    // 5-instance chain: c[0] -> c[1] -> c[2] -> c[3] -> c[4] (4 nesting edges) accepted.
+    let mut c = [0i32; 7];
+    for slot in &mut c {
+        *slot = ep_create1(0)?;
+    }
+    let ev = EpollEvent { events: EPOLLIN, data: 0x55 };
+    for i in 0..4 {
+        eq("nest chain edge", ep_ctl(c[i], EPOLL_CTL_ADD, c[i + 1], Some(&ev)), 0)?;
+    }
+    // 6th instance downward (`c[4] -> c[5]`) and upward (`c[6] -> c[0]`) -> -ELOOP.
+    eq("6th nest downward ELOOP", ep_ctl(c[4], EPOLL_CTL_ADD, c[5], Some(&ev)), ELOOP)?;
+    eq("6th nest upward ELOOP", ep_ctl(c[6], EPOLL_CTL_ADD, c[0], Some(&ev)), ELOOP)?;
+    // Direct and transitive cycles -> -ELOOP.
+    eq("direct cycle ELOOP", ep_ctl(c[1], EPOLL_CTL_ADD, c[0], Some(&ev)), ELOOP)?;
+    eq("deep cycle ELOOP", ep_ctl(c[4], EPOLL_CTL_ADD, c[0], Some(&ev)), ELOOP)?;
+
+    // Readiness propagates through the entire 5-instance chain and wakes `poll(epfd)`.
+    let (r, w) = make_pipe()?;
+    let pev = EpollEvent { events: EPOLLIN, data: 0x99 };
+    eq("add pipe to leaf epoll", ep_ctl(c[4], EPOLL_CTL_ADD, r, Some(&pev)), 0)?;
+    let mut out = [EpollEvent::default(); 2];
+    eq("root epoll empty", ep_wait(c[0], &mut out, 0), 0)?;
+
+    let mut pfd = [PollFd { fd: c[0], events: POLLIN, revents: 0 }];
+    eq("poll empty epfd", sys(SYS_POLL, [pfd.as_mut_ptr() as u64, 1, 0, 0, 0, 0]), 0)?;
+
+    // The child waits for the scenario to confirm the parent blocked in
+    // poll(c[0], -1), then writes once. No timeout supplies a final recheck.
+    let me = ok("getpid", sys(SYS_GETPID, [0; 6]))?;
+    let child = ok("fork nested writer", sys(SYS_FORK, [0; 6]))?;
+    if child == 0 {
+        if read_n(0, &mut [0u8; 2]).is_err() || write_all(w, b"n").is_err() {
+            exit_group(14);
+        }
+        exit_group(0);
+    }
+    say!("epoll-wake: pid={me} nested-ready");
+    eq("poll wakes on nested epfd", sys(SYS_POLL, [pfd.as_mut_ptr() as u64, 1, u64::MAX, 0, 0, 0]), 1)?;
+    ensure("poll revents POLLIN", (pfd[0].revents & POLLIN) != 0, i64::from(pfd[0].revents))?;
+    eq("root epoll reports inner", ep_wait(c[0], &mut out, 0), 1)?;
+    eq("root epoll data", { out[0].data } as i64, 0x55)?;
+    eq("leaf epoll reports pipe", ep_wait(c[4], &mut out, 0), 1)?;
+    eq("leaf epoll data", { out[0].data } as i64, 0x99)?;
+
+    wait_child(child)?;
+
+    let mut b = [0u8; 1];
+    read_n(r, &mut b)?;
+    eq("root epoll drained", ep_wait(c[0], &mut out, 0), 0)?;
+
+    close(r)?;
+    close(w)?;
+    for fd in c {
+        close(fd)?;
+    }
+    Ok(())
+}
+
+fn check_timeouts_and_pwait_pending() -> R {
+    let ep = ep_create1(0)?;
+    let (r, w) = make_pipe()?;
+    let ev = EpollEvent { events: EPOLLIN, data: 1 };
+    eq("add timeout pipe", ep_ctl(ep, EPOLL_CTL_ADD, r, Some(&ev)), 0)?;
+    let mut out = [EpollEvent::default(); 2];
+
+    // Busy-host rule: floors only, never ceilings.
+    let t0 = clock_ns(CLOCK_MONOTONIC)?;
+    eq("epoll_wait 50ms timeout", ep_wait(ep, &mut out, 50), 0)?;
+    let elapsed = clock_ns(CLOCK_MONOTONIC)? - t0;
+    ensure("epoll_wait elapsed >= 50ms", elapsed >= 50 * NS_PER_MS, elapsed as i64)?;
+
+    let ts = Timespec { tv_sec: 0, tv_nsec: (50 * NS_PER_MS) as i64 };
+    let t0 = clock_ns(CLOCK_MONOTONIC)?;
+    eq(
+        "epoll_pwait2 50ms timeout",
+        sys(SYS_EPOLL_PWAIT2, [ep as u64, out.as_mut_ptr() as u64, out.len() as u64, &ts as *const _ as u64, 0, 8]),
+        0,
+    )?;
+    let elapsed2 = clock_ns(CLOCK_MONOTONIC)? - t0;
+    ensure("epoll_pwait2 elapsed >= 50ms", elapsed2 >= 50 * NS_PER_MS, elapsed2 as i64)?;
+
+    // Invalid `epoll_pwait2` timespec and `epoll_pwait` sigsetsize.
+    let bad_ts = Timespec { tv_sec: 0, tv_nsec: NS_PER_SEC as i64 };
+    eq(
+        "epoll_pwait2 bad tv_nsec EINVAL",
+        sys(SYS_EPOLL_PWAIT2, [ep as u64, out.as_mut_ptr() as u64, 1, &bad_ts as *const _ as u64, 0, 8]),
+        EINVAL,
+    )?;
+    let neg_ts = Timespec { tv_sec: -1, tv_nsec: 0 };
+    eq(
+        "epoll_pwait2 neg tv_sec EINVAL",
+        sys(SYS_EPOLL_PWAIT2, [ep as u64, out.as_mut_ptr() as u64, 1, &neg_ts as *const _ as u64, 0, 8]),
+        EINVAL,
+    )?;
+    let empty_mask = 0u64;
+    eq(
+        "epoll_pwait bad sigsetsize EINVAL",
+        sys(SYS_EPOLL_PWAIT, [ep as u64, out.as_mut_ptr() as u64, 1, 0, &empty_mask as *const _ as u64, 4]),
+        EINVAL,
+    )?;
+
+    // `epoll_pwait` mask rule (pending before call): block SIGUSR1, raise it
+    // so it is pending while blocked, confirm handler did not run, then call
+    // `epoll_pwait` with a mask that unblocks SIGUSR1. Even with SA_RESTART,
+    // `epoll_pwait` returns -EINTR immediately, delivers the handler, and
+    // restores the original blocked mask.
+    SIG_HITS.store(0, Ordering::SeqCst);
+    set_usr1_action(usr1_handler as *const () as u64, SA_RESTORER | SA_RESTART)?;
+    let usr1_bit = 1u64 << (SIGUSR1 - 1);
+    set_sigmask(usr1_bit)?;
+    let me = ok("getpid", sys(SYS_GETPID, [0; 6]))?;
+    eq("kill(self, SIGUSR1)", sys(SYS_KILL, [me as u64, SIGUSR1, 0, 0, 0, 0]), 0)?;
+    let mut pend = 0u64;
+    eq("rt_sigpending", sys(SYS_RT_SIGPENDING, [&mut pend as *mut _ as u64, 8, 0, 0, 0, 0]), 0)?;
+    ensure("SIGUSR1 pending while blocked", (pend & usr1_bit) != 0, pend as i64)?;
+    eq("handler not yet run", SIG_HITS.load(Ordering::SeqCst) as i64, 0)?;
+
+    eq(
+        "epoll_pwait pending signal EINTR",
+        sys(SYS_EPOLL_PWAIT, [ep as u64, out.as_mut_ptr() as u64, 1, u64::MAX, &TEMP_MASK as *const _ as u64, 8]),
+        EINTR,
+    )?;
+    eq("handler ran once", SIG_HITS.load(Ordering::SeqCst) as i64, 1)?;
+    eq("sigmask restored", get_sigmask()? as i64, usr1_bit as i64)?;
+
+    set_sigmask(0)?;
+    close(r)?;
+    close(w)?;
+    close(ep)
+}
+
+fn check_pwait_restores_mask_on_success() -> R {
+    let ep = ep_create1(0)?;
+    let (r, w) = make_pipe()?;
+    eq("add mask pipe", ep_ctl(ep, EPOLL_CTL_ADD, r, Some(&EpollEvent { events: EPOLLIN, data: 7 })), 0)?;
+    let original = 1 << (SIGUSR1 - 1);
+    set_sigmask(original)?;
+    let mut out = [EpollEvent::default(); 1];
+    let zero = Timespec::default();
+    for ready in [false, true] {
+        if ready {
+            write_all(w, b"r")?;
+        }
+        for syscall in [SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2] {
+            let timeout = if syscall == SYS_EPOLL_PWAIT { 0 } else { &zero as *const _ as u64 };
+            // The second masked call also detects a leaked saved-mask slot.
+            for _ in 0..2 {
+                eq(
+                    "masked normal return",
+                    sys(syscall, [ep as u64, out.as_mut_ptr() as u64, 1, timeout, &TEMP_MASK as *const _ as u64, 8]),
+                    i64::from(ready),
+                )?;
+                eq("normal return restored original mask", get_sigmask()? as i64, original as i64)?;
+            }
+        }
+    }
+    set_sigmask(0)?;
+    close(r)?;
+    close(w)?;
+    close(ep)
+}
+
+fn run_pwait_blocked() -> R {
+    let ep = ep_create1(0)?;
+    let (r, w) = make_pipe()?;
+    let ev = EpollEvent { events: EPOLLIN, data: 1 };
+    eq("add blocked pipe", ep_ctl(ep, EPOLL_CTL_ADD, r, Some(&ev)), 0)?;
+
+    SIG_HITS.store(0, Ordering::SeqCst);
+    set_usr1_action(usr1_handler as *const () as u64, SA_RESTORER | SA_RESTART)?;
+    let usr1_bit = 1u64 << (SIGUSR1 - 1);
+    set_sigmask(usr1_bit)?;
+
+    let pid = ok("getpid", sys(SYS_GETPID, [0; 6]))?;
+    say!("epoll-pwait: pid={pid} ready");
+
+    let mut out = [EpollEvent::default(); 2];
+    let ret = sys(
+        SYS_EPOLL_PWAIT,
+        [ep as u64, out.as_mut_ptr() as u64, out.len() as u64, (-1i32) as u32 as u64, &TEMP_MASK as *const _ as u64, 8],
+    );
+    eq("epoll_pwait blocked EINTR", ret, EINTR)?;
+    ensure("handler ran", SIG_HITS.load(Ordering::SeqCst) >= 1, SIG_HITS.load(Ordering::SeqCst) as i64)?;
+    eq("handler ran under temporary mask", USR1_MASK.load(Ordering::SeqCst) as i64, (TEMP_MASK | usr1_bit) as i64)?;
+    eq("sigmask restored after blocked EINTR", get_sigmask()? as i64, usr1_bit as i64)?;
+
+    set_sigmask(0)?;
+    close(r)?;
+    close(w)?;
+    close(ep)
+}
+
+fn parse_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut val = 0u64;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+    }
+    Some(val)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     // SAFETY: the C runtime passes `argc` NUL-terminated strings in `argv`.
@@ -619,6 +1083,22 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
             ("timerfd_realtime_abstime_and_poll", &check_timerfd_realtime_abstime_and_poll),
             ("signal_interruption", &check_signal_interruption),
         ]),
+        b"epoll" => run_checks(&[
+            ("lt_et_and_oneshot", &check_lt_et_and_oneshot),
+            ("epoll_ctl_errors_and_exclusive", &check_epoll_ctl_errors_and_exclusive),
+            ("dup_fork_and_proc_fd", &check_dup_fork_and_proc_fd),
+            ("nested_epoll_and_poll", &check_nested_epoll_and_poll),
+            ("timeouts_and_pwait_pending", &check_timeouts_and_pwait_pending),
+            ("pwait_restores_mask_on_success", &check_pwait_restores_mask_on_success),
+        ]),
+        b"epoll-pwait-blocked" => run_checks(&[("epoll_pwait_blocked_signal", &run_pwait_blocked)]),
+        b"send-sig" if n == 4 => {
+            let (Some(pid), Some(sig)) = (parse_u64(args[2]), parse_u64(args[3])) else {
+                say!("usage: m9_io send-sig <pid> <sig>");
+                return common::USAGE_EXIT;
+            };
+            run_checks(&[("send_sig", &|| eq("kill", sys(SYS_KILL, [pid, sig, 0, 0, 0, 0]), 0))])
+        }
         _ => {
             say!("{USAGE}");
             common::USAGE_EXIT

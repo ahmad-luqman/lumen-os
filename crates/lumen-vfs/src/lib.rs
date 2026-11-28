@@ -49,7 +49,7 @@ pub use ops::{
     Opened, link_at, mkdir_at, mknod_at, open_inode, open_inode_guarded, open_inode_guarded_with_truncate_error,
     readlink_at, rename_at2, symlink_at, unlink_at,
 };
-pub use poll::{PollGuard, PollHead, PollMask, PollWaker, Pollable};
+pub use poll::{DeferLink, DeferSlot, PollDefer, PollDeferred, PollGuard, PollHead, PollMask, PollWaker, Pollable};
 pub use resolve::{
     Final, NamedPath, ParentTarget, ResolveFlags, ResolvedPath, check_access, compute_cwd_path, resolve_named_path,
     resolve_parent, resolve_path,

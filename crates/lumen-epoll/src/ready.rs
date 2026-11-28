@@ -2,7 +2,7 @@
 //! (`begin_scan` / `finish_scan` / `finish_peek` / `abort_scan`), and copy-out
 //! rollback (`unreport`), corresponding to Linux `fs/eventpoll.c` `ep->lock`,
 //! `ep_poll_callback`, `ep_events_available`, `ep_start_scan`,
-//! `ep_send_events`, `ep_done_scan`, and `ep_read_events_proc`.
+//! `ep_send_events`, `ep_done_scan`, and `__ep_eventpoll_poll`.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -527,8 +527,7 @@ impl ReadyQueue {
     }
 
     /// Complete a non-consuming nested-epoll readiness probe started by
-    /// [`Self::begin_scan`] (Linux `fs/eventpoll.c` `__ep_eventpoll_poll` /
-    /// `ep_read_events_proc`).
+    /// [`Self::begin_scan`] (Linux `fs/eventpoll.c` `__ep_eventpoll_poll`).
     ///
     /// Scans the whole batch in `polled` (parallel to `scan.handles()`):
     /// - At the first handle with non-zero `polled[i] & watch_mask`, stops with

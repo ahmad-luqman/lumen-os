@@ -14,8 +14,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use lumen_sockabi::{Family, OptVal, SockAddr, SockOpt, Ucred};
 use lumen_vfs::{
-    AccessMode, AdvisoryLocks, DevId, DirEntry, Ino, InodeType, Metadata, OpenFlags, PollMask, PollWaker, Pollable,
-    SetTime, Timespec, VfsError, VfsInode, mode_after_chown, next_lock_id,
+    AccessMode, AdvisoryLocks, DevId, DirEntry, Ino, InodeType, Metadata, OpenFlags, PollDefer, PollMask, PollWaker,
+    Pollable, SetTime, Timespec, VfsError, VfsInode, mode_after_chown, next_lock_id,
 };
 
 use crate::linux::process::{self, FileRef, KernelFile};
@@ -366,7 +366,7 @@ impl SockPollWait {
 }
 
 impl PollWaker for SockPollWait {
-    fn wake(&self, _ready: PollMask) {
+    fn wake(&self, _ready: PollMask, _defer: &mut PollDefer) {
         self.fired.store(true, Ordering::SeqCst);
         let _ = self.queue.wake_one();
     }
@@ -707,7 +707,7 @@ pub fn create_socketpair(family: Family, kind: SockKind, protocol: i32) -> Resul
 }
 
 #[cfg(feature = "ktest")]
-mod ktest_support {
+pub(crate) mod ktest_support {
     use super::*;
     use alloc::collections::VecDeque;
     use core::sync::atomic::AtomicUsize;

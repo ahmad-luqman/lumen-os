@@ -410,11 +410,13 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `UserThreadState::linux`, so a syscall finds it lock-free through
   `current_thread`/`current_process`), `KernelFile` (`id()` exposing
   `OpenFile::id` from `lumen_vfs::next_open_file_id`, combined `end_refs`
-  released via `release_end`, in-flight `IoFile` refcount guard,
+  released via `release_end` (running `epoll::release_file` first, #476),
+  in-flight `IoFile` refcount guard (`file_ref()` metadata-only clone),
+  `epitems: SpinLock<EpWatchers>` (10c leaf, #476),
   `obj: Option<FileObj>` holding `Pipe(PipePoll)`, `Tty(TtyPoll)`,
-  `Anon(AnonObj)` with `AnonObj::{kind,pollable,release}`, or
+  `Anon(AnonObj)` with `AnonObj::{Epoll,kind,pollable,release}` (#476), or
   `Sock(Arc<dyn SockOps>)` via `new_sock`/`sock()`, and `pollable()`,
-  #379, #386, #388, #471, #472), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
+  #379, #386, #388, #471, #472, #476), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
   vfork and thread clone validation, #380, #382), `process/table.rs`
   (`ProcTable` behind `PROCS`: lumen-proc's tree, processes by pid, threads
   by tid, `WaitResult`, `link_init`/`link_root`/`link_thread`/
@@ -473,12 +475,32 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   covering `Process` and `TimerFd` targets (`TIMERFD_OWNER`, `requeue_timerfd`,
   `wake_worker`), boot-CPU `on_tick` wakeup and timer worker thread from
   `timer::init`, `create`/`set`/`get`/`delete`/`overrun`/`delivered`/`clear`);
+  `linux/epoll.rs` (M9 B5, #476: `Epoll` over `lumen_epoll`'s `EpollSet`
+  under `mtx` (00b), `ReadyQueue` (10e leaf), `WaitQueue` (`wake_seq`, 10f),
+  source-callback `source_seq` for serial safety diagnostics,
+  `KernelPollHead`, `DeferSlot<KernelLocks>` (`PollDeferred`), and global
+  `EPOLL_LOOPS` (00a); `EpWatchers`/`EpWatcherSlot` for `KernelFile::epitems`
+  (10c leaf), `EpWaker`, `ctl_add`/`ctl_mod`/`ctl_del`, two-phase `wait` with
+  copy-out `unreport`, fallible shared `prepare_scan`, `poll_and_record`,
+  `deliver`, `unlink_all`, `encode_event`/`decode_event`, and guardless
+  zero-to-ready edge tracking with rearming after each guardless ET report.
+  `recheck_step` derives guardless requirements from live `Subscription`
+  states. Nested `Pollable::poll` retains subscriptions while outer
+  epoll/poll/select recompute rechecks and allocation retries each pass
+  (including ADD while blocked, DEL/last-close, and recovery after OOM);
+  `ConsoleStep` shares poll's 5 ms and serial 100 ms policy.
+  `close` and `release_file` remove interests and nesting edges. Ktests cover
+  confirmed infinite blocked waits, guardless nesting and drain/refill edges,
+  retained guarded wakes after removal of the last guardless target, allocation
+  retry, expired-timeout signal precedence, and maxevents=1 rotation);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern; M7's and
   M8's `not_implemented` stubs are gone, while M9's remaining B0 stubs (#471)
-  live in `epoll.rs` plus C7's in `io.rs`, `mem.rs`, `sys.rs`;
-  `socket.rs` holds B1's (#472) generic `SockOps` handlers and `evfd.rs` holds
-  B6's (#477) `eventfd`/`eventfd2`/`timerfd_*` handlers; `sendmmsg`, `recvmmsg`, `membarrier`, `clone3`, `execveat`,
+  live in C7's `io.rs`, `mem.rs`, `sys.rs`;
+  `socket.rs` holds B1's (#472) generic `SockOps` handlers, `evfd.rs` holds
+  B6's (#477) `eventfd`/`eventfd2`/`timerfd_*` handlers and `epoll.rs` holds
+  B5's (#476) `epoll_create`/`epoll_create1`/`epoll_ctl`/`epoll_wait`/
+  `epoll_pwait`/`epoll_pwait2`; `sendmmsg`, `recvmmsg`, `membarrier`, `clone3`, `execveat`,
   `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` make
   up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
   (ARCHITECTURE section 8)), `unmap_past`
@@ -507,7 +529,7 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391; M9's clusters:
   `socket` generic `SockOps` handlers (#472), `evfd` `eventfd`/`eventfd2` and
   `timerfd_create`/`timerfd_settime`/`timerfd_gettime` handlers (#477), and
-  `epoll` B0 stubs (#471));
+  `epoll` (#476));
   `fd` holds `open`/`openat`/`lseek` (with `open_fifo`, #386,
   `devpts::open`, #388, #389, and `/proc/<pid>/fd/N` reopen `-ENXIO`
   unless `O_PATH` for anon/socket inodes, #471, #472) and descriptor
@@ -711,8 +733,12 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   the limit-taking family `alloc_below`, `alloc_from_below`,
   `reserve_below`, `insert_at_below`, what syscalls use under
   `RLIMIT_NOFILE`, #435),
-  `poll` (`PollMask`, `PollWaker`, `Pollable`, `PollGuard`, `PollHead`,
-  #374), the namespace operations (`open_inode`, `open_inode_guarded_with_truncate_error` (#414), `mkdir_at`, `mknod_at` (#386),
+  `poll` (`PollMask`, `PollWaker`, `Pollable`, `PollGuard`, `PollHead` with
+  diagnostic-only `try_subscriber_count`, `PollDeferred` with sealed
+  `DeferLink`/`DeferSlot` (one exclusive slot per entry),
+  `PollDefer` with crate-private construction/drain,
+  deterministic requeue-during-run and concurrent notification tests,
+  #374, #476), the namespace operations (`open_inode`, `open_inode_guarded_with_truncate_error` (#414), `mkdir_at`, `mknod_at` (#386),
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
   call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,
   whose `WouldBlock` alone names the holder; `PosixWaitGraph`, who waits
@@ -1278,8 +1304,10 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `tools/linux-m9/` (#471): M9's test programs, built the same way into
   `build/linux/` and staged in both images, sharing `common.rs` (the raw
   `syscall`, `say!`, argv, `Fail`, `run_checks`): `m9_net`, `m9_unix`,
-  `m9_io`, `m9_proc` and `dnsd` (B0 skeletons; later issues add their checks
-  and C3 implements `dnsd`).
+  `m9_io` (B5 #476: epoll LT/ET/one-shot, nested and fork waits confirmed
+  blocked through ps before writes, timeout floors and normal/interrupted
+  pwait mask restoration), `m9_proc` and `dnsd` (B0 skeletons; later issues
+  add their checks and C3 implements `dnsd`).
 - `tests/scenarios/`: QEMU tests, incl. `test_net.py` (M9 networking,
   sockets, `AF_UNIX`, ICMP and stress; B0 empty skeleton, #471),
   `test_linux_user.py` (M6/M7 ring-3
@@ -1289,7 +1317,7 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   syscalls, MT stress, POSIX shared memory and semaphores on `/dev/shm`
   #433), `test_linux_io.py` (`poll`/`select` on console,
   pipes/FIFOs, PTY termios/job control, `ash -i` console job control,
-  `ptyrun`'s console relay, #437),
+  `ptyrun`'s console relay, #437; epoll and pwait, #476),
   `test_linux_vm.py` (cross-CPU `munmap`/`mprotect` TLB shootdowns),
   `test_alpine.py` (Alpine minirootfs coreutils plus M8's D1 `ash` #393,
   D2 `gcc`/`g++`/`make` #394, D3 `git`/`sqlite3` and `vim` over `ptyrun`

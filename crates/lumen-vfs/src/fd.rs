@@ -28,6 +28,9 @@ pub trait VfsLock<T> {
 
     fn new(val: T) -> Self;
     fn lock(&self) -> Self::Guard<'_>;
+    /// Diagnostic/test-only nonblocking probe. Production callers must use
+    /// `lock` rather than treating `None` as permission to skip required work.
+    fn try_lock(&self) -> Option<Self::Guard<'_>>;
     fn get_mut(&mut self) -> &mut T;
 }
 
@@ -58,6 +61,10 @@ impl<T> VfsLock<T> for LocalLock<T> {
 
     fn lock(&self) -> Self::Guard<'_> {
         self.0.borrow_mut()
+    }
+
+    fn try_lock(&self) -> Option<Self::Guard<'_>> {
+        self.0.try_borrow_mut().ok()
     }
 
     fn get_mut(&mut self) -> &mut T {
