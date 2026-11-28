@@ -26,7 +26,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   generational `SockId` entries, bounded LISTEN pools, accept queues,
   event-based `changed` (including packet metadata capacity), per-state
   timers, orphan cleanup, shutdown readiness, datagram tickets, wildcard
-  receive fairness and listener option inheritance. Caller-timed deadlines
+  receive fairness, UDP recipient specificity, connected-interface send
+  readiness, ICMP hop limits and listener option inheritance. Caller-timed deadlines
   count transmitted keepalive probes and reap unreachable orphans; retired
   TCP transports preserve unread data without duplicate receive buffers.
   Seeded interfaces, typed preparations, explicit `Family`/`V6Only`, ICMP

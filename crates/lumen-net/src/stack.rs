@@ -139,6 +139,10 @@ const TIME_WAIT: Duration = Duration::from_secs(10);
 const SYN_RECEIVED_TIMEOUT: Duration = Duration::from_secs(63);
 
 impl Entry {
+    // Connected datagrams report send capacity only on their default route.
+    fn datagram_tx_iface(&self, i: usize) -> bool {
+        self.peer.is_none() || self.iface == Some(IfaceId::from_index(i))
+    }
     fn new(id: SockId, proto: Proto) -> Self {
         Self {
             id,
@@ -758,7 +762,8 @@ impl<D: NetDevice> Stack<D> {
                 };
                 // Payload occupancy alone misses zero-length datagrams that
                 // exhaust the packet metadata ring.
-                let writable = queued < self.snapshots[idx].tx || can_send && !self.snapshots[idx].can_send;
+                let writable = e.datagram_tx_iface(i)
+                    && (queued < self.snapshots[idx].tx || can_send && !self.snapshots[idx].can_send);
                 if writable || arrival && e.heads[i].present {
                     self.mark(id);
                 }
@@ -1041,7 +1046,10 @@ impl<D: NetDevice> Stack<D> {
                     && e.peer.is_none_or(|p| p == tuple.remote)
                     && (e.peer.is_none() || e.iface.is_none_or(|iface| iface.index() == i))
             })
-            .min_by_key(|e| e.bind_order)
+            // Linux v6.12 __udp{4,6}_lib_lookup tries the exact local
+            // address before the wildcard bucket; compute_score then
+            // prefers a matching connected peer within that bucket.
+            .min_by_key(|e| (e.bound.unwrap().addr.is_none(), e.peer.is_none(), e.bind_order))
             .map_or(Syn::NoOwner, |e| Syn::Deliver(Some(e.id.index())))
     }
     fn ingress_frame(&mut self, i: usize, len: usize, now: Instant) {
@@ -1370,14 +1378,15 @@ impl<D: NetDevice> Stack<D> {
             r.readable = e.rd || e.heads.iter().any(|h| h.present);
             r.writable = e.handles.iter().all(Option::is_none)
                 || e.handles.iter().enumerate().any(|(i, h)| {
-                    h.is_some_and(|h| {
-                        let s = &self.interfaces[i].as_ref().unwrap().sockets;
-                        if e.proto == Proto::Udp {
-                            s.get::<udp::Socket>(h).can_send()
-                        } else {
-                            s.get::<icmp::Socket>(h).can_send()
-                        }
-                    })
+                    e.datagram_tx_iface(i)
+                        && h.is_some_and(|h| {
+                            let s = &self.interfaces[i].as_ref().unwrap().sockets;
+                            if e.proto == Proto::Udp {
+                                s.get::<udp::Socket>(h).can_send()
+                            } else {
+                                s.get::<icmp::Socket>(h).can_send()
+                            }
+                        })
                 });
             r.hup = e.rd && e.wr;
             r.rdhup = e.rd;
@@ -1463,12 +1472,18 @@ impl<D: NetDevice> Stack<D> {
                 self.apply_keepalive(id, now);
             }
             self.apply_tcp_options(id);
-        } else if e.proto == Proto::Udp {
+        } else {
             let handles = e.handles;
             let ttl = e.options.ttl;
+            let proto = e.proto;
             for (i, h) in handles.into_iter().enumerate() {
                 if let Some(h) = h {
-                    self.interfaces[i].as_mut().unwrap().sockets.get_mut::<udp::Socket>(h).set_hop_limit(Some(ttl));
+                    let sockets = &mut self.interfaces[i].as_mut().unwrap().sockets;
+                    if proto == Proto::Udp {
+                        sockets.get_mut::<udp::Socket>(h).set_hop_limit(Some(ttl));
+                    } else {
+                        sockets.get_mut::<icmp::Socket>(h).set_hop_limit(Some(ttl));
+                    }
                 }
             }
         }
@@ -2204,6 +2219,7 @@ fn configure_datagram(prep: &mut ConnectPrep, proto: Proto, req: Bound, i: usize
             p.socket.bind(listen_endpoint(req, i)).map_err(|_| NetError::Inval)
         }
         (ConnectPrep::Icmp(p), Proto::IcmpEcho { .. }) => {
+            p.socket.set_hop_limit(Some(ttl));
             p.socket.bind(icmp::Endpoint::Ident(req.port)).map_err(|_| NetError::Inval)
         }
         _ => Err(NetError::Inval),

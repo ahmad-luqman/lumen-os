@@ -634,3 +634,46 @@ fn udp_family_demux_preserves_dhcp_dispatch() {
     let ordinary = Tuple { local: IpEndpoint::new(packet.local.addr, 1234), ..packet };
     assert!(matches!(s.udp_action(1, ordinary), Syn::NoOwner));
 }
+
+#[test]
+fn icmp_ttl_before_and_after_bind_reaches_all_transports_and_wire() {
+    // Linux v6.12 net/ipv4/ping.c, ping_v4_sendmsg:822-828 and
+    // net/ipv4/raw.c, raw_sendmsg:651-662 use ip_append_data/push;
+    // net/ipv4/ip_output.c, __ip_make_skb:1437-1449 selects the socket's
+    // TTL for the emitted header. Binding does not freeze that option.
+    use smoltcp::wire::{Icmpv4Packet, Ipv4Packet};
+    for raw in [false, true] {
+        let mut s = stack();
+        eth(&mut s, 0);
+        let b = budget();
+        let id = s.open(Family::V4, Proto::IcmpEcho { raw }).unwrap();
+        s.set_opt(id, NetOpt::Ttl(37), Instant::ZERO).unwrap();
+        s.bind(
+            id,
+            BindReq { port: 1234, ..BindReq::default() },
+            Preps::Icmp(&mut [prepare_icmp(b).unwrap(), prepare_icmp(b).unwrap()].into_iter()),
+            Instant::ZERO,
+        )
+        .unwrap();
+        for ttl in [37, 91] {
+            if ttl == 91 {
+                s.set_opt(id, NetOpt::Ttl(ttl), Instant::ZERO).unwrap();
+            }
+            for i in 0..2 {
+                let h = s.entry(id).unwrap().handles[i].unwrap();
+                assert_eq!(s.interfaces[i].as_ref().unwrap().sockets.get::<icmp::Socket>(h).hop_limit(), Some(ttl));
+            }
+            let mut request = [8, 0, 0, 0, 0x04, 0xd2, 0, 1];
+            Icmpv4Packet::new_unchecked(&mut request[..]).fill_checksum();
+            s.send(id, &request, Some(IpEndpoint::new(loopback_addr(false), 0)), Preps::None, Instant::ZERO).unwrap();
+            s.poll_round(Instant::ZERO);
+            let (rx, _) = s.lo.receive(Instant::ZERO).expect("echo request was transmitted");
+            rx.consume(|data| {
+                let packet = Ipv4Packet::new_checked(data).unwrap();
+                assert_eq!(packet.hop_limit(), ttl);
+                assert_eq!(packet.next_header(), smoltcp::wire::IpProtocol::Icmp);
+                assert_eq!(packet.payload()[0], 8);
+            });
+        }
+    }
+}

@@ -4281,9 +4281,11 @@ pub trait NetDevice: Send {
 - **Wildcards:** a wildcard TCP listener (0.0.0.0, or `::` without
   `IPV6_V6ONLY`, which covers 0.0.0.0 too) holds a LISTEN pool on each
   set. A wildcard-bound UDP socket holds a smoltcp socket on each set; its
-  readiness is their union, `recv` alternates between the two sets when
+  readiness is their union while unconnected, `recv` alternates between the two sets when
   both hold data (neither starves), and `send` routes by destination. A
-  wildcard socket that connects fixes its interface then. If Ethernet is
+  wildcard socket that connects fixes its interface then; writable readiness
+  and transmit-space `changed` events use only that interface's handle.
+  If Ethernet is
   attached after a wildcard UDP bind, a later connect/send installs the
   missing interface socket from its typed preparation.
 - **Families:** an `AF_INET6` socket using a v4-mapped address gets an
@@ -4317,6 +4319,13 @@ pub trait NetDevice: Send {
     DHCP dispatch ahead of UDP. Linux **v6.12**, `net/ipv4/udp.c`,
     `compute_score`, lines 378–381; `net/ipv6/udp.c`, `compute_score`,
     lines 126–129 exclude incompatible families before delivery.
+    Among eligible recipients, a specific local address wins over a wildcard,
+    then a matching connected peer wins over an unconnected socket; bind
+    order breaks ties. Linux **v6.12**, `net/ipv4/udp.c`,
+    `__udp4_lib_lookup`, lines 497–527, and `net/ipv6/udp.c`,
+    `__udp6_lib_lookup`, lines 235–265 search the specific address first;
+    their `compute_score` functions (lines 389–401 and 137–147 respectively)
+    prefer a matching peer address and port within that binding.
   - #459's PR 2 host-tests the filter on `lo` and Ethernet (a v4 SYN to a `v6only`
     listener's port is refused, a full pool drops a SYN, a v6 datagram
     never reaches an `AF_INET` socket) and both wildcard-listener orders.
@@ -4693,6 +4702,8 @@ queued payloads are zero length.
 
 **ICMP (C6).** `auto-icmp-echo-reply` answers echo requests on both
 interfaces.
+- Ping and raw transports apply the saved TTL at creation; later `Ttl`
+  option changes update every existing handle's hop limit.
 - **Ping sockets** (`SOCK_DGRAM` with `IPPROTO_ICMP` or `IPPROTO_ICMPV6`):
   a smoltcp ICMP socket bound to the socket's identifier (its "port":
   from `bind`, or a free one in 1–65535). It sends

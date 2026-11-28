@@ -623,3 +623,137 @@ fn udp_wildcard_recipients_are_selected_by_family_in_both_bind_orders() {
         }
     }
 }
+
+fn reuse_udp(s: &mut Stack<Wire>, b: &'static Budget, v6: bool, local: Option<IpAddress>) -> SockId {
+    let id = s.open(if v6 { Family::V6 } else { Family::V4 }, Proto::Udp).unwrap();
+    s.bind(
+        id,
+        BindReq { addr: local, port: 4000, reuse_addr: true, ..BindReq::default() },
+        Preps::Udp(&mut [udp(b)].into_iter()),
+        at(0),
+    )
+    .unwrap();
+    id
+}
+
+#[test]
+fn udp_specific_local_binding_wins_in_both_orders() {
+    // Linux v6.12 net/ipv4/udp.c, __udp4_lib_lookup:497-527, and
+    // net/ipv6/udp.c, __udp6_lib_lookup:235-265 try the specific local
+    // address before the wildcard bucket, regardless of bind order.
+    for v6 in [false, true] {
+        for specific_first in [false, true] {
+            let mut s = stack();
+            let b = budget();
+            let mut receivers = Vec::new();
+            for specific in [specific_first, !specific_first] {
+                receivers.push((specific, reuse_udp(&mut s, b, v6, specific.then_some(addr(v6)))));
+            }
+            let sender = bind_udp(&mut s, b, Some(addr(v6)), 4001, v6);
+            s.send(sender, b"specific", Some(IpEndpoint::new(addr(v6), 4000)), Preps::None, at(0)).unwrap();
+            steps(&mut s, &mut 0, 12);
+            for (specific, receiver) in receivers {
+                let mut data = [0; 16];
+                if specific {
+                    assert_eq!(s.recv(receiver, &mut data, false).unwrap().copied, 8);
+                    assert_eq!(&data[..8], b"specific");
+                }
+                assert_eq!(s.recv(receiver, &mut data, false), Err(NetError::WouldBlock));
+            }
+        }
+    }
+}
+
+#[test]
+fn udp_connected_peer_wins_on_shared_binding() {
+    // Linux v6.12 net/ipv4/udp.c, compute_score:389-401 and
+    // udp4_lib_lookup2:438-449; net/ipv6/udp.c, compute_score:137-147
+    // and udp6_lib_lookup2:181-192 prefer a matching peer address/port.
+    for v6 in [false, true] {
+        for connected_first in [false, true] {
+            for specific in [false, true] {
+                let mut s = stack();
+                let b = budget();
+                let mut receivers = Vec::new();
+                for connected in [connected_first, !connected_first] {
+                    let id = reuse_udp(&mut s, b, v6, specific.then_some(addr(v6)));
+                    if connected {
+                        s.connect(id, IpEndpoint::new(addr(v6), 4001), None, at(0)).unwrap();
+                    }
+                    receivers.push((connected, id));
+                }
+                let mut now = 0;
+                for (port, payload) in [(4001, b"peer"), (4002, b"else")] {
+                    let sender = bind_udp(&mut s, b, Some(addr(v6)), port, v6);
+                    s.send(sender, payload, Some(IpEndpoint::new(addr(v6), 4000)), Preps::None, at(now)).unwrap();
+                }
+                steps(&mut s, &mut now, 12);
+                for (connected, receiver) in receivers {
+                    let mut data = [0; 16];
+                    assert_eq!(s.recv(receiver, &mut data, false).unwrap().copied, 4);
+                    assert_eq!(&data[..4], if connected { b"peer" } else { b"else" });
+                    assert_eq!(s.recv(receiver, &mut data, false), Err(NetError::WouldBlock));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn udp_equal_specificity_uses_bind_order_not_slot_order() {
+    // Linux v6.12 net/ipv4/udp.c, udp4_lib_lookup2:438-441 and
+    // net/ipv6/udp.c, udp6_lib_lookup2:181-184 replace only on a higher
+    // score. Lumen's deterministic tie policy is earliest bind.
+    for v6 in [false, true] {
+        let mut s = stack();
+        let b = budget();
+        let earlier_slot = s.open(if v6 { Family::V6 } else { Family::V4 }, Proto::Udp).unwrap();
+        let earlier_bind = reuse_udp(&mut s, b, v6, Some(addr(v6)));
+        s.bind(
+            earlier_slot,
+            BindReq { addr: Some(addr(v6)), port: 4000, reuse_addr: true, ..BindReq::default() },
+            Preps::Udp(&mut [udp(b)].into_iter()),
+            at(0),
+        )
+        .unwrap();
+        let sender = bind_udp(&mut s, b, Some(addr(v6)), 4001, v6);
+        s.send(sender, b"tie", Some(IpEndpoint::new(addr(v6), 4000)), Preps::None, at(0)).unwrap();
+        steps(&mut s, &mut 0, 12);
+        let mut data = [0; 3];
+        assert_eq!(s.recv(earlier_bind, &mut data, false).unwrap().copied, 3);
+        assert_eq!(&data, b"tie");
+        assert_eq!(s.recv(earlier_slot, &mut data, false), Err(NetError::WouldBlock));
+    }
+}
+
+#[test]
+fn connected_udp_writability_ignores_unused_interface() {
+    // Linux v6.12 net/core/datagram.c, datagram_poll:919-923 reports
+    // this socket's send capacity. Lumen's two transport queues must not
+    // let an unused interface conceal exhaustion on the connected route.
+    let (mut s, mut peer, control, _) = wire_stacks();
+    let b = budget();
+    let receiver = bind_udp(&mut peer, budget(), None, 4000, false);
+    let id = bind_udp(&mut s, b, None, 4001, false);
+    assert_eq!(s.socket_count(), 2);
+    // A queued sendto on lo will drain after connect fixes the route to eth0.
+    s.send(id, b"unused", Some(IpEndpoint::new(addr(false), 4999)), Preps::None, at(0)).unwrap();
+    s.connect(id, IpEndpoint::new(IpAddress::v4(10, 0, 0, 2), 4000), None, at(0)).unwrap();
+    assert_eq!(s.iface_of(id), Some(IfaceId::Eth0));
+    control.block.store(true, Ordering::Relaxed);
+    for _ in 0..32 {
+        s.send(id, &[], None, Preps::None, at(0)).unwrap();
+    }
+    assert_eq!(s.send(id, &[], None, Preps::None, at(0)), Err(NetError::WouldBlock));
+    assert!(!s.readiness(id).writable);
+    s.changed();
+    s.poll_round(at(0));
+    assert!(!s.readiness(id).writable);
+    assert!(!s.changed().contains(&id), "unused lo transmit space is not a writable event");
+    control.block.store(false, Ordering::Relaxed);
+    let mut now = 1;
+    wire_steps(&mut s, &mut peer, &mut now, 48);
+    assert!(s.readiness(id).writable);
+    assert!(s.changed().contains(&id), "selected eth0 transmit space wakes the sender");
+    assert_eq!(peer.recv(receiver, &mut [], false).unwrap().full_len, 0);
+}
