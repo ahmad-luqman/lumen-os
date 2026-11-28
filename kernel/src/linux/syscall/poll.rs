@@ -1355,6 +1355,42 @@ crate::ktest!(
             kassert_eq!(select_at(100, rset_va, 0, 0, ro_page + 32), neg_errno(errno::EBADF));
             kassert_eq!(sys_mprotect(ro_page, 4096, u64::from(general::PROT_READ | general::PROT_WRITE)), 0);
 
+            // M9 B3: section 7's readiness cases through a real socket file,
+            // with only its transport readiness seamed. Linux v6.12
+            // net/ipv4/tcp.c:558-611 (tcp_poll); C4 exercises live TCP states.
+            use crate::net::inet::{InetSocket, Proto, TcpState};
+            use lumen_net::Readiness;
+            let socket =
+                InetSocket::new(lumen_sockabi::Family::Inet, Proto::Tcp(TcpState::new())).map_err(|_| "inet socket")?;
+            let file = crate::net::sock::new_socket_file(socket.clone(), false).map_err(|_| "inet file")?;
+            let fd = ktest_install_file(file)?;
+            let inet_cases = [
+                (Readiness::default(), PollMask::EMPTY),
+                (Readiness { readable: true, ..Readiness::default() }, PollMask::IN | PollMask::RDNORM),
+                (Readiness { writable: true, ..Readiness::default() }, PollMask::OUT | PollMask::WRNORM),
+                (
+                    Readiness { readable: true, rdhup: true, ..Readiness::default() },
+                    PollMask::IN | PollMask::RDNORM | PollMask::RDHUP,
+                ),
+                (Readiness { hup: true, ..Readiness::default() }, PollMask::HUP),
+                (Readiness { error: true, ..Readiness::default() }, PollMask::ERR),
+                (
+                    Readiness { writable: true, hup: true, ..Readiness::default() },
+                    PollMask::OUT | PollMask::WRNORM | PollMask::HUP,
+                ),
+                (
+                    Readiness { readable: true, writable: true, rdhup: true, hup: true, error: false },
+                    PollMask::ALWAYS_READY | PollMask::RDHUP | PollMask::HUP,
+                ),
+            ];
+            for (readiness, expected) in inet_cases {
+                socket.set_test_readiness(readiness);
+                write_pollfds(fds_va, &[(fd.raw(), (PollMask::ALWAYS_READY | PollMask::RDHUP).bits())])?;
+                kassert_eq!(sys_poll(fds_va, 1, 0), u64::from(expected != PollMask::EMPTY));
+                kassert_eq!(read_revents(fds_va, 1)?[0], expected.bits());
+            }
+            kassert_eq!(super::fd::sys_close(fd), 0);
+
             kassert_eq!(test_inode.subscriber_count(), 0);
             Ok(())
         })?;

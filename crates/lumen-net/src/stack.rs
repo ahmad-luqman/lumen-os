@@ -13,7 +13,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint};
 enum Role {
     Fresh,
     Active,
-    Listener(usize),
+    Listener { backlog: usize, sizes: BufSizes },
     Pool(SockId),
     Queued(SockId, u64),
     Orphan,
@@ -227,7 +227,8 @@ pub struct Stack<D: NetDevice> {
     // Loopback alias ICMP sockets need a source override during egress.
     held_icmp: Vec<(usize, icmp::Socket<'static>)>,
     now: Instant,
-    next_poll: Option<Instant>,
+    next_poll: [Option<Instant>; 2],
+    socket_deadline: Option<Instant>,
     needs_poll: bool,
     queue_order: u64,
     lease: Option<Lease>,
@@ -268,7 +269,8 @@ impl<D: NetDevice> Stack<D> {
             empty: SocketSet::new(filled(1, || SocketStorage::EMPTY)?),
             held_icmp: reserved(NET_SOCKETS)?,
             now,
-            next_poll: None,
+            next_poll: [None; 2],
+            socket_deadline: None,
             needs_poll: false,
             queue_order: 0,
             lease: None,
@@ -343,6 +345,10 @@ impl<D: NetDevice> Stack<D> {
     fn touch(&mut self, id: SockId) {
         self.mark(id);
         self.needs_poll = true;
+    }
+    /// Whether this exact generation is a live user or listener identity.
+    pub fn contains(&self, id: SockId) -> bool {
+        self.entry(id).is_ok()
     }
     /// Creates bookkeeping for the supplied address family and protocol.
     pub fn open(&mut self, family: Family, proto: Proto) -> Result<SockId, NetError> {
@@ -603,7 +609,7 @@ impl<D: NetDevice> Stack<D> {
                 }
                 return Err(NetError::Already);
             }
-            if matches!(e.role, Role::Listener(_)) {
+            if matches!(e.role, Role::Listener { .. }) {
                 return Err(NetError::IsConn);
             }
         }
@@ -946,7 +952,7 @@ impl<D: NetDevice> Stack<D> {
         let listener = self
             .live_entries()
             .filter(|e| {
-                if !matches!(e.role, Role::Listener(_)) {
+                if !matches!(e.role, Role::Listener { .. }) {
                     return false;
                 }
                 let req = e.bound.unwrap();
@@ -959,7 +965,7 @@ impl<D: NetDevice> Stack<D> {
         let Some(e) = listener else {
             return Syn::NoOwner;
         };
-        let Role::Listener(backlog) = e.role else {
+        let Role::Listener { backlog, .. } = e.role else {
             unreachable!();
         };
         let in_flight = self
@@ -1284,14 +1290,8 @@ impl<D: NetDevice> Stack<D> {
         }
         self.poll_dhcp();
         self.update_shortfalls();
-        let socket_deadline = self.live_entries().flat_map(|e| e.deadline.into_iter().chain(e.keep_deadline)).min();
-        self.next_poll = self
-            .interfaces
-            .iter_mut()
-            .flatten()
-            .filter_map(|s| s.iface.poll_at(now, &s.sockets))
-            .chain(socket_deadline)
-            .min();
+        self.socket_deadline = self.live_entries().flat_map(|e| e.deadline.into_iter().chain(e.keep_deadline)).min();
+        self.next_poll = self.interfaces.each_mut().map(|s| s.as_mut().and_then(|s| s.iface.poll_at(now, &s.sockets)));
         // Egress can enqueue loopback packets after the ingress budget ran.
         // Unlike hardware, this device has no interrupt to wake the owner.
         more |= self.lo.take_full() || self.lo.queued() != 0;
@@ -1364,8 +1364,8 @@ impl<D: NetDevice> Stack<D> {
         self.now = now;
         let e = self.entry(id)?;
         let state = if e.proto == Proto::Tcp { self.tcp_ref(id).ok().map(tcp::Socket::state) } else { None };
-        if matches!(e.role, Role::Listener(_)) || state == Some(tcp::State::SynSent) {
-            if matches!(e.role, Role::Listener(_)) && how == Shut::Wr {
+        if matches!(e.role, Role::Listener { .. }) || state == Some(tcp::State::SynSent) {
+            if matches!(e.role, Role::Listener { .. }) && how == Shut::Wr {
                 return Ok(());
             }
             self.close_children(id, now);
@@ -1422,7 +1422,7 @@ impl<D: NetDevice> Stack<D> {
         let Ok(e) = self.entry(id) else {
             return;
         };
-        if matches!(e.role, Role::Listener(_)) {
+        if matches!(e.role, Role::Listener { .. }) {
             self.close_children(id, now);
             self.remove(id, false, self.now);
         } else if e.proto == Proto::Tcp && e.handles.iter().any(Option::is_some) {
@@ -1499,7 +1499,7 @@ impl<D: NetDevice> Stack<D> {
             return Readiness { hup: true, error: true, ..Readiness::default() };
         };
         let mut r = Readiness { error: e.error.is_some(), ..Readiness::default() };
-        if let Role::Listener(_) = e.role {
+        if let Role::Listener { .. } = e.role {
             r.readable = self.queued(id) != 0;
             return r;
         }
@@ -1617,7 +1617,7 @@ impl<D: NetDevice> Stack<D> {
             }
         }
         let e = self.entry(id)?;
-        if matches!(e.role, Role::Listener(_)) {
+        if matches!(e.role, Role::Listener { .. }) {
             let options = e.options;
             for pos in 0..self.live.len() {
                 let child = self.entries[self.live[pos]].as_mut().unwrap();
@@ -1718,8 +1718,22 @@ impl<D: NetDevice> Stack<D> {
         if self.needs_poll || self.lo.queued() != 0 {
             Some(now)
         } else {
-            self.next_poll.into_iter().chain(self.ports.deadline()).min()
+            self.next_poll.into_iter().flatten().chain(self.socket_deadline).chain(self.ports.deadline()).min()
         }
+    }
+    /// Preserves loopback and Lumen timers while Ethernet cannot transmit.
+    /// Only Ethernet's already-due egress request is suppressed; the owner
+    /// must also poll periodically to recover a lost completion interrupt.
+    pub fn poll_at_while_eth_blocked(&self, now: Instant) -> Option<Instant> {
+        if self.needs_poll || self.lo.queued() != 0 {
+            return Some(now);
+        }
+        self.next_poll[0]
+            .into_iter()
+            .chain(self.next_poll[1].filter(|deadline| *deadline > now))
+            .chain(self.socket_deadline)
+            .chain(self.ports.deadline())
+            .min()
     }
     /// Number of live port claims plus TIME-WAIT reservations; raw ICMP claims no identifier.
     pub fn port_count(&self) -> usize {
@@ -1754,6 +1768,17 @@ impl<D: NetDevice> Stack<D> {
     pub fn eth_tx_ready(&self) -> bool {
         self.eth.as_ref().is_some_and(Adapter::tx_ready)
     }
+
+    /// Borrows the attached device with exclusive access to the stack.
+    /// The owner must serialize diagnostics with polling, just as socket I/O.
+    pub fn device_mut(&mut self) -> Option<&mut D> {
+        self.eth.as_mut().map(|adapter| &mut adapter.device)
+    }
+
+    /// Configured addresses of one interface, or an empty slice if absent.
+    pub fn interface_addresses(&self, iface: IfaceId) -> &[IpCidr] {
+        self.interfaces[iface.index()].as_ref().map_or(&[], |state| state.iface.ip_addrs())
+    }
 }
 
 impl<D: NetDevice> Stack<D> {
@@ -1775,6 +1800,7 @@ impl<D: NetDevice> Stack<D> {
         &mut self,
         id: SockId,
         backlog: usize,
+        sizes: BufSizes,
         pool: &mut dyn Iterator<Item = TcpPrep>,
         now: Instant,
     ) -> Result<(), NetError> {
@@ -1782,7 +1808,7 @@ impl<D: NetDevice> Stack<D> {
         if e.proto != Proto::Tcp {
             return Err(NetError::OpNotSupp);
         }
-        if !matches!(e.role, Role::Fresh | Role::Listener(_)) {
+        if !matches!(e.role, Role::Fresh | Role::Listener { .. }) {
             return Err(NetError::Inval);
         }
         let req = e.bound.unwrap_or(self.unbound_req(id)?);
@@ -1809,6 +1835,18 @@ impl<D: NetDevice> Stack<D> {
                 n += 1;
             }
         }
+        // Linux v6.12 net/ipv4/inet_connection_sock.c:1245-1254 clones
+        // listener state. Lumen fixes actual capacities at the first listen.
+        // Relisten callers prepare with listener_sizes(id), even if SO_*BUF
+        // options changed meanwhile. Existing children retain their buffers.
+        let sizes = self.listener_sizes(id).unwrap_or(sizes);
+        if prepared
+            .iter()
+            .flatten()
+            .any(|p| p.socket.recv_capacity() != sizes.rx || p.socket.send_capacity() != sizes.tx)
+        {
+            return Err(NetError::Inval);
+        }
         let autobind = self.entry(id)?.bound.is_none();
         if autobind {
             self.bind(id, req.request(), Preps::None, now)?;
@@ -1820,7 +1858,7 @@ impl<D: NetDevice> Stack<D> {
             }
             return Err(err);
         }
-        self.entry_mut(id)?.role = Role::Listener(backlog);
+        self.entry_mut(id)?.role = Role::Listener { backlog, sizes };
         let mut n = 0;
         for (i, iface) in IfaceId::ALL.into_iter().enumerate() {
             for _ in 0..needed[i] {
@@ -1884,11 +1922,18 @@ impl<D: NetDevice> Stack<D> {
     pub fn shortfalls(&self) -> &[(SockId, IfaceId, usize)] {
         &self.shortages
     }
+    /// Actual transport capacities fixed by the first successful listen.
+    pub fn listener_sizes(&self, id: SockId) -> Option<BufSizes> {
+        match self.entry(id).ok()?.role {
+            Role::Listener { sizes, .. } => Some(sizes),
+            _ => None,
+        }
+    }
     fn shortfall(&self, id: SockId, iface: IfaceId) -> usize {
         let Ok(e) = self.entry(id) else {
             return 0;
         };
-        let Role::Listener(backlog) = e.role else {
+        let Role::Listener { backlog, .. } = e.role else {
             return 0;
         };
         if self.queued(id) > backlog || !self.coverage(e.bound.unwrap().addr)[iface.index()] {
@@ -1913,6 +1958,10 @@ impl<D: NetDevice> Stack<D> {
         if self.shortfall(id, iface) == 0 {
             return Ok(false);
         }
+        let sizes = self.listener_sizes(id).ok_or(NetError::Inval)?;
+        if prep.socket.recv_capacity() != sizes.rx || prep.socket.send_capacity() != sizes.tx {
+            return Err(NetError::Inval);
+        }
         self.install_pool(id, iface, prep, now)?;
         self.needs_poll = true;
         self.update_shortfalls();
@@ -1920,7 +1969,7 @@ impl<D: NetDevice> Stack<D> {
     }
     /// Detaches the oldest completed child only after its peer endpoint is available.
     pub fn accept(&mut self, id: SockId) -> Result<(SockId, IpEndpoint), NetError> {
-        if !matches!(self.entry(id)?.role, Role::Listener(_)) {
+        if !matches!(self.entry(id)?.role, Role::Listener { .. }) {
             return Err(NetError::Inval);
         }
         let child = self
@@ -2376,5 +2425,96 @@ fn configure_datagram(prep: &mut ConnectPrep, proto: Proto, req: Bound, i: usize
             if raw { Ok(()) } else { p.socket.bind(icmp::Endpoint::Ident(req.port)).map_err(|_| NetError::Inval) }
         }
         _ => Err(NetError::Inval),
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    struct Device {
+        ready: bool,
+    }
+    impl NetDevice for Device {
+        fn info(&self) -> NetInfo {
+            NetInfo { mac: [2, 0, 0, 0, 0, 1], mtu: 1500, link_up: true }
+        }
+        fn tx_ready(&self) -> bool {
+            self.ready
+        }
+        fn receive(&mut self, _: &mut [u8; ETH_FRAME_MAX]) -> Option<usize> {
+            None
+        }
+        fn transmit<R>(&mut self, _: usize, _: impl FnOnce(&mut [u8]) -> R) -> Result<R, TxError> {
+            Err(TxError::Full)
+        }
+        fn reclaim(&mut self) -> usize {
+            0
+        }
+    }
+    #[test]
+    fn blocked_ethernet_preserves_loopback_and_socket_deadlines() {
+        let mut stack = Stack::<Device>::try_new(Loopback::try_new(65535, 16).unwrap(), Instant::ZERO, 474).unwrap();
+        let now = Instant::from_secs(5);
+        stack.next_poll = [Some(now + Duration::from_millis(7)), Some(now - Duration::from_secs(1))];
+        assert_eq!(stack.poll_at(now), Some(now - Duration::from_secs(1)));
+        assert_eq!(stack.poll_at_while_eth_blocked(now), stack.next_poll[0]);
+        stack.socket_deadline = Some(now + Duration::from_millis(3));
+        assert_eq!(stack.poll_at_while_eth_blocked(now), stack.socket_deadline);
+        stack.socket_deadline = None;
+        stack.next_poll[0] = None;
+        assert_eq!(stack.poll_at_while_eth_blocked(now), None);
+        stack.next_poll[1] = Some(now + Duration::from_secs(2));
+        assert_eq!(stack.poll_at_while_eth_blocked(now), stack.next_poll[1]);
+        stack.needs_poll = true;
+        assert_eq!(stack.poll_at_while_eth_blocked(now), Some(now));
+        stack.needs_poll = false;
+        let id = stack.open(Family::V4, Proto::Tcp).unwrap();
+        stack.bind(id, BindReq { port: 1234, ..BindReq::default() }, Preps::None, now).unwrap();
+        stack.ports.time_wait(id, now + Duration::from_millis(1), None);
+        stack.needs_poll = false;
+        assert_eq!(stack.poll_at_while_eth_blocked(now), Some(now + Duration::from_millis(1)));
+    }
+    #[test]
+    fn worker_deadline_selection_preserves_timers_for_every_device_state() {
+        let mut stack = Stack::<Device>::try_new(Loopback::try_new(65535, 16).unwrap(), Instant::ZERO, 474).unwrap();
+        let now = Instant::from_secs(5);
+        let timer = now + Duration::from_millis(7);
+        let egress = now - Duration::from_secs(1);
+        stack.next_poll = [Some(timer), Some(egress)];
+        // Made-up B2 states: usable+full, broken, not ready, usable+free.
+        for (state, usable, full, expected) in [
+            ("full", true, true, timer),
+            ("broken", false, false, timer),
+            ("not ready", false, true, timer),
+            ("free", true, false, egress),
+        ] {
+            assert_eq!(
+                worker_deadline(usable, full, stack.poll_at(now), stack.poll_at_while_eth_blocked(now)),
+                Some(expected),
+                "{state}"
+            );
+        }
+    }
+    #[test]
+    fn diagnostics_follow_the_attached_device_and_address_configuration() {
+        let mut stack = Stack::<Device>::try_new(Loopback::try_new(65535, 16).unwrap(), Instant::ZERO, 474).unwrap();
+        assert!(stack.device_mut().is_none());
+        assert!(stack.interface_addresses(IfaceId::Eth0).is_empty());
+        assert_eq!(
+            stack.interface_addresses(IfaceId::Lo),
+            &[IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8), IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128),]
+        );
+        let addr = Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24);
+        stack
+            .attach_eth(Device { ready: false }, EthConfig::Static { addr, router: None }, Instant::ZERO, 475)
+            .unwrap();
+        assert!(!stack.eth_tx_ready());
+        stack.device_mut().unwrap().ready = true;
+        assert!(stack.eth_tx_ready());
+        assert_eq!(stack.interface_addresses(IfaceId::Eth0), &[IpCidr::Ipv4(addr)]);
+        stack.configure_eth(None, None).unwrap();
+        assert!(stack.interface_addresses(IfaceId::Eth0).is_empty());
+        assert_eq!(stack.interface_addresses(IfaceId::Lo).len(), 2);
     }
 }

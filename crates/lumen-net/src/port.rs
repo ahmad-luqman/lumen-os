@@ -36,10 +36,14 @@ pub(crate) struct PortTable {
     slots: Vec<Option<Binding>>,
     time_wait: Vec<Option<Binding>>,
     next: [u16; 3],
-    uses: Vec<[usize; 3]>,
+    // At most NET_ENTRIES live plus NET_ENTRIES TIME-WAIT claims (4096).
+    uses: Vec<[u16; 3]>,
 }
 impl PortTable {
     pub fn try_new(capacity: usize) -> Result<Self, NetError> {
+        if capacity > usize::from(u16::MAX) / 2 {
+            return Err(NetError::NoBufs);
+        }
         Ok(Self {
             slots: filled(capacity, || None)?,
             time_wait: filled(capacity, || None)?,
@@ -146,10 +150,10 @@ impl PortTable {
         }
         Err(NetError::AddrNotAvail)
     }
-    fn forget(uses: &mut [[usize; 3]], b: Binding) {
+    fn forget(uses: &mut [[u16; 3]], b: Binding) {
         uses[b.req.port as usize][Self::protocol(b.proto)] -= 1;
     }
-    fn drop_where(slots: &mut [Option<Binding>], uses: &mut [[usize; 3]], pred: impl Fn(Binding) -> bool) {
+    fn drop_where(slots: &mut [Option<Binding>], uses: &mut [[u16; 3]], pred: impl Fn(Binding) -> bool) {
         for slot in slots {
             if slot.is_some_and(&pred) {
                 let b = slot.take().unwrap();
@@ -368,5 +372,37 @@ mod round1_tests {
         t.next[2] = 65535;
         assert_eq!(t.bind(id(1), p, Bound::default()).unwrap().port, 65535);
         assert_eq!(t.bind(id(2), p, Bound::default()).unwrap().port, 2);
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    #[test]
+    fn port_use_counts_include_live_and_time_wait_claims() {
+        let mut table = PortTable::try_new(crate::NET_ENTRIES).unwrap();
+        let id = |idx| SockId { idx, generation: 1 };
+        let req = Bound { port: 1234, reuse_addr: true, ..Bound::default() };
+        table.bind(id(0), Proto::Tcp, req).unwrap();
+        for n in 1..crate::NET_ENTRIES {
+            table.inherit(id(0), id(n as u32)).unwrap();
+        }
+        for n in 0..crate::NET_ENTRIES {
+            table.time_wait(id(n as u32), Instant::from_secs(10), None);
+        }
+        table.bind(id(2048), Proto::Tcp, req).unwrap();
+        for n in 2049..4096 {
+            table.inherit(id(2048), id(n)).unwrap();
+        }
+        assert_eq!(table.uses[1234][0], 4096);
+        for n in 2048..4096 {
+            table.release(id(n));
+        }
+        assert_eq!(table.uses[1234][0], 2048);
+        table.expire(Instant::from_secs(10));
+        assert_eq!(table.uses[1234][0], 0);
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.uses.capacity() * size_of::<[u16; 3]>(), 393216);
+        assert!(matches!(PortTable::try_new(32768), Err(NetError::NoBufs)));
     }
 }

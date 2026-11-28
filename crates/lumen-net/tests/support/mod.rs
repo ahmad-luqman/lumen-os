@@ -43,7 +43,7 @@ pub fn listener(
     s.bind(id, BindReq { addr, port, ..BindReq::default() }, Preps::None, Instant::ZERO).unwrap();
     let n = s.preps_needed(id, PrepFor::Listen(backlog));
     let pool: Vec<_> = (0..n).map(|_| prepare_tcp(b, sizes()).unwrap()).collect();
-    s.listen(id, backlog, &mut pool.into_iter(), Instant::ZERO).unwrap();
+    s.listen(id, backlog, sizes(), &mut pool.into_iter(), Instant::ZERO).unwrap();
     id
 }
 pub fn connect(s: &mut Stack<Wire>, b: &'static Budget, remote: IpEndpoint, now: i64) -> SockId {

@@ -139,7 +139,7 @@ fn connect_listen_accept_and_ethernet_poll_allocate_nothing() {
                 Instant::ZERO,
             )
             .unwrap();
-            b.listen(l, 0, &mut pool.into_iter(), Instant::ZERO).unwrap();
+            b.listen(l, 0, sizes(), &mut pool.into_iter(), Instant::ZERO).unwrap();
             let c = a.open(Family::V4, Proto::Tcp).unwrap();
             assert_eq!(
                 a.connect(c, IpEndpoint::new(IpAddress::v4(10, 0, 0, 2), 1234), Some(client), Instant::ZERO),

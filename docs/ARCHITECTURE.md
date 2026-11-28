@@ -4353,10 +4353,21 @@ runs every poll. Its loop:
    listener pools outside the lock.
 4. If an interface used its whole receive budget, or `lo`'s ring was
    full, loop again at once without waiting. When `eth0`'s transmit queue
-   was full, go to 1 and wait for the doorbell (transmit completions ring
-   it), never spinning; otherwise go to 1. So a flood never holds the
-   lock for more than one budget, and readiness reaches waiters between
-   rounds.
+   is usable but out of slots, wait for its doorbell or the earliest
+   remaining timer: ignore only eth0's already-due egress deadline, never
+   loopback, socket/orphan/keepalive or TIME-WAIT deadlines. An unusable
+   device is not a full queue; it uses the same deadline filtering and
+   cannot stop other timers. Cap every idle wait at 100 ms to recover lost
+   interrupts. A deadline wake that finds RX/TX completions without a ring
+   calls `BELL.note_missed_info` only if the ring count is still unchanged at
+   the end of the locked round. A ring during polling requests another
+   round and is not classified as missed. The observation logs at INFO
+   because an IRQ can still be in flight after the final sample.
+   Wait deadlines use the round's
+   own clock pair: real `now_ns + max(next - time, 0)`, capped at 100 ms;
+   a frozen test clock cannot cause a busy loop against the real clock.
+   So a flood never holds the lock for more than one budget, and readiness
+   reaches waiters between rounds.
 
 Syscalls work on smoltcp sockets inline, under the stack lock: they queue
 and dequeue data, connect, listen, shut down and close, then kick the
@@ -4395,32 +4406,76 @@ its interrupt handler only rings and kicks.
 - `VirtioHal::TABLE` (10f) is taken under it by `share`/`unshare`'s
   no-bounce path.
 
+**Fixed boot storage (B3, #474/#501).** On x86-64 with the pinned
+compiler, the measured ktest heap delta for the boxed `NetStack`, budget,
+registration table, lumen-net tables, both SocketSets and loopback is
+**about 6.2 MB, measured at #501** (allocator-rounded blocks).
+The two sets are 499,712 bytes each. `PortTable.uses` now reserves 393,216
+bytes (`65536 * 3 * sizeof(u16)`), down from 1,572,864 bytes with `usize`.
+Its count includes up to 2048 live and 2048 TIME-WAIT claims, safely below
+`u16::MAX`. The worker's preallocated notification and refill vectors add
+196,608 bytes; its thread/stack and the NIC's DMA buffers are separate.
+This is fixed boot overhead, not part of the charged socket-buffer budget.
+The fixed tables stay bounded; failed allocations return `NoMem`.
+`PortTable::try_new` returns `NoBufs` if its requested count could overflow
+its `u16` use counters. Both worker vectors are fallibly reserved before
+spawn; the current boot log includes them in its fixed-storage total.
+
 **The kernel's side (B3, `kernel/src/net/stack.rs` and `inet.rs`).** C3,
-C4 and C6 append to `Proto`'s arms and never change the rest:
+C4 and C6 implement their respective `net/udp.rs`, `net/tcp.rs`, and
+`net/icmp.rs` modules (C3 owns UDP, C4 TCP, C6 ICMP). `inet.rs` keeps one-line
+protocol delegations so these lanes do not edit shared arms. Each state
+owns its interior mutability; `send_lock` serializes senders across
+prepare/copy/commit chunks, and `recv_lock` serializes receivers across
+peek/copy/consume chunks. Neither user copies nor socket destruction or
+`from_id` belong inside either stack-access closure. Read-only
+`InetSocket::query` does not notify or kick; mutations use `with`.
+Each protocol module owns its state constructor and future `socket()`
+constructor. C3/C4/C6 append only their family/type/protocol selection arms
+in `net/sock.rs::create_socket`, delegating to those constructors; this is
+the shared append point. They do not append `Proto` or `SockOps` arms.
+
+The fields are:
 
 ```rust
 // kernel/src/net/stack.rs (B3)
 pub struct NetStack {
     inner: SleepMutex<NetInner>,              // level 9b
-    kicked: AtomicBool, wake: WaitQueue,      // the thread's wait
-    budget: &'static Budget,                  // NET_MEM_CAP
+    kicked: AtomicBool, wake: WaitQueue,
+    budget: &'static Budget,                 // NET_MEM_CAP
+    refill_failures: AtomicUsize,             // failure episodes
+    #[cfg(feature = "ktest")] owner: AtomicU64,
+    #[cfg(feature = "ktest")] rounds: AtomicU64,
 }
-struct NetInner { stack: lumen_net::Stack<VirtioNet>, socks: Box<[Weak<InetSocket>; NET_ENTRIES]> }
+struct NetInner {
+    stack: lumen_net::Stack<VirtioNet>,
+    entries: Box<[Option<Entry>]>,            // NET_ENTRIES, fixed at boot
+}
+struct Entry { id: SockId, sock: Weak<InetSocket>, warned: bool }
 impl NetStack {
     pub fn get() -> &'static NetStack;
-    pub fn with<R>(&self, f: impl FnOnce(&mut lumen_net::Stack<VirtioNet>) -> R) -> R;  // takes inner
+    pub(super) fn try_get() -> Option<&'static NetStack>;
+    pub(super) fn with<R>(&self, f: impl FnOnce(&mut lumen_net::Stack<VirtioNet>) -> R) -> R;
+    pub fn budget(&self) -> &'static Budget;
     pub fn kick(&self);
-    pub fn register(&self, id: SockId, sock: &Arc<InetSocket>);   // under inner
+    pub fn register(&self, id: SockId, sock: &Arc<InetSocket>);
+    pub fn unregister(&self, id: SockId);
 }
 // kernel/src/net/inet.rs (B3)
 pub struct InetSocket {
     id: SockId, family: Family, proto: Proto,
     send_lock: SleepMutex<()>, recv_lock: SleepMutex<()>,       // Lock 0
-    opts: SpinLock<InetOpts>,                                   // 10c leaf: timeouts, sizes, flags
+    opts: SpinLock<InetOpts>,                                   // 10c leaf: sizes today; C5 adds other options
     poll: KernelPollHead,
+    released: AtomicBool,
+    #[cfg(feature = "ktest")] test_readiness: SpinLock<Option<Readiness>>,
 }
-pub enum Proto { Tcp(TcpState), Udp(UdpState), Icmp(IcmpState) }   // C4, C3, C6 fill their arm
-impl SockOps for InetSocket { /* dispatches on `proto` */ }
+pub enum Proto { Tcp(TcpState), Udp(UdpState), Icmp(IcmpState) }   // states live in protocol modules
+impl InetSocket {
+    pub fn query<R>(&self, f: impl FnOnce(&lumen_net::Stack<VirtioNet>, SockId) -> R) -> R;
+    pub fn with<R>(&self, f: impl FnOnce(&mut lumen_net::Stack<VirtioNet>, SockId) -> R) -> R;
+}
+impl SockOps for InetSocket { /* delegates to protocol state methods */ }
 ```
 
 **Readiness (B3).**
@@ -4488,7 +4543,17 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
     replacements outside the lock and installs
     them before its next round, and stops refilling while the accept queue
     is full. A refill that fails (`-ENOBUFS`, `-ENOMEM`) warns once per
-    listener, counts in `net`, and is retried after each poll.
+    failure episode, counts episodes in `net`, and is retried after each
+    poll. Only filling the listener's entire shortfall (across both
+    interfaces) clears the warning latch; one installed prep does not.
+    `listen` takes explicit `BufSizes` and checks its preparations against
+    them. The first successful call captures them in
+    `Role::Listener { backlog, sizes }`; relisten/refill use those fixed
+    capacities. C4 prepares a relisten from `listener_sizes(id)`, even if
+    SO_*BUF changed, and accept constructs the child from those same sizes.
+    Relisten updates the backlog (Linux v6.12 `net/ipv4/af_inet.c:199-203`);
+    mismatched preparations remain a caller error. Kernel options are not
+    a second source of refill sizes.
   - A SYN past the pool, or to a full listener, is dropped by the SYN
     filter (above), as Linux drops it, so the client retries; no RST.
   - **Closing a listener** aborts (RST) its queued connections and
@@ -4974,6 +5039,7 @@ impl<D: NetDevice> Stack<D> {
         &mut self,
         id: SockId,
         backlog: usize,
+        sizes: BufSizes,
         pool: &mut dyn Iterator<Item = TcpPrep>,
         now: Instant,
     ) -> Result<(), NetError>;
@@ -5025,7 +5091,25 @@ copy it before releasing the lock. DHCP configuration failures retain the
 event for retry; only successfully applied leases reach `lease_event`.
 
 B3 supplies independent `lumen_rand` seeds to `try_new`/`attach_eth` for TCP
-ISNs and DHCP transaction IDs; clocks are not random seeds. `snapshot`,
+ISNs and DHCP transaction IDs; clocks are not random seeds.
+
+**No-entropy boot deviation:** until the pool is seeded, the stack stays
+absent and `lo` stays down too, an exception to "lo is always up" above.
+An INFO message includes `NoSource`'s explanation. Raw NIC status/ARP
+diagnostics remain available; `net` also reports Waiting for entropy,
+Failed or Up. `net-init` retries once per second while RDRAND can still
+answer or virtio-rng remains bound. It stops, logging once at INFO, if no
+source can ever answer. A failed virtio-rng probe consumed its device;
+this does not re-probe it or implement hotplug. A later successful draw
+starts the stack. Fixed-storage/vector allocation and worker spawn errors
+log ERROR and leave DEVICE untouched. The worker is spawned before device
+handoff or stack publication; there are no startup panics for these
+reported failures. Attaching the first NIC with no router uses reserved
+storage and cannot return an error (the address fits; no route is added).
+Once protocol constructors are wired, inet opens while the stack is
+absent return `ENETDOWN`.
+
+`snapshot`,
 `observe`, `note_sent`, and `syn_action` walk only live IDs. Per round,
 deadlines and orphan reaping still scan the fixed entry array, and
 `changed()` scans the fixed dirty array when collected. Port expiration
@@ -5548,7 +5632,7 @@ section 7's stack and is a dependency of B2 and B3. The developer image
 | B0 | the skeleton | #450, #464 | `M9_SYSCALLS` (appended to `linux/mod.rs`), stub modules `syscall/socket.rs`, `syscall/epoll.rs`, `syscall/evfd.rs`, `vfs/anon.rs` (anonymous inodes on dev `0:9` sharing one inode number, `InodeType::Anon` with `st_mode == 0600` and no `S_IFMT` bits, `noop_llseek`, `pread64`/`pwrite64` `-ESPIPE`, `/proc/<pid>/fd/N` reopen `-ENXIO` unless `O_PATH`, `mmap` `-ENODEV`, named `anon_inode:[eventpoll]`, `[eventfd]`, `[timerfd]`), `KernelFile::id()` (`OpenFile::id` from `lumen_vfs::next_open_file_id`), `KernelFile::obj: Option<FileObj>` (`Pipe`, `Tty`, `Anon(AnonObj)` with `AnonObj::{kind, pollable, release}` via `release_end`; B1 adds `Sock`, B5 and B6 append `AnonObj` arms) and `KernelFile::pollable()`, which `poll_file` and `epoll_ctl` both use, `syscalls.py`'s `PLANNED`/`ENOSYS_BY_DECISION` changes, empty `tests/scenarios/test_net.py`, `tools/linux-m9/` (modes `m9_net`, `m9_unix`, `m9_io`, `m9_proc`, `dnsd`; in `test_rootfs_dev.py`'s fixture tuple); `cargo:lumen-sockabi` (#464), `ktest:lumen_kernel::linux::m9_abi_constants_match_spec`, `ktest:lumen_kernel::vfs::anon::anon_inodes_report_dev_0_9_and_proc_fd_names`, `ktest:lumen_kernel::linux::syscall::poll::pollable_routes_each_file_kind`, `harness:test_syscalls::test_m9_table_covers_the_census`, `harness:test_syscalls::test_each_m9_stub_returns_enosys_and_names_its_issue` | 8, 15 |
 | B1 | socket file objects and every socket handler | B0 | `kernel/src/net/mod.rs`, `kernel/src/net/sock.rs`: `SockOps`, `block_on`, `InFlightFile`, sockfs (dev `0:8`), `FileObj::Sock(Arc<dyn SockOps>)` (reached through `pollable()` and `release_end`); every handler in `syscall/socket.rs` written once as generic `SockOps` dispatch (address decode, `msghdr`, `CmsgIter`/`CmsgWriter`, slot reservation and install), so families only implement `SockOps`; `socket`/`socketpair` dispatch by family, `read`/`write`/`readv`/`writev` as send and receive, `S_IFSOCK` `fstat`, `/proc/<pid>/fd` `socket:[ino]`, `FIONBIO`, `FIONREAD`; `ktest:lumen_kernel::net::sock::socket_and_socketpair_dispatch_by_family`, `ktest:lumen_kernel::net::sock::socket_io_and_poll_reach_sockops` | 8 |
 | B2 | `NetDevice` and virtio-net | B0, #459's PR 2, #463 | `kernel/src/net/virtio_net.rs` (in `DRIVERS`), `share`'s no-bounce path for recorded DMA runs (`virtio.rs`), the `net` shell command and its `selftest`, `RUNS` if its count needs it; `scenario:test_net::test_virtio_net_frames` | 7 |
-| B3 | the stack and the `net` thread | B1, B2, #459's PR 2 | `kernel/src/net/stack.rs` (`NetStack`, the thread, readiness, listener refill, the SYN filter's kernel side, the `net` command's TIME-WAIT list), `kernel/src/net/inet.rs` (`InetSocket` and its `Proto` enum, whose arms C3, C4 and C6 append; section 7's code block); `cargo:lumen-net` (#459), `ktest:lumen_kernel::net::stack::loopback_tcp_echo_through_the_net_thread`, `ktest:lumen_kernel::net::stack::readiness_notifies_after_the_stack_lock`, `ktest:lumen_kernel::net::stack::listen_pool_refills_between_polls`, `ktest:lumen_kernel::net::stack::socket_limits_give_enobufs` | 7, 9 |
+| B3 | the stack and the `net` thread | B1, B2, #459's PR 2 | `kernel/src/net/stack.rs` (`NetStack`, the thread, readiness, listener refill, the `net` command's TIME-WAIT list), `kernel/src/net/inet.rs` (`InetSocket` and its fixed `Proto` delegation; C3/C4/C6 own protocol modules and append constructor arms in `sock.rs::create_socket`; section 7's code block); `cargo:lumen-net` (#459), `ktest:lumen_kernel::net::stack::loopback_tcp_echo_through_the_net_thread`, `ktest:lumen_kernel::net::stack::readiness_notifies_after_the_stack_lock`, `ktest:lumen_kernel::net::stack::listen_pool_refills_between_polls`, `ktest:lumen_kernel::net::stack::socket_limits_give_enobufs` | 7, 9 |
 | B4 | address configuration | B3, #463 | `kernel/src/net/config.rs` (`lumen.net=`, DHCPv4, the lease log line); `ktest:lumen_kernel::net::config::net_cmdline_parses_off_dhcp_and_static`, `scenario:test_net::test_dhcp_dns_and_loopback` (its B4 checks; C3 and C4 add theirs) | 7 |
 | B5 | `epoll` | B0, B1, #461 | `kernel/src/linux/epoll.rs` (`Epoll`, the release hook, deferred notify), `syscall/epoll.rs`, lumen-vfs's `PollWaker`/`PollDefer` change (section 10) and every waker's update; `cargo:lumen-epoll`, `cargo:lumen-vfs`, `ktest:lumen_kernel::linux::epoll::interest_outlives_a_closed_dup_and_goes_with_the_last`, `ktest:lumen_kernel::linux::epoll::nested_notify_is_deferred_past_the_source_lock`, `ktest:lumen_kernel::linux::epoll::epoll_ctl_errors_in_linux_order`, `ktest:lumen_kernel::linux::epoll::copy_out_fault_unreports_the_rest`, `scenario:test_linux_io::test_epoll_edge_and_level_triggered` | 9, 10 |
 | B6 | `eventfd` and `timerfd` | B0, #468 | `kernel/src/linux/evfd.rs`, `syscall/evfd.rs`, `linux::timer`'s timerfd target; `cargo:lumen-eventfd`, `ktest:lumen_kernel::linux::evfd::timerfd_expiries_count_on_the_timers_worker`, `scenario:test_linux_io::test_eventfd_and_timerfd` | 8, 10 |
@@ -5557,7 +5641,7 @@ section 7's stack and is a dependency of B2 and B3. The developer image
 | C3 | UDP over IPv4 and IPv6 | B3, B4, #464 | `kernel/src/net/udp.rs`; `scenario:test_net::test_udp_datagrams_over_loopback`, `test_dhcp_dns_and_loopback`'s DNS check | 7, 8 |
 | C4 | TCP over IPv4 and IPv6 | B3, B4, #464 | `kernel/src/net/tcp.rs` (connect, listen and its pool, accept, shutdown, errors, `SIGPIPE`); `scenario:test_net::test_ipv4_and_ipv6_tcp_echo`, `test_dhcp_dns_and_loopback`'s TCP checks | 7, 8 |
 | C5 | options, names and message calls | C1, C3, C4 | `tests/conformance/libc-test-xfail.txt` loses #434's two entries (libc-test's `socket.c` needs C3's UDP and C5's `getsockname` and `SO_RCVTIMEO`; the PR says `Fixes #434`); the option table in `net/inet.rs` and `net/unix.rs`, `getsockname`/`getpeername`, `sendmsg`/`recvmsg` control paths, `SO_RCVTIMEO`/`SO_SNDTIMEO`; `scenario:test_net::test_bsd_socket_options_and_nonblocking` | 7, 8 |
-| C6 | ICMP: ping sockets and raw echo | B3 | `kernel/src/net/icmp.rs`, its `Proto` arm; appends `Icmp6Filter`, `Ipv6Checksum`, `Ipv6HopLimit` and `Ipv6RecvHopLimit` to lumen-sockabi's `SockOpt` (append-only) and answers them; `scenario:test_net::test_ping_over_loopback` | 7 |
+| C6 | ICMP: ping sockets and raw echo | B3 | `kernel/src/net/icmp.rs`, its constructor arm in `sock.rs::create_socket`; appends `Icmp6Filter`, `Ipv6Checksum`, `Ipv6HopLimit` and `Ipv6RecvHopLimit` to lumen-sockabi's `SockOpt` (append-only) and answers them; `scenario:test_net::test_ping_over_loopback` | 7 |
 | C7 | the census's leftovers | B1, C1 | `sendfile`, `copy_file_range`, `getresuid`/`getresgid`, `madvise(MADV_FREE)`, the CPU-time clocks in `clock_gettime`/`clock_getres`; `scenario:test_linux_proc::test_m9_small_syscalls` | 8 |
 | C8 | network and epoll stress, SMP | B5, B6, C4 | `scenario:test_net::test_connection_and_epoll_stress`, `test_epoll_edge_and_level_triggered`'s mixed-set check (a socket, an eventfd and a timerfd) | 15 |
 | D0 | the heavy tier (section 15) | — | `tier = "heavy"` in `tests/features/*.toml` and `status.py --tier pr\|heavy\|all`, `@pytest.mark.heavy`, `make test-heavy`, a KVM-only workflow; `harness:test_status::test_heavy_tier_is_gated_apart` (`--check --tier pr` ignores heavy rows and `--tier heavy` checks only them, each reading its own results file, and `--tier all` needs both) | 15 |
@@ -5585,7 +5669,7 @@ targets, `test_rootfs_dev.py`'s fixture tuple, the shared scenario files
 (`test_net.py`, `test_linux_io.py`, `test_linux_proc.py`: one test or
 tagged check per issue), the `tools/linux-m9` programs (one mode or
 check per issue), and these append-only regions with named owners:
-`inet.rs`'s `Proto` arms (C3's UDP, C4's TCP, C6's ICMP), `unix.rs`'s
+`sock.rs::create_socket`'s family/type/protocol arms (C3's UDP, C4's TCP, C6's ICMP), `unix.rs`'s
 option arms (C2's `SO_PASSCRED`, C5's table), lumen-sockabi's `SockOpt`
 variants (C6's ICMPv6 options) and `AnonObj`'s arms (B5, B6).
 `net/inet.rs` is B3's, then C5's (after C3 and C4 merge);
@@ -9984,7 +10068,9 @@ order: a lock may be taken while holding only locks above it.
     copy or with any lock 0–9
  9b. NetStack::inner (SleepMutex; M9, section 7): both interfaces, both
     socket sets, lumen-net's Stack and the virtio-net device; taken under
-    a Lock 0 socket lock or an epoll mutex, never held across a user copy
+    a Lock 0 socket lock, `net::virtio_net::SELFTEST_SERIAL` (a Lock 0
+    sleep mutex serializing shell diagnostic requests), or an epoll mutex,
+    never held across a user copy
     or with any lock 1–9a, and nothing allocates under it
 10. IRQ-off SpinLocks, in this sub-order:
     a. PROCS (the process table: lumen-proc's ProcTree, processes and

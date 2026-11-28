@@ -66,3 +66,46 @@ tests = [
 name = "virtio-net RX skip budget requests another poll; empty completion source does not (completed-buffer metadata seam)"
 milestone = "M9"
 tests = ["ktest:lumen_kernel::net::virtio_net::virtio_net_receive_budget_rings_for_another_poll"]
+
+[[feature]]
+name = "Network stack worker: IPv4/IPv6 loopback TCP, readiness after unlocking, listener refill and socket limits"
+milestone = "M9"
+tests = [
+    "cargo:lumen-net",
+    "ktest:lumen_kernel::net::stack::loopback_tcp_echo_through_the_net_thread",
+    "ktest:lumen_kernel::net::stack::readiness_notifies_after_the_stack_lock",
+    "ktest:lumen_kernel::net::stack::listen_pool_refills_between_polls",
+    "ktest:lumen_kernel::net::stack::socket_limits_give_enobufs",
+    "ktest:lumen_kernel::linux::syscall::poll::poll_masks_of_each_file_kind",
+    "scenario:test_net::test_virtio_net_frames",
+    "scenario:test_net::test_net_without_entropy_keeps_raw_diagnostics",
+]
+
+[[feature]]
+name = "Stack review regressions: the idle cap expires loopback TIME-WAIT with failed Ethernet, refill failures recover by episode, stale registrations cannot replace live sockets, and selftest keeps failure reasons"
+milestone = "M9"
+tests = [
+    "cargo:lumen-net",
+    "ktest:lumen_kernel::net::stack::loopback_time_wait_expires_with_unusable_ethernet",
+    "ktest:lumen_kernel::net::stack::refill_failures_warn_once_per_episode_and_recover",
+    "ktest:lumen_kernel::net::stack::recycled_socket_registration_preserves_the_new_generation",
+    "ktest:lumen_kernel::net::virtio_net::stack_selftest_preserves_failure_reasons",
+    "scenario:test_net::test_virtio_net_frames",
+    "scenario:test_net::test_net_without_entropy_keeps_raw_diagnostics",
+]
+
+[[feature]]
+name = "Network idle wait bounds a silent device without delaying earlier timers (made-up deadlines)"
+milestone = "M9"
+tests = ["ktest:lumen_kernel::net::stack::idle_wait_preserves_earlier_timers_and_bounds_silent_devices"]
+
+[[feature]]
+name = "Network worker chooses deadlines by device state; partial refills retain their episode; live listener diagnostics and replies arriving after a timed-out wait"
+milestone = "M9"
+tests = [
+    "cargo:lumen-net",
+    "ktest:lumen_kernel::net::stack::worker_deadline_selection_preserves_timers_for_every_device_state",
+    "ktest:lumen_kernel::net::stack::partial_listener_refill_keeps_the_failure_episode",
+    "ktest:lumen_kernel::net::stack::net_diagnostics_report_open_listener_and_memory",
+    "ktest:lumen_kernel::net::virtio_net::stack_selftest_reports_a_reply_after_the_wait_deadline",
+]

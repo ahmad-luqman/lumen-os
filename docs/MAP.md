@@ -25,6 +25,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   family-aware ingress selection, the SYN backlog filter and reset
   classification. `stack.rs`: `Stack`,
   generational `SockId` entries, bounded LISTEN pools, accept queues,
+  #474/#501 listener-owned `BufSizes` checked against explicit preparations
+  and `lib.rs::worker_deadline` for device-state deadline selection,
   event-based `changed` (including packet metadata capacity), per-state
   timers, orphan cleanup, shutdown readiness, datagram tickets, wildcard
   receive fairness, TCP tuple uniqueness and listener precedence,
@@ -555,14 +557,36 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `stat_from_metadata`/`statx_from_metadata`; the handlers' rules are in
   ARCHITECTURE section 8, "Handlers".
   `net/` (M9; ARCHITECTURE sections 7, 8 and 10): `net/mod.rs` (`net::init`,
-  called at boot after `linux::init` and populated by B3/B4, #472) and
+  called at boot after `linux::init`, #472/#474) and
   `net/virtio_net.rs` (#473: `VirtioNetDevice` implements lumen-net's
   `NetDevice` with 16 RX and 16 TX DMA buffers, single-descriptor frames,
   nonblocking receive/transmit/reclaim, MSI-X `BELL`, frame/drop counters,
   and the `net`/`net selftest` commands; `Health` distinguishes recoverable
   failure from permanent queue corruption; `DeviceSlot` (`Empty | Probed | Taken`)
   declines a second NIC even after `take_device`, which transfers ownership
-  (for B3) to its stack; RX budget exhaustion rings `BELL` for another poll) and
+  to its stack; RX budget exhaustion rings `BELL` for another poll; #474 adds
+  `VirtioNet`, which asserts TX lengths and observes the worker-driven ARP
+  selftest with typed outcomes retained past a waiter timeout, and routes
+  IRQ kicks and shell diagnostics to the stack; `rng::can_retry_seed`
+  reports whether an existing entropy source can still answer;
+  `virtio::Doorbell::note_missed_info` counts polling recovery without a
+  warning for an IRQ still in flight) and
+  `net/stack.rs` (#474: `NetStack::inner`, boot-reserved weak socket table,
+  fixed SocketSets (499,712 bytes each on x86-64) and shared buffer budget;
+  about 6.2 MB fixed boot storage measured at #501, plus 196,608 bytes of
+  worker vectors (included in the current boot log), excluding the worker
+  stack/NIC DMA; port-use counts are `u16`, independent RNG seeds, INFO and
+  deferred initialization only while an entropy source can still answer;
+  startup reserves the vectors and spawns before device handoff/publication,
+  the sole `net` polling thread,
+  post-lock readiness notifications, deadline-preserving idle polling,
+  generation-checked registrations, whole-shortfall refill failure episodes, and socket/TIME-WAIT
+  diagnostics, with ktests for nonzero listener counts/memory, partial refill
+  recovery, relative waits and device-state deadline selection), `net/inet.rs` (#474: `InetSocket`, fixed `Proto` delegations for C3/C4/C6,
+  Lock 0 I/O locks, options leaf and `KernelPollHead`, readiness mapping;
+  `net/tcp.rs`, `udp.rs`, `icmp.rs` own their protocol state and delegated
+  operations and constructors; C4/C3/C6 append their family/type/protocol
+  constructor selection only in `sock.rs::create_socket`), and
   `net/sock.rs` (#472: the generic socket file object: `SockKind`,
   `ShutdownHow`, `UserSpan`/`UserIovec`, `InFlightFile`, `SendIo` (with
   `named`), `RecvIo`, `RecvDone`, `SockOps` (with required `disconnect`),

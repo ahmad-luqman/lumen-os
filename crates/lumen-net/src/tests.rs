@@ -111,7 +111,7 @@ fn accept_failure_keeps_child_queued() {
     let mut s = stack();
     let b = budget();
     let l = s.open(Family::V4, Proto::Tcp).unwrap();
-    s.listen(l, 0, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
+    s.listen(l, 0, BufSizes { rx: 64, tx: 64 }, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
     let idx = *s.live.last().unwrap();
     let c = s.entries[idx].as_mut().unwrap();
     c.role = Role::Queued(l, 1);
@@ -127,8 +127,8 @@ fn somaxconn_plus_one_clamps_and_refill_reports_capacity_failure() {
     let b = budget();
     let l = s.open(Family::V4, Proto::Tcp).unwrap();
     let pool: Vec<_> = (0..8).map(|_| tcp(b)).collect();
-    s.listen(l, SOMAXCONN + 1, &mut pool.into_iter(), Instant::ZERO).unwrap();
-    assert_eq!(s.entry(l).unwrap().role, Role::Listener(SOMAXCONN));
+    s.listen(l, SOMAXCONN + 1, BufSizes { rx: 64, tx: 64 }, &mut pool.into_iter(), Instant::ZERO).unwrap();
+    assert_eq!(s.entry(l).unwrap().role, Role::Listener { backlog: SOMAXCONN, sizes: BufSizes { rx: 64, tx: 64 } });
     assert_eq!(s.preps_needed(l, PrepFor::Listen(SOMAXCONN + 1)), 0);
     assert_eq!(clamp_backlog((SOMAXCONN + 1) as i32), SOMAXCONN);
     let child = s.entries[*s.live.last().unwrap()].as_ref().unwrap().id;
@@ -244,7 +244,7 @@ fn hop_by_hop_ipv6_syn_cannot_steal_an_ipv4_listen_slot() {
     let b = budget();
     let l = s.open(Family::V4, Proto::Tcp).unwrap();
     s.bind(l, BindReq { port: 1234, ..BindReq::default() }, Preps::None, Instant::ZERO).unwrap();
-    s.listen(l, 0, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
+    s.listen(l, 0, BufSizes { rx: 64, tx: 64 }, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
     let c = s.open(Family::V4, Proto::Tcp).unwrap();
     assert_eq!(
         s.connect(c, IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), 1234), Some(ConnectPrep::Tcp(tcp(b))), Instant::ZERO),
@@ -289,7 +289,7 @@ fn ethernet_ipv6_syn_and_udp_filters_do_not_depend_on_loopback_pinning() {
     s.interfaces[1].as_mut().unwrap().iface.update_ip_addrs(|a| a.push(IpCidr::new(dst, 64)).unwrap());
     let l = s.open(Family::V4, Proto::Tcp).unwrap();
     s.bind(l, BindReq { port: 1234, ..BindReq::default() }, Preps::None, Instant::ZERO).unwrap();
-    s.listen(l, 0, &mut [tcp(b), tcp(b)].into_iter(), Instant::ZERO).unwrap();
+    s.listen(l, 0, BufSizes { rx: 64, tx: 64 }, &mut [tcp(b), tcp(b)].into_iter(), Instant::ZERO).unwrap();
     let mut p = [0u8; 74];
     p[..6].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
     p[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
@@ -382,7 +382,7 @@ fn supplied_seeds_control_tcp_isns_and_dhcp_transaction_ids() {
 fn connected_pair(s: &mut Stack<TestDevice>, b: &'static Budget) -> (SockId, SockId) {
     let l = s.open(Family::V4, Proto::Tcp).unwrap();
     s.bind(l, BindReq { port: 1234, ..BindReq::default() }, Preps::None, Instant::ZERO).unwrap();
-    s.listen(l, 0, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
+    s.listen(l, 0, BufSizes { rx: 64, tx: 64 }, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
     let c = s.open(Family::V4, Proto::Tcp).unwrap();
     assert_eq!(
         s.connect(c, IpEndpoint::new(loopback_addr(false), 1234), Some(ConnectPrep::Tcp(tcp(b))), Instant::ZERO),
@@ -577,7 +577,7 @@ fn listener_option_changes_update_prefilled_children_before_handshake() {
     let b = budget();
     let l = s.open(Family::V4, Proto::Tcp).unwrap();
     s.bind(l, BindReq { port: 1234, ..BindReq::default() }, Preps::None, Instant::ZERO).unwrap();
-    s.listen(l, 0, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
+    s.listen(l, 0, BufSizes { rx: 64, tx: 64 }, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
     let options = [
         (OptQuery::NoDelay, NetOpt::NoDelay(true)),
         (OptQuery::KeepIdle, NetOpt::KeepIdle(Duration::from_secs(2))),
@@ -909,7 +909,7 @@ fn closed_tcp_tuple_cannot_shadow_a_new_connection() {
     let local = loopback_addr(false);
     let l = s.open(Family::V4, Proto::Tcp).unwrap();
     s.bind(l, BindReq { port: 1234, ..BindReq::default() }, Preps::None, Instant::ZERO).unwrap();
-    s.listen(l, 0, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
+    s.listen(l, 0, BufSizes { rx: 64, tx: 64 }, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
     let mut clients = Vec::new();
     for _ in 0..2 {
         let c = s.open(Family::V4, Proto::Tcp).unwrap();
