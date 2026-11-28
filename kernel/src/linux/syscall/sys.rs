@@ -175,6 +175,16 @@ pub(super) fn sys_setfsgid(_gid: u32) -> u64 {
     0
 }
 
+/// `getresuid(ruid, euid, suid)` (118): M9 stub, replaced by C7.
+pub(super) fn sys_getresuid(_ruid: UserPtr, _euid: UserPtr, _suid: UserPtr) -> u64 {
+    super::not_implemented(general::__NR_getresuid)
+}
+
+/// `getresgid(rgid, egid, sgid)` (120): M9 stub, replaced by C7.
+pub(super) fn sys_getresgid(_rgid: UserPtr, _egid: UserPtr, _sgid: UserPtr) -> u64 {
+    super::not_implemented(general::__NR_getresgid)
+}
+
 const _: () = {
     assert!(core::mem::size_of::<general::rusage>() == 18 * 8);
     assert!(core::mem::size_of::<general::statfs>() == 15 * 8);

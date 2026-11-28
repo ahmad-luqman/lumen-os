@@ -233,21 +233,7 @@ fn wait_ready(
 /// `waker` when provided and pushing any returned [`PollGuard`] onto `guards`.
 fn poll_file(file: &KernelFile, waker: Option<&Arc<dyn PollWaker>>, guards: &mut Vec<PollGuard>) -> PollMask {
     static WARNED_NO_GUARD: AtomicBool = AtomicBool::new(false);
-    if let Some(pipe) = file.pipe() {
-        let (mask, guard) = pipe.poll_open(file.access_mode(), file.writer_generation(), waker);
-        if let Some(guard) = guard {
-            guards.push(guard);
-        }
-        return mask;
-    }
-    if let Some(end) = file.tty() {
-        let (mask, guard) = end.tty.poll(end.master, file.access_mode(), waker);
-        if let Some(guard) = guard {
-            guards.push(guard);
-        }
-        return mask;
-    }
-    match file.inode().pollable() {
+    match file.pollable() {
         Some(pollable) => {
             let (mask, guard) = pollable.poll(file.access_mode(), waker);
             match guard {

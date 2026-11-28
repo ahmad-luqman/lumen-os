@@ -114,8 +114,15 @@ $(BUILD)/linux/m8_proc: tools/linux-m8/signal_waits.rs tools/linux-m8/signals.rs
 $(BUILD)/linux/m8_proc: tools/linux-m8/threads.rs tools/linux-m8/timers.rs
 $(BUILD)/linux/m8_proc: tools/linux-m8/sessions.rs
 
+# M9's (#471; ARCHITECTURE section 15, "M9's tests"); each `mod common;`s
+# tools/linux-m9/common.rs.
+M9_LINUX := m9_net m9_unix m9_io m9_proc dnsd
+M9_LINUX_OUT := $(addprefix $(BUILD)/linux/,$(M9_LINUX))
+$(M9_LINUX_OUT): $(BUILD)/linux/%: tools/linux-m9/%.rs tools/linux-m9/common.rs $(BUILD)/deps/alpine-minirootfs/.version rust-toolchain.toml
+	$(MUSL_EXE)
+
 # Every Linux test binary: built by `build`, staged by both images.
-LINUX_TEST_BINS := $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(M8_LINUX_OUT)
+LINUX_TEST_BINS := $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(M8_LINUX_OUT) $(M9_LINUX_OUT)
 
 # Two kernels: the normal one (the shells) and the in-kernel test build.
 # `| apps`: built first (order-only: the kernel rebuilds when cargo says).
@@ -230,13 +237,13 @@ lint: ## clippy on host crates (incl. their tests), the kernel and the apps; ruf
 fmt: ## Format Rust and Python
 	cargo fmt --all
 	cd apps && cargo fmt --all
-	rustfmt --edition 2024 tools/linux-hello/hello.rs tools/linux-m7/*.rs tools/linux-m8/*.rs
+	rustfmt --edition 2024 tools/linux-hello/hello.rs tools/linux-m7/*.rs tools/linux-m8/*.rs tools/linux-m9/*.rs
 	uv run --frozen ruff format tools tests
 
 fmt-check: ## Check formatting
 	cargo fmt --all -- --check
 	cd apps && cargo fmt --all -- --check
-	rustfmt --edition 2024 --check tools/linux-hello/hello.rs tools/linux-m7/*.rs tools/linux-m8/*.rs
+	rustfmt --edition 2024 --check tools/linux-hello/hello.rs tools/linux-m7/*.rs tools/linux-m8/*.rs tools/linux-m9/*.rs
 	uv run --frozen ruff format --check tools tests
 
 status: ## Regenerate docs/STATUS.md from the last test results

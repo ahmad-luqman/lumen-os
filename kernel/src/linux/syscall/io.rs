@@ -184,6 +184,24 @@ pub(super) fn sys_sync() -> u64 {
     0
 }
 
+/// `sendfile(out, in, offset, count)` (40): M9 stub, replaced by C7.
+pub(super) fn sys_sendfile(_out_fd: Fd, _in_fd: Fd, _offset: UserPtr, _count: u64) -> u64 {
+    super::not_implemented(crate::linux::general::__NR_sendfile)
+}
+
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` (326): M9
+/// stub, replaced by C7.
+pub(super) fn sys_copy_file_range(
+    _fd_in: Fd,
+    _off_in: UserPtr,
+    _fd_out: Fd,
+    _off_out: UserPtr,
+    _len: u64,
+    _flags: u32,
+) -> u64 {
+    super::not_implemented(crate::linux::general::__NR_copy_file_range)
+}
+
 #[cfg(feature = "ktest")]
 use super::at;
 #[cfg(feature = "ktest")]

@@ -232,23 +232,26 @@ PLANNED: dict[str, frozenset[str]] = {
         "recvfrom", "sendmsg", "recvmsg", "shutdown", "getsockname", "getpeername", "setsockopt",
         "getsockopt", "epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait",
         "epoll_pwait2", "eventfd", "eventfd2", "timerfd_create", "timerfd_settime",
-        "timerfd_gettime",
+        "timerfd_gettime", "sendfile", "copy_file_range", "getresuid", "getresgid", "madvise",
     }),
     "M10": frozenset({
-        "mremap", "madvise", "memfd_create", "inotify_init", "inotify_init1", "inotify_add_watch",
+        "mremap", "memfd_create", "inotify_init", "inotify_init1", "inotify_add_watch",
         "inotify_rm_watch", "rseq", "io_uring_setup", "io_uring_enter",
         "io_uring_register",
     }),
 }
 # fmt: on
 
-# The syscalls M8 leaves -ENOSYS, each by a decision ARCHITECTURE section 8
-# records ("Stays `-ENOSYS` in M8, and why"): sendfile and membarrier (the
-# callers fall back), clone3 and execveat, futex_waitv, the scheduler-policy
-# calls (no real-time policies), signalfd and signalfd4, and times.
+# The syscalls M8 and M9 leave -ENOSYS, each by a decision ARCHITECTURE section
+# 8 records ("Stays `-ENOSYS` in M8, and why" / "Stays `-ENOSYS` (or refused)
+# in M9, and why"): membarrier (the census calls only register private
+# expedited, which musl ignores), sendmmsg and recvmmsg (no M9 census call),
+# clone3 and execveat, futex_waitv, the scheduler-policy calls (no real-time
+# policies), signalfd and signalfd4 (no census call, not in gVisor's subset),
+# and times.
 # fmt: off
 ENOSYS_BY_DECISION: frozenset[str] = frozenset({
-    "sendfile", "membarrier", "clone3", "execveat", "futex_waitv", "sched_setparam",
+    "membarrier", "sendmmsg", "recvmmsg", "clone3", "execveat", "futex_waitv", "sched_setparam",
     "sched_getparam", "sched_setscheduler", "sched_getscheduler", "sched_get_priority_max",
     "sched_get_priority_min", "sched_rr_get_interval", "signalfd", "signalfd4", "times",
 })
@@ -646,6 +649,22 @@ M8_ARGS: dict[str, int] = {
     "setpriority": 3, "getrusage": 2, "sysinfo": 1, "prctl": 5, "statfs": 2, "fstatfs": 2,
     "clock_getres": 2, "getcpu": 3, "setfsuid": 1, "setfsgid": 1,
 }
+
+# How many arguments each of M9_SYSCALLS takes: Linux's x86-64 signatures
+# (`SYSCALL_DEFINE<n>`), so its arm reads that many registers.
+M9_ARGS: dict[str, int] = {
+    # socket
+    "socket": 3, "connect": 3, "accept": 3, "sendto": 6, "recvfrom": 6, "sendmsg": 3,
+    "recvmsg": 3, "shutdown": 2, "bind": 3, "listen": 2, "getsockname": 3, "getpeername": 3,
+    "socketpair": 4, "setsockopt": 5, "getsockopt": 5, "accept4": 4,
+    # epoll
+    "epoll_create": 1, "epoll_wait": 4, "epoll_ctl": 4, "epoll_pwait": 6, "epoll_create1": 1,
+    "epoll_pwait2": 6,
+    # evfd
+    "timerfd_create": 2, "eventfd": 1, "timerfd_settime": 4, "timerfd_gettime": 2, "eventfd2": 2,
+    # C7
+    "madvise": 3, "sendfile": 4, "copy_file_range": 6, "getresuid": 3, "getresgid": 3,
+}
 # fmt: on
 
 # The arms written inline in `dispatch`, calling no handler (M6's), by their
@@ -693,8 +712,9 @@ def arm_problems(arms: Iterable[Arm]) -> list[str]:
     - one calling a handler not named after the first syscall of its pattern
       (`sys_<name>`), or more than one, or none (but `INLINE_ARMS`);
     - one reading argument registers other than the first few in order;
-    - an M8 syscall's (`M8_ARGS`) reading other than its argument count, or
-      sharing its arm."""
+    - an M8 or M9 syscall's (`M8_ARGS`, `M9_ARGS`) reading other than its
+      argument count, or sharing its arm."""
+    expected_args = {**M8_ARGS, **M9_ARGS}
     problems = []
     for arm in arms:
         first = arm.names[0]
@@ -702,9 +722,11 @@ def arm_problems(arms: Iterable[Arm]) -> list[str]:
             problems.append(f"{first}: calls {', '.join(arm.handlers) or 'no handler'}")
         if arm.registers != ARG_REGISTERS[: len(arm.registers)]:
             problems.append(f"{first}: reads {', '.join(arm.registers)}")
-        elif first in M8_ARGS and len(arm.registers) != M8_ARGS[first]:
-            problems.append(f"{first}: reads {len(arm.registers)} registers, not {M8_ARGS[first]}")
-        if len(arm.names) > 1 and set(arm.names) & M8_ARGS.keys():
+        elif first in expected_args and len(arm.registers) != expected_args[first]:
+            problems.append(
+                f"{first}: reads {len(arm.registers)} registers, not {expected_args[first]}"
+            )
+        if len(arm.names) > 1 and set(arm.names) & expected_args.keys():
             problems.append(f"{first}: shares its arm with {', '.join(arm.names[1:])}")
     return problems
 

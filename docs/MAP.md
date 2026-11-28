@@ -337,19 +337,23 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `vfs/devpts.rs` (M8, #388, #389: `/dev/pts` filesystem `Devpts` on dev
   0:5, `PTY_MAX` = 256, `TtyEnd` open-description lifetime, `open`
   allocating PTY pairs on `/dev/ptmx` and resolving `/dev/tty` and
-  `/dev/console`, `console_file`)
+  `/dev/console`, `console_file`),
+  `vfs/anon.rs` (M9 B0, #471: unmounted anonymous inodes on `ANON_DEV` `0:9`,
+  `AnonKind`/`AnonInode`/`new_inode` naming `anon_inode:[eventpoll]`,
+  `anon_inode:[eventfd]` and `anon_inode:[timerfd]`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `mounts`: an errored ext4 volume
   `ro,errors=remount-ro`, `format_mounts_of`, #349; `/proc/<pid>/maps` from
   `AddressSpace::format_maps`, its lines `lumen_vm::maps`'s; `/proc/<pid>/exe`
   updated on `execve`, #381; the node
   kinds, inode numbers, fds and numeric names `lumen_vfs::procfs`'s).
-  `linux/` (M6, M7, M8; ARCHITECTURE section 8): `linux/mod.rs` the
-  `linux-raw-sys` re-exports, `M6_SYSCALLS`, `M7_SYSCALLS` and
-  `M8_SYSCALLS` (the numbers, `syscall_name`; pinned by the
-  `abi_constants_match_spec`, `m7_abi_constants_match_spec` and
-  `m8_abi_constants_match_spec` ktests, the latter two with their flags and
-  struct layouts, #371), `uname`'s payload, `pub use process::timer`, and the `linux` command (`linux /path`
+  `linux/` (M6–M9; ARCHITECTURE section 8): `linux/mod.rs` the
+  `linux-raw-sys` re-exports (incl. `net` via `lumen-sockabi`, #471),
+  `M6_SYSCALLS`, `M7_SYSCALLS`, `M8_SYSCALLS` and `M9_SYSCALLS` (32 new M9
+  numbers, #471) (the numbers, `syscall_name`; pinned by the
+  `abi_constants_match_spec`, `m7_abi_constants_match_spec`,
+  `m8_abi_constants_match_spec` and `m9_abi_constants_match_spec` ktests,
+  the latter three with their flags and struct layouts, #371, #471), `uname`'s payload, `pub use process::timer`, and the `linux` command (`linux /path`
   from the VFS, `run_exec`: load, run, count frames, the path as `exe`, the thread named after the path's last component, #276);
   `linux/init.rs` `linux::init`, called at boot after the VFS to start pid 1
   (`process::start_init`: a kernel-owned process with no threads, every
@@ -368,9 +372,10 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   methods such as `record_exit`), `UserThread` (a tid, its process,
   `clear_child_tid`, robust list; held in the scheduler thread's
   `UserThreadState::linux`, so a syscall finds it lock-free through
-  `current_thread`/`current_process`), `KernelFile` (combined `end_refs`,
-  in-flight `IoFile` refcount guard, optional `PipeEnd` and `TtyEnd`, #379,
-  #386, #388), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
+  `current_thread`/`current_process`), `KernelFile` (global monotonic `id`,
+  combined `end_refs`, in-flight `IoFile` refcount guard, optional
+  `PipeEnd`, `TtyEnd` and `AnonObj`, and `pollable()`, #379, #386, #388,
+  #471), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
   vfork and thread clone validation, #380, #382), `process/table.rs`
   (`ProcTable` behind `PROCS`: lumen-proc's tree, processes by pid, threads
   by tid, `WaitResult`, `link_init`/`link_root`/`link_thread`/
@@ -423,11 +428,12 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `create`/`set`/`get`/`delete`/`overrun`/`delivered`/`clear`);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern; M7's and
-  M8's `not_implemented` stubs are gone; of the M8 table's rows only
-  `sendfile` and `membarrier` stay `-ENOSYS`; with `clone3`, `execveat`,
-  `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` they
-  make up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
-  (ARCHITECTURE section 8, "Stays `-ENOSYS` in M8")), `unmap_past`
+  M8's `not_implemented` stubs are gone, while M9's 32 B0 stubs (#471) live
+  in `socket.rs`, `epoll.rs`, `evfd.rs` plus C7's in `io.rs`, `mem.rs`,
+  `sys.rs`; `sendmmsg`, `recvmmsg`, `membarrier`, `clone3`, `execveat`,
+  `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` make
+  up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
+  (ARCHITECTURE section 8)), `unmap_past`
   (#378; `meta.rs`'s `unmap_past_size_now`, the unmap after any failed
   truncate: `truncate`, `ftruncate`, `O_TRUNC`, #414) and the shared copy helpers, `time.rs` (`RawTimespec`,
   `read_timespec`, `write_timespec`, `ERESTARTNOHAND`, #383, shared by `futex`,
@@ -443,7 +449,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `kill`, `tkill`, `tgkill`, `pause`, `restart_syscall`, #384, #385),
   `futex` (`futex`, `set_robust_list`, `get_robust_list`, `nanosleep`,
   `clock_nanosleep`, #383), `poll` (`poll`, `ppoll`, `select`, `pselect6`
-  over `wait_ready` and `PollWait`, #374, #385), `pipe` (`pipe`, `pipe2`,
+  over `wait_ready`, `PollWait` and `KernelFile::pollable`, #374, #385,
+  #471), `pipe` (`pipe`, `pipe2`,
   `dup`, `dup2`, `dup3`, `mknod`, `mknodat`, #386), `timer` (`alarm`,
   `getitimer`, `setitimer`, `timer_create`, `timer_settime`,
   `timer_gettime`, `timer_getoverrun`, `timer_delete`, #392) and `sys`
@@ -1080,7 +1087,7 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   census on pinned stock Alpine 3.21 x86-64 generating `tests/linux/m8-census.toml`
   and `tests/linux/m9-census.toml`.
 - `tools/mkrootfs.sh`, `tools/mkrootfs-dev.sh`, `tools/linux-m7/`,
-  `tools/linux-m8/`: deterministic `build/alpine-rootfs.ext4`
+  `tools/linux-m8/`, `tools/linux-m9/`: deterministic `build/alpine-rootfs.ext4`
   assembly (`s_flags` saying signed directory hashes on every host,
   `tools/ext4-signed-hash.sh`, #308); `tools/mkrootfs-dev.sh` (`make
   rootfs-dev`, #344) builds `build/alpine-dev.ext4` from the minirootfs,
@@ -1117,8 +1124,15 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `ptyrun-relay`/`ptyrun-child`, the relay's backpressure, partial writes
   and `SIGWINCH`, #437), and
   `ptyrun` (D3's PTY runner: `--script <file> -- <program>` scripted PTY
-  master and interactive console-to-PTY relay forwarding `SIGWINCH`, #395, #437).
-- `tests/scenarios/`: QEMU tests, incl. `test_linux_user.py` (M6/M7 ring-3
+  master and interactive console-to-PTY relay forwarding `SIGWINCH`, #395, #437);
+  `tools/linux-m9/` (#471): M9's test programs, built the same way into
+  `build/linux/` and staged in both images, sharing `common.rs` (the raw
+  `syscall`, `say!`, argv, `Fail`, `run_checks`): `m9_net`, `m9_unix`,
+  `m9_io`, `m9_proc` and `dnsd` (B0 skeletons; later issues add their checks
+  and C3 implements `dnsd`).
+- `tests/scenarios/`: QEMU tests, incl. `test_net.py` (M9 networking,
+  sockets, `AF_UNIX`, ICMP and stress; B0 empty skeleton, #471),
+  `test_linux_user.py` (M6/M7 ring-3
   entry, faults, ABI, busybox and `dlopen`), `test_linux_proc.py`
   (processes, `fork`/`exec`/shebangs, signals/`sigaltstack`, signal waits,
   `futex`/nanosleep, pthreads, sessions/groups, interval/POSIX timers, small

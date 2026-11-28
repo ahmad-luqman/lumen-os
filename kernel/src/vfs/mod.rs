@@ -9,6 +9,7 @@
 //! its ktest, `ext4_crate_smoke`, is in `vfs/tests.rs` with the others of
 //! this file's code).
 
+pub mod anon;
 pub mod devfs;
 pub mod devpts;
 pub mod ext4;

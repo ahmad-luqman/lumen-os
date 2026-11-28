@@ -643,12 +643,12 @@ def test_kernel_tables_reads_each_milestones_rows():
 
 def test_m8_table_covers_the_census():
     """ARCHITECTURE section 8: every syscall the M8 census (#337) saw is in
-    M6_SYSCALLS, M7_SYSCALLS or M8_SYSCALLS, or -ENOSYS by a recorded
-    decision (ENOSYS_BY_DECISION); M8's table is the plan's (PLANNED["M8"]),
+    M6_SYSCALLS–M9_SYSCALLS or -ENOSYS by a recorded decision
+    (ENOSYS_BY_DECISION); M8's table is the plan's (PLANNED["M8"]),
     each of its numbers dispatched, and no decided -ENOSYS one dispatched or
     in a table."""
     tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
-    assert set(tables) == {"M6", "M7", "M8"}
+    assert set(tables) == {"M6", "M7", "M8", "M9"}
     rows = [name for names in tables.values() for name in names]
     assert len(rows) == len(set(rows)), "a syscall in two tables, or twice in one"
     assert (len(tables["M6"]), len(tables["M7"]), len(tables["M8"])) == (30, 47, 60)
@@ -657,7 +657,7 @@ def test_m8_table_covers_the_census():
     assert syscalls.uncovered(census_names, tables) == []
     # The check could have failed: a census syscall in no table and no
     # decision is reported, and so is one a table lost.
-    assert syscalls.uncovered([*census_names, "socket", "mremap"], tables) == ["mremap", "socket"]
+    assert syscalls.uncovered([*census_names, "ptrace", "mremap"], tables) == ["mremap", "ptrace"]
     without_pipe = {**tables, "M8": [n for n in tables["M8"] if n != "pipe"]}
     assert syscalls.uncovered(census_names, without_pipe) == ["pipe"]
 
@@ -666,13 +666,15 @@ def test_m8_table_covers_the_census():
     implemented = syscalls.dispatched(DISPATCH_FILE.read_text())
     assert set(tables["M8"]) <= implemented
     assert not syscalls.ENOSYS_BY_DECISION & implemented
-    # The two the census saw are among the decisions, which are section 8's
-    # "Stays `-ENOSYS` in M8" list.
-    assert {"sendfile", "membarrier"} <= census_names & syscalls.ENOSYS_BY_DECISION
+    # `membarrier` stays -ENOSYS; `sendfile` moved to M9_SYSCALLS; `sendmmsg`
+    # and `recvmmsg` joined section 8's M9 -ENOSYS decisions.
+    assert "membarrier" in census_names & syscalls.ENOSYS_BY_DECISION
+    assert "sendfile" in set(tables["M9"])
     assert syscalls.ENOSYS_BY_DECISION == {
-        "sendfile", "membarrier", "clone3", "execveat", "futex_waitv", "sched_setparam",
-        "sched_getparam", "sched_setscheduler", "sched_getscheduler", "sched_get_priority_max",
-        "sched_get_priority_min", "sched_rr_get_interval", "signalfd", "signalfd4", "times",
+        "membarrier", "sendmmsg", "recvmmsg", "clone3", "execveat", "futex_waitv",
+        "sched_setparam", "sched_getparam", "sched_setscheduler", "sched_getscheduler",
+        "sched_get_priority_max", "sched_get_priority_min", "sched_rr_get_interval",
+        "signalfd", "signalfd4", "times",
     }  # fmt: skip
 
 
@@ -1053,11 +1055,13 @@ def test_m9_census_parses(tmp_path):
 
 def test_m9_report_lists_m10_rows_the_gate_needs(tmp_path, capsys):
     """M9 census report (#451): compares the census against M6-M8 kernel tables
-    and ROADMAP's M9/M10 lists, surfacing M10 rows, M8 ENOSYS_BY_DECISION calls
+    and ROADMAP's M9/M10 lists, surfacing M10 rows, ENOSYS_BY_DECISION calls
     (syscall count only), CPU-time clocks separately, unplanned calls, and the
     #450 design probes."""
     (tmp_path / "net-bench.strace").write_text(M9_TRACE_NET)
-    (tmp_path / "ruby-fiber.strace").write_text(M9_TRACE_RUNTIME)
+    (tmp_path / "ruby-fiber.strace").write_text(
+        M9_TRACE_RUNTIME + "202   ptrace(0, 0, NULL, NULL) = -1 EPERM (Operation not permitted)\n"
+    )
     _write_meta(tmp_path)
     census_file = tmp_path / "m9-census.toml"
     census_file.write_text(syscalls.build(tmp_path, tmp_path, milestone="M9"))
@@ -1082,37 +1086,44 @@ def test_m9_report_lists_m10_rows_the_gate_needs(tmp_path, capsys):
 
     # Priority section order (ENOSYS header counts syscalls only; CPU-time clocks separate).
     order = [
-        "unplanned (2):",
-        "M10 rows seen in the M9 census (3):",
-        "M8 ENOSYS_BY_DECISION seen in the M9 census (4):",
+        "unplanned (1):",
+        "M10 rows seen in the M9 census (2):",
+        "M8 ENOSYS_BY_DECISION seen in the M9 census (5):",
         "CPU-time clocks seen in the M9 census (2):",
-        "M9 planned (25):",
+        "M9 planned (27):",
         "M6-M8 tables (5):",
         "M9 design probes (#450):",
     ]
     positions = [out.index(header) for header in order]
     assert positions == sorted(positions)
 
-    # M10 rows seen in the census: exactly the three present in the trace.
-    m10 = sections["M10 rows seen in the M9 census (3):"]
-    for name in ("mremap", "madvise", "memfd_create"):
+    # M10 rows seen in the census: mremap and memfd_create (madvise moved to M9).
+    m10 = sections["M10 rows seen in the M9 census (2):"]
+    for name in ("mremap", "memfd_create"):
         assert re.search(rf"^ +\d+ {name} ", m10, re.MULTILINE), m10
+    assert "madvise" not in m10
     assert "io_uring_setup" not in m10
     assert " read " not in m10
 
-    # M8 ENOSYS_BY_DECISION rows (4 syscalls only); CPU-time clocks on their own block.
-    enosys = sections["M8 ENOSYS_BY_DECISION seen in the M9 census (4):"]
-    for name in ("sendfile", "times", "signalfd4", "clone3"):
+    # ENOSYS_BY_DECISION rows (5 syscalls only); CPU-time clocks on their own block.
+    enosys = sections["M8 ENOSYS_BY_DECISION seen in the M9 census (5):"]
+    for name in ("times", "signalfd4", "recvmmsg", "sendmmsg", "clone3"):
         assert re.search(rf"^ +\d+ {name} ", enosys, re.MULTILINE), enosys
+    assert "sendfile" not in enosys
     assert "CPU-time" not in enosys
 
     clocks_sec = sections["CPU-time clocks seen in the M9 census (2):"]
     assert "  clock_gettime: -6, 2, 3 (ruby-fiber)" in clocks_sec
     assert "  clock_getres: 3 (ruby-fiber)" in clocks_sec
 
-    # Unplanned: sendmmsg and recvmmsg (not in M6-M8, M9, M10 or ENOSYS_BY_DECISION).
-    unplanned = sections["unplanned (2):"]
-    assert "recvmmsg" in unplanned and "sendmmsg" in unplanned
+    # Unplanned: ptrace (not in M6-M8, M9, M10 or ENOSYS_BY_DECISION).
+    unplanned = sections["unplanned (1):"]
+    assert "ptrace" in unplanned
+
+    # M9 planned includes madvise and sendfile alongside the socket/epoll/evfd calls.
+    m9_planned = sections["M9 planned (27):"]
+    for name in ("madvise", "sendfile", "socket", "epoll_ctl"):
+        assert re.search(rf"^ +\d+ {name} ", m9_planned, re.MULTILINE), m9_planned
 
     # M6-M8 tables include M6/M7 (read, ioctl, clock_gettime) and M8-only (clock_getres, pipe2).
     m6_m8 = sections["M6-M8 tables (5):"]
@@ -1160,3 +1171,40 @@ def test_m9_report_lists_m10_rows_the_gate_needs(tmp_path, capsys):
     assert f"AF_PACKET (domain 17): {not_seen}" in clean_out
     assert f"SIOC*IF* ioctls (0x8910–0x893f): {not_seen}" in clean_out
     assert "CPU-time clocks: none" in clean_out
+
+
+def test_m9_table_covers_the_census():
+    """ARCHITECTURE section 8 (B0, #471): every syscall the M9 census (#451)
+    saw is in M6_SYSCALLS–M9_SYSCALLS or -ENOSYS by a recorded decision
+    (ENOSYS_BY_DECISION); M9's table matches PLANNED["M9"] and M9_ARGS,
+    each of its numbers is dispatched, and no decided -ENOSYS syscall is
+    dispatched or in a table."""
+    tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
+    assert set(tables) == {"M6", "M7", "M8", "M9"}
+    rows = [name for names in tables.values() for name in names]
+    assert len(rows) == len(set(rows)), "a syscall in two tables, or twice in one"
+    assert (len(tables["M6"]), len(tables["M7"]), len(tables["M8"]), len(tables["M9"])) == (
+        30,
+        47,
+        60,
+        32,
+    )
+
+    census_names = tomllib.loads(M9_CENSUS.read_text())["syscalls"].keys()
+    assert syscalls.uncovered(census_names, tables) == []
+    # Mutant checks: an uncovered syscall or one dropped from M9_SYSCALLS fails.
+    assert syscalls.uncovered([*census_names, "ptrace", "mremap"], tables) == ["mremap", "ptrace"]
+    without_socket = {**tables, "M9": [n for n in tables["M9"] if n != "socket"]}
+    assert syscalls.uncovered(census_names, without_socket) == ["socket"]
+    without_epoll = {**tables, "M9": [n for n in tables["M9"] if n != "epoll_ctl"]}
+    assert syscalls.uncovered(census_names, without_epoll) == ["epoll_ctl"]
+
+    assert set(tables["M9"]) == syscalls.PLANNED["M9"] == syscalls.M9_ARGS.keys()
+    assert not syscalls.ENOSYS_BY_DECISION & set(rows)
+    implemented = syscalls.dispatched(DISPATCH_FILE.read_text())
+    assert set(tables["M9"]) <= implemented
+    assert not syscalls.ENOSYS_BY_DECISION & implemented
+    assert census_names & syscalls.ENOSYS_BY_DECISION == {"membarrier"}
+    assert {"sendmmsg", "recvmmsg", "membarrier", "signalfd", "signalfd4"} <= (
+        syscalls.ENOSYS_BY_DECISION
+    )

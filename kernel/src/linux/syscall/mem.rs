@@ -262,5 +262,10 @@ fn msync(addr: u64, length: u64, flags: i32) -> Result<(), u32> {
     if found.hole { Err(errno::ENOMEM) } else { Ok(()) }
 }
 
+/// `madvise(addr, len, advice)` (28): M9 stub, replaced by C7.
+pub(super) fn sys_madvise(_addr: u64, _len: u64, _advice: i32) -> u64 {
+    super::not_implemented(general::__NR_madvise)
+}
+
 #[cfg(feature = "ktest")]
 mod tests;
