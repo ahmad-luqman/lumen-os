@@ -105,6 +105,7 @@ struct Entry {
     keep_probes: u32,
     icmp_destinations: [Destinations; 2],
     raw_ident: Option<u16>,
+    listen_sizes: Option<BufSizes>,
 }
 // ICMP metadata in smoltcp contains only the source. Keep one destination
 // alongside each of its eight receive slots, including queued alias traffic.
@@ -181,6 +182,7 @@ impl Entry {
             keep_probes: 0,
             icmp_destinations: [Destinations::default(); 2],
             raw_ident: None,
+            listen_sizes: None,
         }
     }
 }
@@ -227,7 +229,8 @@ pub struct Stack<D: NetDevice> {
     // Loopback alias ICMP sockets need a source override during egress.
     held_icmp: Vec<(usize, icmp::Socket<'static>)>,
     now: Instant,
-    next_poll: Option<Instant>,
+    next_poll: [Option<Instant>; 2],
+    socket_deadline: Option<Instant>,
     needs_poll: bool,
     queue_order: u64,
     lease: Option<Lease>,
@@ -268,7 +271,8 @@ impl<D: NetDevice> Stack<D> {
             empty: SocketSet::new(filled(1, || SocketStorage::EMPTY)?),
             held_icmp: reserved(NET_SOCKETS)?,
             now,
-            next_poll: None,
+            next_poll: [None; 2],
+            socket_deadline: None,
             needs_poll: false,
             queue_order: 0,
             lease: None,
@@ -343,6 +347,10 @@ impl<D: NetDevice> Stack<D> {
     fn touch(&mut self, id: SockId) {
         self.mark(id);
         self.needs_poll = true;
+    }
+    /// Whether this exact generation is a live user or listener identity.
+    pub fn contains(&self, id: SockId) -> bool {
+        self.entry(id).is_ok()
     }
     /// Creates bookkeeping for the supplied address family and protocol.
     pub fn open(&mut self, family: Family, proto: Proto) -> Result<SockId, NetError> {
@@ -1284,14 +1292,8 @@ impl<D: NetDevice> Stack<D> {
         }
         self.poll_dhcp();
         self.update_shortfalls();
-        let socket_deadline = self.live_entries().flat_map(|e| e.deadline.into_iter().chain(e.keep_deadline)).min();
-        self.next_poll = self
-            .interfaces
-            .iter_mut()
-            .flatten()
-            .filter_map(|s| s.iface.poll_at(now, &s.sockets))
-            .chain(socket_deadline)
-            .min();
+        self.socket_deadline = self.live_entries().flat_map(|e| e.deadline.into_iter().chain(e.keep_deadline)).min();
+        self.next_poll = self.interfaces.each_mut().map(|s| s.as_mut().and_then(|s| s.iface.poll_at(now, &s.sockets)));
         // Egress can enqueue loopback packets after the ingress budget ran.
         // Unlike hardware, this device has no interrupt to wake the owner.
         more |= self.lo.take_full() || self.lo.queued() != 0;
@@ -1718,8 +1720,22 @@ impl<D: NetDevice> Stack<D> {
         if self.needs_poll || self.lo.queued() != 0 {
             Some(now)
         } else {
-            self.next_poll.into_iter().chain(self.ports.deadline()).min()
+            self.next_poll.into_iter().flatten().chain(self.socket_deadline).chain(self.ports.deadline()).min()
         }
+    }
+    /// Preserves loopback and Lumen timers while Ethernet cannot transmit.
+    /// Only Ethernet's already-due egress request is suppressed; the owner
+    /// must also poll periodically to recover a lost completion interrupt.
+    pub fn poll_at_while_eth_blocked(&self, now: Instant) -> Option<Instant> {
+        if self.needs_poll || self.lo.queued() != 0 {
+            return Some(now);
+        }
+        self.next_poll[0]
+            .into_iter()
+            .chain(self.next_poll[1].filter(|deadline| *deadline > now))
+            .chain(self.socket_deadline)
+            .chain(self.ports.deadline())
+            .min()
     }
     /// Number of live port claims plus TIME-WAIT reservations; raw ICMP claims no identifier.
     pub fn port_count(&self) -> usize {
@@ -1820,6 +1836,26 @@ impl<D: NetDevice> Stack<D> {
                 n += 1;
             }
         }
+        // Linux v6.12 net/ipv4/inet_connection_sock.c:1245-1254 clones
+        // listener state. Lumen fixes actual capacities at the first listen.
+        let sizes = self
+            .entry(id)?
+            .listen_sizes
+            .or_else(|| {
+                prepared
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map(|p| BufSizes { rx: p.socket.recv_capacity(), tx: p.socket.send_capacity() })
+            })
+            .ok_or(NetError::Inval)?;
+        if prepared
+            .iter()
+            .flatten()
+            .any(|p| p.socket.recv_capacity() != sizes.rx || p.socket.send_capacity() != sizes.tx)
+        {
+            return Err(NetError::Inval);
+        }
         let autobind = self.entry(id)?.bound.is_none();
         if autobind {
             self.bind(id, req.request(), Preps::None, now)?;
@@ -1832,6 +1868,7 @@ impl<D: NetDevice> Stack<D> {
             return Err(err);
         }
         self.entry_mut(id)?.role = Role::Listener(backlog);
+        self.entry_mut(id)?.listen_sizes = Some(sizes);
         let mut n = 0;
         for (i, iface) in IfaceId::ALL.into_iter().enumerate() {
             for _ in 0..needed[i] {
@@ -1895,6 +1932,10 @@ impl<D: NetDevice> Stack<D> {
     pub fn shortfalls(&self) -> &[(SockId, IfaceId, usize)] {
         &self.shortages
     }
+    /// Actual transport capacities fixed by the first successful listen.
+    pub fn listener_sizes(&self, id: SockId) -> Option<BufSizes> {
+        self.entry(id).ok().filter(|e| matches!(e.role, Role::Listener(_)))?.listen_sizes
+    }
     fn shortfall(&self, id: SockId, iface: IfaceId) -> usize {
         let Ok(e) = self.entry(id) else {
             return 0;
@@ -1923,6 +1964,10 @@ impl<D: NetDevice> Stack<D> {
     pub fn refill(&mut self, id: SockId, iface: IfaceId, prep: TcpPrep, now: Instant) -> Result<bool, NetError> {
         if self.shortfall(id, iface) == 0 {
             return Ok(false);
+        }
+        let sizes = self.listener_sizes(id).ok_or(NetError::Inval)?;
+        if prep.socket.recv_capacity() != sizes.rx || prep.socket.send_capacity() != sizes.tx {
+            return Err(NetError::Inval);
         }
         self.install_pool(id, iface, prep, now)?;
         self.needs_poll = true;
@@ -2413,6 +2458,29 @@ mod diagnostic_tests {
         fn reclaim(&mut self) -> usize {
             0
         }
+    }
+    #[test]
+    fn blocked_ethernet_preserves_loopback_and_socket_deadlines() {
+        let mut stack = Stack::<Device>::try_new(Loopback::try_new(65535, 16).unwrap(), Instant::ZERO, 474).unwrap();
+        let now = Instant::from_secs(5);
+        stack.next_poll = [Some(now + Duration::from_millis(7)), Some(now - Duration::from_secs(1))];
+        assert_eq!(stack.poll_at(now), Some(now - Duration::from_secs(1)));
+        assert_eq!(stack.poll_at_while_eth_blocked(now), stack.next_poll[0]);
+        stack.socket_deadline = Some(now + Duration::from_millis(3));
+        assert_eq!(stack.poll_at_while_eth_blocked(now), stack.socket_deadline);
+        stack.socket_deadline = None;
+        stack.next_poll[0] = None;
+        assert_eq!(stack.poll_at_while_eth_blocked(now), None);
+        stack.next_poll[1] = Some(now + Duration::from_secs(2));
+        assert_eq!(stack.poll_at_while_eth_blocked(now), stack.next_poll[1]);
+        stack.needs_poll = true;
+        assert_eq!(stack.poll_at_while_eth_blocked(now), Some(now));
+        stack.needs_poll = false;
+        let id = stack.open(Family::V4, Proto::Tcp).unwrap();
+        stack.bind(id, BindReq { port: 1234, ..BindReq::default() }, Preps::None, now).unwrap();
+        stack.ports.time_wait(id, now + Duration::from_millis(1), None);
+        stack.needs_poll = false;
+        assert_eq!(stack.poll_at_while_eth_blocked(now), Some(now + Duration::from_millis(1)));
     }
     #[test]
     fn diagnostics_follow_the_attached_device_and_address_configuration() {

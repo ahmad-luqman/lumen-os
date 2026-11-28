@@ -1,7 +1,7 @@
 //! Nonblocking virtio Ethernet with fixed DMA buffers (M9 B2, #473).
 //! The device has one serialized caller; its IRQ only wakes that caller.
-//! The shell owns it under `DEVICE` for B2; B3 will move it into
-//! `NetStack::inner`, whose sleep mutex serializes the net thread.
+//! `DEVICE` owns raw diagnostics until stack initialization succeeds. Then
+//! `NetStack::inner` owns it and only the net thread polls it.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -503,17 +503,17 @@ fn selftest(device: &mut VirtioNetDevice) -> Result<[u8; 6], String> {
     reply.ok_or_else(|| NO_REPLY.into())
 }
 
-/// B2's device status and direct ARP selftest; shell output is written only
-/// after releasing the device owner lock.
+/// Parses diagnostics once and routes them to the current device owner.
+/// Formatting and output happen after releasing its lock.
 pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
-    if super::stack::initialized() {
-        return super::stack::command(ctx, args);
-    }
     let test = match args {
         [] => false,
         [arg] if arg == "selftest" => true,
         _ => return ctx.fail("usage: net [selftest]"),
     };
+    if let Some(net) = super::stack::NetStack::try_get() {
+        return if test { stack_selftest(net, ctx) } else { super::stack::command(net, ctx) };
+    }
     let mut guard = DEVICE.lock();
     let Some(device) = guard.as_mut() else {
         drop(guard);
@@ -531,24 +531,32 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
         return;
     }
     device.reclaim();
-    let info = device.info();
-    let counts = device.counts();
-    let free = device.tx_free();
-    let health = device.health;
+    let snapshot =
+        Snapshot { info: device.info(), counts: device.counts(), free: device.tx_free(), health: device.health };
     drop(guard);
-    let mac = mac_text(info.mac);
-    let link = if info.link_up { "up" } else { "down" };
-    let _ = writeln!(ctx.out, "net: mac {mac}, link {link} ({health:?}), mtu {}", info.mtu);
-    let _ = writeln!(
-        ctx.out,
-        "net: rx {}, tx {}, rx_drops {}, tx_drops {}, tx_free {free}/{QUEUE_SIZE}, reclaimed {}, irqs {}",
-        counts.received,
-        counts.transmitted,
-        counts.rx_drops,
-        counts.tx_drops,
-        counts.reclaimed,
-        BELL.rings()
-    );
+    print_snapshot(ctx, snapshot);
+}
+
+#[cfg(feature = "ktest")]
+enum TestDeviceGuard {
+    Stack(super::stack::DeviceTestGuard),
+    Raw(crate::sync::SleepMutexGuard<'static, DeviceSlot>),
+}
+#[cfg(feature = "ktest")]
+impl TestDeviceGuard {
+    fn as_mut(&mut self) -> Option<&mut VirtioNetDevice> {
+        match self {
+            Self::Stack(guard) => guard.as_mut(),
+            Self::Raw(guard) => guard.as_mut(),
+        }
+    }
+}
+#[cfg(feature = "ktest")]
+fn test_device_guard() -> TestDeviceGuard {
+    match super::stack::device_test_guard() {
+        Some(guard) => TestDeviceGuard::Stack(guard),
+        None => TestDeviceGuard::Raw(DEVICE.lock()),
+    }
 }
 
 #[cfg(feature = "ktest")]
@@ -565,7 +573,7 @@ fn drain_tx(dev: &mut VirtioNetDevice) -> Result<(), &'static str> {
 crate::ktest!(
     fn virtio_net_fills_and_reclaims_all_slots_without_dma_allocation() {
         use crate::{kassert, kassert_eq};
-        let mut guard = super::stack::device_test_guard();
+        let mut guard = test_device_guard();
         let dev = guard.as_mut().ok_or("no net device")?;
         let mac = dev.info().mac;
         let runs = virtio::outstanding_runs();
@@ -599,7 +607,7 @@ crate::ktest!(
         // A status-register seam, not a reset of live hardware: posted DMA
         // stays owned until the real device completes it.
         static FAILED: AtomicU8 = AtomicU8::new(0x8f);
-        let mut guard = super::stack::device_test_guard();
+        let mut guard = test_device_guard();
         let dev = guard.as_mut().ok_or("no net device")?;
         let actual = dev.status;
         let start = dev.counts();
@@ -652,7 +660,7 @@ crate::ktest!(
 crate::ktest!(
     fn virtio_net_oversized_transmit_preserves_health() {
         use crate::{kassert, kassert_eq};
-        let mut guard = super::stack::device_test_guard();
+        let mut guard = test_device_guard();
         let dev = guard.as_mut().ok_or("no net device")?;
         let start = dev.counts();
         let health = dev.health;
@@ -673,7 +681,7 @@ crate::ktest!(
 crate::ktest!(
     fn virtio_net_receive_skips_bad_completions_and_reposts() {
         use crate::{kassert, kassert_eq};
-        let mut guard = super::stack::device_test_guard();
+        let mut guard = test_device_guard();
         let dev = guard.as_mut().ok_or("no net device")?;
         drain_tx(dev)?;
         let mac = dev.info().mac;
@@ -736,7 +744,7 @@ crate::ktest!(
 crate::ktest!(
     fn virtio_net_receive_budget_rings_for_another_poll() {
         use crate::{kassert, kassert_eq};
-        let mut guard = super::stack::device_test_guard();
+        let mut guard = test_device_guard();
         let dev = guard.as_mut().ok_or("no net device")?;
         drain_tx(dev)?;
         let mut out = [0; ETH_FRAME_MAX];
@@ -791,29 +799,69 @@ static SELFTEST_SERIAL: SleepMutex<()> = SleepMutex::new(());
 static SELFTEST_REPLY: AtomicU64 = AtomicU64::new(0);
 static SELFTEST_WAIT: crate::sched::WaitQueue = crate::sched::WaitQueue::new();
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Selftest {
+    Idle,
+    Requested,
+    Watching,
+}
+// High byte is the result tag; low bytes carry a MAC or raw device status.
+const REPLY_MAC: u64 = 1 << 56;
+const REPLY_TX_FULL: u64 = 2 << 56;
+const REPLY_TX_FAILED: u64 = 3 << 56;
+const REPLY_STATUS: u64 = 4 << 56;
+const REPLY_BROKEN: u64 = 5 << 56;
+const REPLY_TIMEOUT: u64 = 6 << 56;
+
 pub struct VirtioNet {
     pub(super) device: VirtioNetDevice,
-    requested: bool,
-    watching: bool,
+    selftest: Selftest,
 }
 impl VirtioNet {
     pub(super) fn new(device: VirtioNetDevice) -> Self {
-        Self { device, requested: false, watching: false }
+        Self { device, selftest: Selftest::Idle }
+    }
+    pub(super) fn usable(&self) -> bool {
+        self.device.health != Health::Broken && self.device.status.check_ready().is_ok()
+    }
+    pub(super) fn tx_full(&self) -> bool {
+        self.usable() && self.device.tx_free() == 0
+    }
+    pub(super) fn completions(&self) -> u64 {
+        let c = self.device.counts();
+        c.received + c.rx_drops + c.reclaimed
+    }
+    fn complete_selftest(&mut self, reply: u64) {
+        self.selftest = Selftest::Idle;
+        SELFTEST_REPLY.store(reply, Ordering::Release);
+        SELFTEST_WAIT.wake_all();
     }
     pub(super) fn selftest_step(&mut self) {
-        if !self.requested {
+        if self.selftest == Selftest::Idle {
+            return;
+        }
+        if self.device.status.check_ready().is_err() {
+            self.complete_selftest(REPLY_STATUS | u64::from(self.device.status.raw()));
+            return;
+        }
+        if self.device.health == Health::Broken {
+            self.complete_selftest(REPLY_BROKEN);
+            return;
+        }
+        if self.selftest != Selftest::Requested {
             return;
         }
         self.device.reclaim();
         if !self.device.tx_ready() {
             return;
         }
-        self.requested = false;
-        self.watching = true;
+        self.selftest = Selftest::Watching;
         let mac = self.device.info().mac;
-        if self.transmit(ARP_FRAME_LEN, |out| arp_request(out, mac)).is_err() {
-            SELFTEST_REPLY.store(u64::MAX, Ordering::Release);
-            SELFTEST_WAIT.wake_all();
+        if let Err(error) = self.transmit(ARP_FRAME_LEN, |out| arp_request(out, mac)) {
+            self.complete_selftest(match error {
+                TxError::Full => REPLY_TX_FULL,
+                TxError::DeviceFailed => REPLY_TX_FAILED,
+            });
         }
     }
     pub(super) fn snapshot(&self) -> Snapshot {
@@ -834,15 +882,12 @@ impl NetDevice for VirtioNet {
     }
     fn receive(&mut self, out: &mut [u8; ETH_FRAME_MAX]) -> Option<usize> {
         let len = self.device.receive(out)?;
-        if self.watching
+        if self.selftest == Selftest::Watching
             && let Some(mac) = arp_reply(&out[..len], self.device.info().mac)
         {
-            self.watching = false;
             let mut encoded = [0; 8];
             encoded[..6].copy_from_slice(&mac);
-            encoded[6] = 1;
-            SELFTEST_REPLY.store(u64::from_le_bytes(encoded), Ordering::Release);
-            SELFTEST_WAIT.wake_all();
+            self.complete_selftest(REPLY_MAC | u64::from_le_bytes(encoded));
         }
         Some(len)
     }
@@ -868,7 +913,7 @@ pub(super) fn print_snapshot(ctx: &mut crate::shell::Ctx<'_>, s: Snapshot) {
     let _ = writeln!(ctx.out, "net: mac {}, link {link} ({:?}), mtu {}", mac_text(s.info.mac), s.health, s.info.mtu);
     let _ = writeln!(
         ctx.out,
-        "net: rx {}, tx {}, rx_drops {}, tx_drops {}, tx_free {}/16, reclaimed {}, irqs {}",
+        "net: rx {}, tx {}, rx_drops {}, tx_drops {}, tx_free {}/{QUEUE_SIZE}, reclaimed {}, irqs {}",
         s.counts.received,
         s.counts.transmitted,
         s.counts.rx_drops,
@@ -878,16 +923,14 @@ pub(super) fn print_snapshot(ctx: &mut crate::shell::Ctx<'_>, s: Snapshot) {
         BELL.rings()
     );
 }
-pub(super) fn stack_selftest(ctx: &mut crate::shell::Ctx<'_>) {
+pub(super) fn stack_selftest(net: &super::stack::NetStack, ctx: &mut crate::shell::Ctx<'_>) {
     let _serial = SELFTEST_SERIAL.lock();
-    let net = super::stack::NetStack::get();
     let requested = net.with(|stack| {
         let Some(device) = stack.device_mut() else {
             return false;
         };
         SELFTEST_REPLY.store(0, Ordering::Release);
-        device.requested = true;
-        device.watching = false;
+        device.selftest = Selftest::Requested;
         true
     });
     if !requested {
@@ -897,17 +940,94 @@ pub(super) fn stack_selftest(ctx: &mut crate::shell::Ctx<'_>) {
     let ready = SELFTEST_WAIT.wait_until_or_deadline(crate::time::now_ns().saturating_add(SELFTEST_TIMEOUT_NS), || {
         SELFTEST_REPLY.load(Ordering::Acquire) != 0
     });
-    net.with(|stack| {
-        if let Some(device) = stack.device_mut() {
-            device.requested = false;
-            device.watching = false;
+    let reply = net.with(|stack| {
+        let device = stack.device_mut().expect("selftest owns an attached device");
+        device.selftest = Selftest::Idle;
+        if ready {
+            SELFTEST_REPLY.load(Ordering::Acquire)
+        } else {
+            REPLY_TIMEOUT | u64::from(device.device.status.raw())
         }
     });
-    let reply = SELFTEST_REPLY.load(Ordering::Acquire);
-    if !ready || reply == u64::MAX {
-        return ctx.fail("net selftest: no ARP reply from 10.0.2.2");
+    match selftest_result(reply) {
+        Ok(mac) => {
+            let _ = writeln!(ctx.out, "net selftest: ARP reply 10.0.2.2 is {}", mac_text(mac));
+        }
+        Err(reason) => ctx.fail(alloc::format!("net selftest: {reason}")),
     }
-    let bytes = reply.to_le_bytes();
-    let mac: [u8; 6] = bytes[..6].try_into().expect("six MAC bytes");
-    let _ = writeln!(ctx.out, "net selftest: ARP reply 10.0.2.2 is {}", mac_text(mac));
 }
+
+fn selftest_result(reply: u64) -> Result<[u8; 6], String> {
+    match reply & (0xff << 56) {
+        REPLY_MAC => Ok(reply.to_le_bytes()[..6].try_into().expect("six MAC bytes")),
+        REPLY_TX_FULL => Err(alloc::format!("transmit failed: {:?}", TxError::Full)),
+        REPLY_TX_FAILED => Err(alloc::format!("transmit failed: {:?}", TxError::DeviceFailed)),
+        REPLY_STATUS => Err(alloc::format!("{NO_REPLY}: link down ({})", ProbeError::NotReady { status: reply as u8 })),
+        REPLY_BROKEN => Err(alloc::format!("{NO_REPLY}: link down ({:?})", Health::Broken)),
+        REPLY_TIMEOUT => Err(alloc::format!(
+            "{NO_REPLY}: {}",
+            virtio::WaitError::Timeout { waited_ns: SELFTEST_TIMEOUT_NS, status: reply as u8 }
+        )),
+        _ => Err(NO_REPLY.into()),
+    }
+}
+
+/// Keeps a failed status seam installed while the real worker runs. Drop
+/// restores the original status and health even if a test returns early.
+#[cfg(feature = "ktest")]
+pub(super) struct FailedDevice {
+    status: StatusHandle,
+    health: Health,
+}
+#[cfg(feature = "ktest")]
+impl FailedDevice {
+    pub(super) fn new() -> Result<Self, &'static str> {
+        static FAILED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0x8f);
+        super::stack::NetStack::get().with(|s| {
+            let d = s.device_mut().ok_or("no Ethernet device")?;
+            let restore = Self { status: d.device.status, health: d.device.health };
+            d.device.status = StatusHandle::ktest_reading(&FAILED, None);
+            // Suppress a second warning from this test fixture; the B2 test
+            // independently verifies the first transition's warning.
+            d.device.health = Health::Failed;
+            Ok(restore)
+        })
+    }
+}
+#[cfg(feature = "ktest")]
+impl Drop for FailedDevice {
+    fn drop(&mut self) {
+        super::stack::NetStack::get().with(|s| {
+            if let Some(d) = s.device_mut() {
+                d.device.status = self.status;
+                d.device.health = self.health;
+            }
+        });
+    }
+}
+
+crate::ktest!(
+    fn stack_selftest_preserves_failure_reasons() {
+        use crate::{kassert, kassert_eq};
+        let _serial = SELFTEST_SERIAL.lock();
+        kassert_eq!(selftest_result(REPLY_TX_FULL), Err("transmit failed: Full".into()));
+        kassert_eq!(selftest_result(REPLY_TX_FAILED), Err("transmit failed: DeviceFailed".into()));
+        kassert!(
+            selftest_result(REPLY_TIMEOUT | 0x0f).unwrap_err().contains("didn't answer in 30000 ms (status 0x0f)")
+        );
+        kassert!(selftest_result(REPLY_BROKEN).unwrap_err().contains("link down (Broken)"));
+        let _failed = FailedDevice::new()?;
+        super::stack::NetStack::get().with(|s| {
+            let d = s.device_mut().unwrap();
+            for state in [Selftest::Requested, Selftest::Watching] {
+                SELFTEST_REPLY.store(0, Ordering::SeqCst);
+                d.selftest = state;
+                d.selftest_step();
+                assert!(d.selftest == Selftest::Idle);
+                assert_eq!(SELFTEST_REPLY.load(Ordering::SeqCst), REPLY_STATUS | 0x8f);
+            }
+        });
+        kassert!(selftest_result(SELFTEST_REPLY.load(Ordering::SeqCst)).unwrap_err().contains("link down"));
+        Ok(())
+    }
+);

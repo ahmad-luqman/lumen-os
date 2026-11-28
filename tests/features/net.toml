@@ -80,3 +80,21 @@ tests = [
     "scenario:test_net::test_virtio_net_frames",
     "scenario:test_net::test_net_without_entropy_keeps_raw_diagnostics",
 ]
+
+[[feature]]
+name = "Stack review regressions: deadlines survive failed Ethernet, refill failures recover by episode, stale registrations cannot replace live sockets, and selftest keeps failure reasons"
+milestone = "M9"
+tests = [
+    "cargo:lumen-net",
+    "ktest:lumen_kernel::net::stack::loopback_time_wait_expires_with_unusable_ethernet",
+    "ktest:lumen_kernel::net::stack::refill_failures_warn_once_per_episode_and_recover",
+    "ktest:lumen_kernel::net::stack::recycled_socket_registration_preserves_the_new_generation",
+    "ktest:lumen_kernel::net::virtio_net::stack_selftest_preserves_failure_reasons",
+    "scenario:test_net::test_virtio_net_frames",
+    "scenario:test_net::test_net_without_entropy_keeps_raw_diagnostics",
+]
+
+[[feature]]
+name = "Network idle wait bounds a silent device without delaying earlier timers (made-up deadlines)"
+milestone = "M9"
+tests = ["ktest:lumen_kernel::net::stack::idle_wait_preserves_earlier_timers_and_bounds_silent_devices"]

@@ -40,9 +40,6 @@ def boot_ktests(boot, cmdline=None):
         extra=extra,
         cmdline=cmdline,
         devices=Devices(blk_mib=1, net=True, share=True, rng=True, keyboard=True),
-        # #474 reserves the two network sets and loopback ring at boot.
-        # Keep room for the heap-growth tests' simultaneous 32-MiB blocks.
-        memory="512M",
     )
 
 

@@ -77,12 +77,13 @@ def mixed(m: Machine) -> int:
 
 def test_random_with_only_rdrand(boot):
     m = shell(boot, cpu="max")
-    # RDRAND's two paths: its 64-byte seed at boot, then 32 bytes per request.
-    assert mixed(m) == 64
-    random_bytes(m)
-    assert mixed(m) == 96
-    random_bytes(m, 100)
+    # RDRAND mixes 64 bytes at boot, plus 32 for each of the stack's
+    # two independent interface-seed draws; later requests mix 32 each.
     assert mixed(m) == 128
+    random_bytes(m)
+    assert mixed(m) == 160
+    random_bytes(m, 100)
+    assert mixed(m) == 192
     assert "RDRAND: in use, 0 draws failed;" in run(m, "random --stats")
     check_sources(m, "RDRAND")
 

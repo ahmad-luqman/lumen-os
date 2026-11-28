@@ -19,6 +19,12 @@ def test_virtio_net_frames(boot):
     state = run(m, "net")
     assert f"net: mac {mac}, link up (Up), mtu 1500\n" in state
     assert "127.0.0.1/8" in state and "::1/128" in state, state
+    limit = re.search(r"INFO  net: lo .*; memory limit (\d+)\n", m.output)
+    assert limit, m.output
+    assert (
+        f"net: open sockets 0, transport slots 0, refill failures 0, socket memory 0/{limit[1]}\n"
+        in state
+    ), state
     counts = re.compile(
         r"net: rx (\d+), tx (\d+), rx_drops (\d+), tx_drops (\d+), "
         r"tx_free (\d+)/16, reclaimed (\d+), irqs (\d+)"
@@ -34,7 +40,7 @@ def test_virtio_net_frames(boot):
         found = counts.search(out)
         assert found, out
         rx, tx, rx_drops, tx_drops, free, reclaimed, irqs = map(int, found.groups())
-        assert rx >= 17 and tx == 17 and rx_drops == tx_drops == 0, out
+        assert rx >= 17 and tx >= 17 and rx_drops == tx_drops == 0, out
         if free == 16:
             assert reclaimed == tx and irqs > 0, out
             return True
@@ -49,7 +55,10 @@ def test_virtio_net_frames(boot):
 def test_net_without_entropy_keeps_raw_diagnostics(boot):
     require_user_network()
     m = boot("qemutest", devices=Devices(net=True))
-    m.expect(r"WARN  net: stack disabled: no seeded RNG\n", 60)
+    m.expect(
+        r"INFO  net: stack waiting for entropy: no randomness source has answered \(no RDRAND, and no virtio-rng device bound.*\n",
+        60,
+    )
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     state = run(m, "net")

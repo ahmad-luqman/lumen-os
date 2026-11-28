@@ -3054,9 +3054,10 @@ crate::ktest!(
     fn timer_ticks_are_not_traced() {
         // At 1 kHz they would flood the trace ring.
         use crate::kassert_eq;
-        // Spinning, not sleeping: switching to the idle thread and back is
-        // traced. Over 20 ticks, each waited for up to 5 s (late under QEMU's
-        // TCG, #45), so a tick traced now and then shows too.
+        // Spin over 20 ticks, each waited for up to 5 s (late under QEMU's
+        // TCG, #45). Periodic workers (#474's network safety poll) can
+        // preempt this thread: their scheduler switches are legitimate,
+        // but no timer/exception/log entry may be added by the ticks.
         let ring = crate::trace::ring();
         let w0 = ring.written();
         for n in 0..20 {
@@ -3066,12 +3067,15 @@ crate::ktest!(
                 return Err("the timer stopped ticking");
             }
         }
+        let mut unexpected = 0;
         for seq in w0..ring.written() {
-            if let Some(e) = ring.read(seq) {
+            let e = ring.read(seq).ok_or("trace overwritten while waiting for ticks")?;
+            if e.kind != crate::trace::Kind::Switch as u16 {
+                unexpected += 1;
                 crate::ktest::diag(format_args!("traced while spinning: kind {:#x} args {:x?}", e.kind, e.args));
             }
         }
-        kassert_eq!(ring.written(), w0);
+        kassert_eq!(unexpected, 0);
         Ok(())
     }
 );

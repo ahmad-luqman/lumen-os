@@ -4353,10 +4353,14 @@ runs every poll. Its loop:
    listener pools outside the lock.
 4. If an interface used its whole receive budget, or `lo`'s ring was
    full, loop again at once without waiting. When `eth0`'s transmit queue
-   was full, go to 1 and wait for the doorbell (transmit completions ring
-   it), never spinning; otherwise go to 1. So a flood never holds the
-   lock for more than one budget, and readiness reaches waiters between
-   rounds.
+   is usable but out of slots, wait for its doorbell or the earliest
+   remaining timer: ignore only eth0's already-due egress deadline, never
+   loopback, socket/orphan/keepalive or TIME-WAIT deadlines. An unusable
+   device is not a full queue; it uses the same deadline filtering and
+   cannot stop other timers. Cap every idle wait at 100 ms to recover lost
+   interrupts. A deadline wake that finds RX/TX completions without a ring
+   calls `BELL.note_missed`. So a flood never holds the lock for more than
+   one budget, and readiness reaches waiters between rounds.
 
 Syscalls work on smoltcp sockets inline, under the stack lock: they queue
 and dequeue data, connect, listen, shut down and close, then kick the
@@ -4395,22 +4399,52 @@ its interrupt handler only rings and kicks.
 - `VirtioHal::TABLE` (10f) is taken under it by `share`/`unshare`'s
   no-bounce path.
 
+**Fixed boot storage (B3, #474/#501).** On x86-64 with the pinned
+compiler, the measured ktest heap delta for the boxed `NetStack`, budget,
+registration table, lumen-net tables, both SocketSets and loopback is
+**6,171,136 bytes** (allocator-rounded blocks), before the worker starts.
+The two sets are 499,712 bytes each. `PortTable.uses` now reserves 393,216
+bytes (`65536 * 3 * sizeof(u16)`), down from 1,572,864 bytes with `usize`.
+Its count includes up to 2048 live and 2048 TIME-WAIT claims, safely below
+`u16::MAX`. The worker's preallocated notification and refill vectors add
+196,608 bytes; its thread/stack and the NIC's DMA buffers are separate.
+This is fixed boot overhead, not part of the charged socket-buffer budget.
+The fixed tables stay bounded; failed reservations return `NoMem`.
+
 **The kernel's side (B3, `kernel/src/net/stack.rs` and `inet.rs`).** C3,
-C4 and C6 append to `Proto`'s arms and never change the rest:
+C4 and C6 implement their respective `net/udp.rs`, `net/tcp.rs`, and
+`net/icmp.rs` modules (C3 owns UDP, C4 TCP, C6 ICMP). `inet.rs` keeps one-line
+protocol delegations so these lanes do not edit shared arms. Each state
+owns its interior mutability; `send_lock` serializes senders across
+prepare/copy/commit chunks, and `recv_lock` serializes receivers across
+peek/copy/consume chunks. Neither user copies nor socket destruction or
+`from_id` belong inside either stack-access closure. Read-only
+`InetSocket::query` does not notify or kick; mutations use `with`.
+
+The fields are:
 
 ```rust
 // kernel/src/net/stack.rs (B3)
 pub struct NetStack {
     inner: SleepMutex<NetInner>,              // level 9b
-    kicked: AtomicBool, wake: WaitQueue,      // the thread's wait
-    budget: &'static Budget,                  // NET_MEM_CAP
+    kicked: AtomicBool, wake: WaitQueue,
+    budget: &'static Budget,                 // NET_MEM_CAP
+    refill_failures: AtomicUsize,             // failure episodes
+    #[cfg(feature = "ktest")] owner: AtomicU64,
+    #[cfg(feature = "ktest")] rounds: AtomicU64,
 }
-struct NetInner { stack: lumen_net::Stack<VirtioNet>, socks: Box<[Weak<InetSocket>; NET_ENTRIES]> }
+struct NetInner {
+    stack: lumen_net::Stack<VirtioNet>,
+    entries: Box<[Option<Entry>]>,            // NET_ENTRIES, fixed at boot
+}
+struct Entry { id: SockId, sock: Weak<InetSocket>, warned: bool }
 impl NetStack {
     pub fn get() -> &'static NetStack;
-    pub fn with<R>(&self, f: impl FnOnce(&mut lumen_net::Stack<VirtioNet>) -> R) -> R;  // takes inner
+    pub(super) fn try_get() -> Option<&'static NetStack>;
+    pub(super) fn with<R>(&self, f: impl FnOnce(&mut lumen_net::Stack<VirtioNet>) -> R) -> R;
     pub fn kick(&self);
-    pub fn register(&self, id: SockId, sock: &Arc<InetSocket>);   // under inner
+    pub fn register(&self, id: SockId, sock: &Arc<InetSocket>);
+    pub fn unregister(&self, id: SockId);
 }
 // kernel/src/net/inet.rs (B3)
 pub struct InetSocket {
@@ -4418,8 +4452,10 @@ pub struct InetSocket {
     send_lock: SleepMutex<()>, recv_lock: SleepMutex<()>,       // Lock 0
     opts: SpinLock<InetOpts>,                                   // 10c leaf: timeouts, sizes, flags
     poll: KernelPollHead,
+    released: AtomicBool,
+    #[cfg(feature = "ktest")] test_readiness: SpinLock<Option<Readiness>>,
 }
-pub enum Proto { Tcp(TcpState), Udp(UdpState), Icmp(IcmpState) }   // C4, C3, C6 fill their arm
+pub enum Proto { Tcp(TcpState), Udp(UdpState), Icmp(IcmpState) }   // states live in protocol modules
 impl SockOps for InetSocket { /* dispatches on `proto` */ }
 ```
 
@@ -4488,7 +4524,11 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
     replacements outside the lock and installs
     them before its next round, and stops refilling while the accept queue
     is full. A refill that fails (`-ENOBUFS`, `-ENOMEM`) warns once per
-    listener, counts in `net`, and is retried after each poll.
+    failure episode, counts episodes in `net`, and is retried after each
+    poll. A successful refill clears the warning latch. The actual buffer
+    capacities are captured by lumen-net's listener entry at the first
+    successful `listen`; relisten/refill reject mismatched preparations.
+    Kernel options are not a second source of refill sizes.
   - A SYN past the pool, or to a full listener, is dropped by the SYN
     filter (above), as Linux drops it, so the client retries; no RST.
   - **Closing a listener** aborts (RST) its queued connections and
@@ -5025,7 +5065,17 @@ copy it before releasing the lock. DHCP configuration failures retain the
 event for retry; only successfully applied leases reach `lease_event`.
 
 B3 supplies independent `lumen_rand` seeds to `try_new`/`attach_eth` for TCP
-ISNs and DHCP transaction IDs; clocks are not random seeds. `snapshot`,
+ISNs and DHCP transaction IDs; clocks are not random seeds. **No-entropy
+boot deviation:** until the pool is seeded, the stack stays absent and
+`lo` stays down too, an exception to "lo is always up" above. This is an
+INFO message including `NoSource`'s explanation, not a warning. Raw NIC
+status/ARP diagnostics remain available. A `net-init` thread retries once
+per second and brings up the stack if a later draw succeeds (including
+RDRAND's deferred seed). A virtio-rng probe that failed already consumed
+its device; this does not re-probe it or implement hotplug. An allocation
+failure in fixed stack construction logs ERROR and preserves raw
+diagnostics instead of panicking. Once protocol constructors are wired,
+inet opens while the stack is absent return `ENETDOWN`. `snapshot`,
 `observe`, `note_sent`, and `syn_action` walk only live IDs. Per round,
 deadlines and orphan reaping still scan the fixed entry array, and
 `changed()` scans the fixed dirty array when collected. Port expiration
@@ -9984,7 +10034,9 @@ order: a lock may be taken while holding only locks above it.
     copy or with any lock 0–9
  9b. NetStack::inner (SleepMutex; M9, section 7): both interfaces, both
     socket sets, lumen-net's Stack and the virtio-net device; taken under
-    a Lock 0 socket lock or an epoll mutex, never held across a user copy
+    a Lock 0 socket lock, `net::virtio_net::SELFTEST_SERIAL` (a Lock 0
+    sleep mutex serializing shell diagnostic requests), or an epoll mutex,
+    never held across a user copy
     or with any lock 1–9a, and nothing allocates under it
 10. IRQ-off SpinLocks, in this sub-order:
     a. PROCS (the process table: lumen-proc's ProcTree, processes and
