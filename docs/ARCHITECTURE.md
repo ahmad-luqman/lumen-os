@@ -4181,6 +4181,7 @@ pub const ETH_FRAME_MAX: usize = 1514;        // no FCS, no VLAN tag
 pub struct NetInfo { pub mac: [u8; 6], pub mtu: usize, pub link_up: bool }  // mtu: the IP MTU
 pub enum TxError { Full, DeviceFailed }
 pub trait NetDevice: Send {
+    /// Current hardware address, IP MTU and link indication.
     fn info(&self) -> NetInfo;
     /// Whether a transmit slot is free now.
     fn tx_ready(&self) -> bool;
@@ -4200,9 +4201,12 @@ pub trait NetDevice: Send {
   frame is copied into one 1514-byte buffer the adapter owns and handed
   to smoltcp from there.
 - **`TxError::DeviceFailed`** drops the frame, counts it in `net`, warns
-  once, and marks the link down until the device recovers.
+  once, and marks the link down until a successful transmit or a later
+  `info()` reports it up. `TxError::Full` is also a counted dropped frame: the token callback has
+  already run. It does not mark the link down. Backpressure is returning
+  no token while `tx_ready()` is false.
 - **`info()`** is read once per poll round. Its `mtu` is the IP MTU: the
-  adapter reports `max_transmission_unit = mtu + 14` for Ethernet.
+  adapter reports `max_transmission_unit = mtu.min(1500) + 14` for Ethernet.
 
 **virtio-net (B2, `kernel/src/net/virtio_net.rs`, added to `DRIVERS`).**
 - **The device:** matches virtio type 1, one device (a second is declined
@@ -4279,14 +4283,17 @@ pub trait NetDevice: Send {
   set. A wildcard-bound UDP socket holds a smoltcp socket on each set; its
   readiness is their union, `recv` alternates between the two sets when
   both hold data (neither starves), and `send` routes by destination. A
-  wildcard socket that connects fixes its interface then.
+  wildcard socket that connects fixes its interface then. If Ethernet is
+  attached after a wildcard UDP bind, a later connect/send installs the
+  missing interface socket from its typed preparation.
 - **Families:** an `AF_INET6` socket using a v4-mapped address gets an
   IPv4 smoltcp endpoint, and `getsockname`/`getpeername` report the
   mapped form. A smoltcp socket with no local address accepts either
   family, so lumen-net filters:
   - **TCP listeners** use a family-specific `ListenEndpoint` where one
-    exists: on `lo` a `v6only` `::` pool listens on `Some(::1)` (`eth0` has
-    no IPv6 in M9). An `AF_INET` 0.0.0.0 pool listens on no address, so it
+    exists: on `lo` a `v6only` `::` pool listens on `Some(::1)`. Wildcard
+    pools also cover attached `eth0`; its unpinned sockets rely on the
+    family filter even though production eth0 has no IPv6 address in M9. An `AF_INET` 0.0.0.0 pool listens on no address, so it
     would take an IPv6 SYN too; the SYN filter (below) stops that.
   - **The SYN filter, on both interfaces:** `Stack::poll_round` pulls each
     frame (from the `NetDevice`, or `lo`'s ring) into its own buffer,
@@ -4299,16 +4306,20 @@ pub trait NetDevice: Send {
     accept queue is full or whose pool has no free LISTEN socket this
     round is dropped, as Linux's `tcp_conn_request` does, and the client's
     retransmission finds the pool refilled.
-  - **One overlap is refused:** binding a 0.0.0.0 listener and a `v6only`
-    `::` listener on the same port in one set is `-EADDRINUSE` (a
-    deviation: Linux allows the pair), because both pools would match an
-    IPv4 SYN on `lo` and smoltcp gives it to whichever comes first.
-  - **UDP:** an `AF_INET` wildcard socket drops IPv6 datagrams in `recv`;
-    a `v6only` `::` socket drops IPv4 ones; a dual-stack `::` socket keeps
-    both, reporting IPv4 senders v4-mapped.
-  - #459's PR 2 host-tests the filter on `lo` (a v4 SYN to a `v6only`
+  - A 0.0.0.0 listener and a `v6only` `::` listener may share a port in
+    either bind order. The SYN family filter selects the appropriate pool.
+  - **UDP:** choose the recipient by family, bound endpoint and connected
+    peer **before** smoltcp's first-match delivery, using the same one-slot
+    ingress set as TCP. An `AF_INET` wildcard cannot consume a packet meant
+    for a `v6only` `::` socket, in either bind order. A dual-stack `::` socket
+    accepts both families and reports IPv4 senders v4-mapped. Receive filters
+    remain a defensive check; DHCP server-to-client traffic retains smoltcp's
+    DHCP dispatch ahead of UDP. Linux **v6.12**, `net/ipv4/udp.c`,
+    `compute_score`, lines 378–381; `net/ipv6/udp.c`, `compute_score`,
+    lines 126–129 exclude incompatible families before delivery.
+  - #459's PR 2 host-tests the filter on `lo` and Ethernet (a v4 SYN to a `v6only`
     listener's port is refused, a full pool drops a SYN, a v6 datagram
-    never reaches an `AF_INET` socket) and the refused overlap.
+    never reaches an `AF_INET` socket) and both wildcard-listener orders.
 
 **The `net` thread (B3, `kernel/src/net/stack.rs`).** One kernel thread
 runs every poll. Its loop:
@@ -4464,12 +4475,12 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
     removes its pool sockets, crediting their charges.
   - **Why not backlog + 1:** a pool socket owns its buffers (128 KiB at
     the defaults below). A full pool for `listen(SOMAXCONN)` would be
-    512 MiB, and for `listen(128)` 16 MiB a set, against the budget below.
+    512 MiB, and for `listen(128)` about 16 MiB a set, against the budget below.
     Eight a set is 1 MiB, 2 MiB for a wildcard listener. The census
     doesn't record `listen`'s backlog; the gate's servers (asyncio's
     default is 100, busybox `nc`) take their clients one at a time.
 - **Ephemeral ports and `bind` (C3, C4).**
-  - lumen-net's `PortTable` holds one table per protocol (TCP, UDP),
+  - lumen-net's `PortTable` holds one table per protocol (TCP, UDP, ICMP ping identifiers),
     shared by both families as Linux's are.
   - Ephemeral ports come from 32768–60999 (Linux's default
     `ip_local_port_range`), next-fit from a per-table cursor, wrapping,
@@ -4479,12 +4490,27 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
   - Two binds of one port conflict when their addresses overlap (equal,
     or either a wildcard of an overlapping family, where a dual-stack `::`
     overlaps every IPv4 address) unless both set `SO_REUSEPORT` (one uid
-    in Lumen), or both set `SO_REUSEADDR` and, for TCP, neither listens.
+    in Lumen), or both set `SO_REUSEADDR` and, for TCP, the existing
+    socket is not listening. The caller beginning to listen does not
+    count as an existing listener (Linux **v6.12**,
+    `net/ipv4/inet_connection_sock.c`, `inet_bind_conflict`, lines 185–191).
+    Thus two reuseaddr binds can coexist; the first listen succeeds, the
+    second conflicts, and a restarted server can listen alongside an old
+    accepted child or FIN-WAIT orphan.
   - A port in TIME-WAIT (below) stays taken, and a new bind there needs
-    `SO_REUSEADDR`: this is why servers set it (the census's four
-    `SO_REUSEADDR` calls). The conflict is `-EADDRINUSE`, and with the
+    `SO_REUSEADDR` on **both** the old and new sockets, or `SO_REUSEPORT`
+    on both. TIME-WAIT preserves the creator's flags (Linux **v6.12**,
+    `net/ipv4/inet_timewait_sock.c`, `inet_twsk_alloc`, lines 205–206).
+    `bind` expires reservations using its caller-supplied `now` first.
+    TIME-WAIT has a separate `NET_ENTRIES`-sized table, so reservations
+    never consume live binding slots. If this fixed table fills, its
+    oldest deadline is evicted (a bounded-resource deviation, host-tested:
+    Linux refuses the new TW bucket when full, rather than evicting an old
+    one; Linux **v6.12**, `net/ipv4/inet_timewait_sock.c`, `inet_twsk_alloc`,
+    lines 185–187). The conflict is `-EADDRINUSE`, and with the
     range used up `-EADDRNOTAVAIL`.
-  - `IPV6_V6ONLY` is settable before `bind`, and `-EINVAL` after.
+  - `IPV6_V6ONLY` is settable before `bind`, and `-EINVAL` after. Bind reads
+    the entry’s family and option; the request cannot overwrite either.
   - `SO_REUSEPORT` doesn't spread connections: the first bound listener
     takes them (a deviation).
 - **`connect`:**
@@ -4492,49 +4518,98 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
   - A non-blocking one returns `-EINPROGRESS`. Completion shows as
     `POLLOUT`, and `SO_ERROR` gives 0 or the error and clears it (the
     census: nine `EINPROGRESS`, then `SO_ERROR`).
-  - A second connect while one is in progress is `-EALREADY`, and once
-    connected `-EISCONN`.
+  - A second connect during the handshake is `-EALREADY`. The first
+    connect after successful transport completion returns 0 and changes
+    the user-visible state from CONNECTING to CONNECTED; later calls give
+    `-EISCONN`. `SO_ERROR` does not make that state transition. If the
+    transport completed and then reset before that call, connect returns
+    its pending error, or `-ECONNABORTED` if it was drained, and disconnects
+    so a fresh attempt is possible (Linux **v6.12**, `net/ipv4/af_inet.c`,
+    `__inet_stream_connect`, lines 654–739).
   - An interrupted blocking connect follows "Signals and sockets"
     (section 8) and the connection carries on, as Linux's.
-- **Timeouts smoltcp doesn't have.** smoltcp retransmits forever unless a
-  socket has a timeout (`set_timeout`). That timeout is an idle timer in
-  every state (`timed_out`: `now >= remote_last_ts + timeout`, scheduled by
-  `poll_at`), so lumen-net sets one per state and clears it when the state
-  ends:
-  - SYN-SENT: 127 s (Linux's six SYN retries), then `ETIMEDOUT`;
-  - a pool socket in SYN-RECEIVED: 63 s (above);
-  - on reaching ESTABLISHED or CLOSE-WAIT: `set_timeout(None)`, or with
-    `SO_KEEPALIVE` the keep-alive timeout below; toggling `SO_KEEPALIVE`
-    later sets or clears it;
-  - `SO_KEEPALIVE`: the keep-alive interval is `TCP_KEEPIDLE` and the
-    timeout idle + `TCP_KEEPINTVL` × `TCP_KEEPCNT` (Linux's defaults 7200
-    s, 75 s, 9), then `ETIMEDOUT`;
-  - a neighbour that never answers ARP (smoltcp keeps the packet
-    unsent): `EHOSTUNREACH` once the SYN-SENT timeout runs out with no TCP
-    segment for that tuple having left the adapter;
-  - an orphan (closed by its user): 60 s, and FIN-WAIT-2 aborted at 60 s
-    (Linux's `tcp_fin_timeout`); `set_ack_delay(None)` on close, so its
-    last ACK isn't held back.
-  - **Deviations:** no `tcp_retries2` give-up, so a dead peer without
-    keep-alive is retransmitted to forever; keep-alive sends one probe at
-    idle and then times out, where Linux sends nine probes 75 s apart; an
-    unreachable neighbour is found at the connect timeout, not after
-    Linux's few seconds of ARP.
-  - `cargo:lumen-net` tests that a connection idle for 200 s (a made-up
-    `Instant`) stays ESTABLISHED.
+- **Timeouts smoltcp doesn't have.** All time comes from caller-supplied
+  `Instant`s. `bind`, `listen`, `connect`, `send`, `shutdown`, `close`,
+  `abort`, `set_opt`, `refill`, internal removal, and polling receive `now`;
+  no inline call dates a deadline from the previous poll.
+  - SYN-SENT: a Lumen deadline at connect + 127 s (Linux's six retries),
+    then `ETIMEDOUT`; if no TCP segment for the tuple left eth0 because
+    ARP never answered, `EHOSTUNREACH` instead.
+  - Pool SYN-RECEIVED: smoltcp's 63 s timeout, cleared on ESTABLISHED or
+    CLOSE-WAIT. Established sockets without keepalive have no timeout.
+  - **Never use `set_timeout` for keepalive or orphan close.** smoltcp's
+    timeout measures idle time from `remote_last_ts`; setting 60 s after
+    an hour of idle would immediately reset a healthy connection.
+  - Keepalive tracks the last tuple arrival and probes that **actually left**
+    the device. Defaults are `TCP_KEEPIDLE=7200`, `TCP_KEEPINTVL=75`,
+    `TCP_KEEPCNT=9`. Only ESTABLISHED/CLOSE-WAIT arm keepalive; an arrival
+    resets the unanswered count, and Closed clears all keepalive state.
+    Timeout requires `count` transmitted unanswered probes followed by one
+    response interval. A late poll emits a probe, never invents missed ones.
+    Linux **v6.12**, `net/ipv4/tcp_timer.c`, `tcp_keepalive_timer`, lines
+    791–830 counts `icsk_probes_out` and excludes outstanding data.
+  - Changing keepalive options clears the unanswered count and deadline,
+    preserving smoltcp's already armed probe time. Lumen changes the interval
+    before the due probe is emitted; timeout can only follow actual probes.
+    **Deviation:** smoltcp cannot re-arm an existing idle timer, so a changed
+    `TCP_KEEPIDLE` can take effect later than Linux's
+    `tcp_sock_set_keepidle_locked` (`net/ipv4/tcp.c`, v6.12, lines 3612–3631).
+    Enabling keepalive on an idle transport sends an immediate probe
+    (another smoltcp deviation from Linux's idle delay).
+  - `close` starts an orphan cleanup deadline at **now + 60 s**, even when
+    a prior `shutdown(Wr)` entered FIN-WAIT-2 long ago. An orphan entering
+    FIN-WAIT-2 restarts it at that transition. In FIN-WAIT-1, CLOSING and
+    LAST-ACK, each arrival reducing `send_queue` restarts it so slow readers
+    can drain queued writes. Linux **v6.12**, `net/ipv4/tcp.c`, `__tcp_close`,
+    lines 3164–3180; `net/ipv4/tcp_input.c`, `tcp_rcv_state_process`, lines
+    6888–6915; `net/ipv4/tcp_timer.c`, `tcp_orphan_retries`, lines 148–161.
+    SYN-SENT/Closed entries are removed immediately at close. An orphan
+    aborted at its cleanup deadline is reaped even if its RST cannot leave
+    because ARP or transmit capacity never recovers.
+  - **Deviations:** Linux frees a FIN-WAIT-2 orphan silently via a timewait
+    mini-socket; Lumen attempts RST. The 60 s no-progress cleanup for other
+    orphan states is a bounded substitute for Linux's unanswered retry
+    limits. No `tcp_retries2` give-up for owned sockets without keepalive;
+    an unreachable neighbor is reported at the connect deadline rather
+    than after Linux's shorter ARP failure.
+  - Deterministic tests cover idle close after 61 s and one hour, with
+    and without intervening polls, data followed by EOF, live-peer
+    keepalive enabling, per-state deadlines, and 200 s established idle.
 - **Errors** (lumen-net classifies each transition after a poll and keeps
   it as the socket's pending error):
   - SynSent to Closed by a RST is `ECONNREFUSED`;
-  - Closed from a synchronized state after a RST is `ECONNRESET`;
-  - a Closed transition with no RST seen is `ETIMEDOUT` if a timeout was
-    set, else `ECONNRESET`.
-  - After the error is taken (`SO_ERROR` or the call that reports it),
-    `recv` returns 0 and `send` gives `-EPIPE` with `SIGPIPE` (section 8).
-    The first call after a reset reports `-ECONNRESET`, as Linux's
-    pending `sk_err` comes first. A `recv` after the peer's FIN returns 0.
+  - A RST in CLOSE-WAIT is `EPIPE`; other synchronized-state resets are
+    `ECONNRESET` (Linux **v6.12**, `net/ipv4/tcp_input.c`, `tcp_reset`,
+    lines 4538–4549);
+  - Other unexpected Closed transitions report `ECONNRESET`; Lumen's
+    connect/keepalive deadlines set their own errors before aborting.
+  - Graceful LAST-ACK → Closed, TIME-WAIT expiry and a RST in TIME-WAIT
+    leave no error. RST and LAST-ACK→Closed in smoltcp 0.14 preserve the
+    receive buffer, so `recv` continues reading that original queue.
+  - Before TIME-WAIT expiry egress or an Ethernet address change could
+    call smoltcp's destructive `reset()`, Lumen moves the socket into its
+    entry's preallocated retired-socket storage and changes it to Closed.
+    It is no longer polled, so no reset packet is emitted. Both buffers and
+    their charge/slot reservation remain until close or reconnect. This
+    copies **no receive bytes** and requires **zero duplicate RX backup
+    bytes** (including with `SO_RCVBUF`): the retained original buffer scales
+    with the requested receive size. Per-entry metadata reserves space for
+    this socket value at stack creation; moving it is a bounded metadata
+    operation, not an O(receive-queue length) per-frame copy.
+  - `recv` returns queued data first. If FIN was received, the drained queue
+    gives EOF even after a later RST; the error remains for `SO_ERROR` or
+    `send`. Otherwise recv reports the pending error once, then EOF. `send`
+    reports the pending error first and later `-EPIPE` with SIGPIPE (section
+    8). Linux **v6.12**, `net/ipv4/tcp.c`, `tcp_recvmsg_locked`, lines
+    2626–2669 checks the queue, then `SOCK_DONE`, then `sk_err`.
 - **Half-close and close:**
   - `SHUT_WR` is smoltcp's `close` (a FIN). `SHUT_RD` is Lumen's flag:
     `recv` returns 0 and later data is dropped. `SHUT_RDWR` is both.
+    `inet_shutdown` behavior is preserved: a listener disconnects on read
+    shutdown (write-only succeeds without disconnecting), SYN-SENT
+    disconnects successfully, and Closed/unconnected sockets return
+    `ENOTCONN` after recording shutdown flags (Linux **v6.12**,
+    `net/ipv4/af_inet.c`, `inet_shutdown`, lines 917–939).
   - `close` with unread received data, or with `SO_LINGER` on and
     `l_linger` 0, aborts (a RST), as Linux's `tcp_close`. Otherwise
     smoltcp's `close` runs, and the socket stays in its set as an orphan
@@ -4547,7 +4622,7 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
     didn't stop (so its last ACK went out), freeing its slot and crediting
     its buffers, and leaves a port-table entry with that deadline, as
     Linux's small time-wait buckets do. Otherwise every active close would
-    hold 128 KiB for 10 s: C8's 500 connections would need about 60 MiB.
+    hold 128 KiB for 10 s: C8's 500 connections would need about 63 MiB.
     A FIN retransmitted into that window gets a RST, not an ACK (a
     deviation).
 - **TCP options** (C5):
@@ -4555,9 +4630,19 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
   - the keep-alive options as above, each stored and reported;
   - `TCP_CORK` is stored and reported, with no effect (smoltcp has no
     cork; a deviation; four census calls);
-  - `TCP_MAXSEG` is settable as on Linux (0, or 88 to 32767, else
-    `-EINVAL`) and stored with no effect on smoltcp's segment size (a
-    deviation); reading it reports smoltcp's segment size.
+  - `TCP_MAXSEG` accepts 0 or 88–32767, else `EINVAL`. A nonzero user MSS
+    is reported before connect/in LISTEN (also in Closed), and after connect
+    readback is `min(user_mss, path/peer MSS)`; zero removes the user clamp.
+    Linux **v6.12**, `net/ipv4/tcp.c`, `do_tcp_setsockopt`, lines 3809–3818,
+    and `do_tcp_getsockopt`, lines 4314–4318 are the reference. **Deviation:**
+    smoltcp 0.14 has no per-socket user-MSS setter, so this changes readback
+    only, not the advertised MSS or actual segmentation.
+  - Changes to listener options update its prefilled LISTEN/SYN-RECEIVED
+    pool, including smoltcp's Nagle/hop-limit settings and Lumen's keepalive
+    policy. Completed queued children and accepted sockets are independent;
+    later listener changes do not overwrite them. Linux **v6.12**,
+    `net/ipv4/inet_connection_sock.c`, `inet_csk_clone_lock`, lines 1245–1254
+    clones current listener state when creating the child.
 - **Timers under the busy-host rule (B3, C4).** smoltcp's retransmission,
   delayed ACK, keep-alive, zero-window probe and TIME-WAIT timers, and the
   timeouts above, all run on the `Instant` the net thread passes. A
@@ -4574,7 +4659,10 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
     `cargo:lumen-net` over a made-up `Instant`.
 
 **UDP (C3).** smoltcp UDP sockets, each direction a packet buffer of 32
-slots and the socket's buffer size in payload bytes.
+slots and the socket's buffer size in payload bytes. UDP and ICMP writable
+notifications compare both payload occupancy and `can_send()` across a poll:
+a full metadata ring becoming available must wake writers even when all
+queued payloads are zero length.
 - **Sizes:** a datagram longer than the MTU less its headers is
   `-EMSGSIZE`: on `lo` 65507 bytes, IPv4's limit, which Lumen applies
   over ::1 too, less IPv6's longer header (65487, where Linux allows 65527:
@@ -4583,10 +4671,21 @@ slots and the socket's buffer size in payload bytes.
   `-EMSGSIZE` too, where Linux sends it into an empty queue (a deviation).
 - **Calls:** `MSG_PEEK`, `MSG_TRUNC` (`recv` returns the datagram's full
   length), and `connect` (the default destination and a source filter;
-  `AF_UNSPEC` disconnects). `SO_BROADCAST` is accepted (slirp's
-  `restrict=on` drops it anyway). musl's resolver path (the census: a
+  `AF_UNSPEC` disconnects). Broadcast sends require `SO_BROADCAST`,
+  otherwise `EACCES` (Linux **v6.12**, `net/ipv4/udp.c`, `udp_sendmsg`,
+  lines 1247–1250). TTL is applied through `set_hop_limit`; TOS is
+  recorded/reported only. The configured device IP MTU is shared by UDP
+  size checks and TCP_MAXSEG reporting. musl's resolver path (the census: a
   non-blocking `bind`, `sendto` port 53, `recvmsg`, `poll`) needs exactly
   these.
+- **Read shutdown:** after `SHUT_RD`/`SHUT_RDWR`, queued and subsequent
+  datagrams are discarded and `recv` returns zero with no source endpoint,
+  agreeing with readable readiness. Linux **v6.12**, `net/ipv4/udp.c`,
+  `udp_recvmsg`, lines 1832–1834, and `net/core/datagram.c`,
+  `__skb_wait_for_more_packets`, lines 104–106 return EOF on the blocking
+  path. **Deviation:** Lumen's unified receive API returns that EOF for all
+  callers; Linux `MSG_DONTWAIT` can instead return `EAGAIN` before reaching
+  the shutdown check (`__skb_recv_udp`, lines 1725, 1733, 1775–1781).
 - **A deviation:** an ICMP port unreachable isn't reported. Linux gives a
   connected UDP socket `-ECONNREFUSED`; smoltcp hands ICMP errors only to
   an ICMP socket bound to that UDP port (`Endpoint::Udp`), which Lumen
@@ -4596,8 +4695,10 @@ slots and the socket's buffer size in payload bytes.
 interfaces.
 - **Ping sockets** (`SOCK_DGRAM` with `IPPROTO_ICMP` or `IPPROTO_ICMPV6`):
   a smoltcp ICMP socket bound to the socket's identifier (its "port":
-  from `bind`, or a free one in 1–65535, as Linux's `ping_get_port`). It sends
-  the caller's echo request with that identifier, and `recv` returns the
+  from `bind`, or a free one in 1–65535). It sends
+  the caller's echo request after replacing bytes 4–5 with that identifier
+  and recomputing the checksum (Linux **v6.12**, `net/ipv4/ping.c`,
+  `ping_get_port`, lines 78–103, and `ping_v4_sendmsg`, line 816). `recv` returns the
   ICMP message without an IP header. smoltcp's ICMP socket accepts both
   directions for its identifier, so lumen-net drops echo **requests** from
   a ping socket's queue, leaving replies. Every gid may open one, a
@@ -4607,14 +4708,21 @@ interfaces.
   (busybox `ping` as root opens `SOCK_RAW` protocol 1: the census). The
   socket binds its ICMP socket to the identifier of the first echo
   request it sends and keeps both requests and replies for it, as a raw
-  socket sees both. IPv4 messages come with a synthesized 20-byte IPv4
-  header, as a Linux raw socket delivers them. Other ICMP types aren't
+  socket sees both. Raw sockets do not reserve identifiers: every matching
+  socket receives the message, including alongside a ping socket. IPv4
+  messages come with a synthesized 20-byte header whose destination is
+  the **received packet's destination**, including loopback aliases and
+  packets queued before an address was removed. A fixed eight-slot
+  destination FIFO accompanies smoltcp's source-only receive metadata. An ICMP message exceeding
+  its send buffer is `EMSGSIZE`; an unaddressable destination is
+  `EADDRNOTAVAIL`, distinct from transient `EAGAIN`. Other ICMP types aren't
   delivered (a deviation), and `SOCK_RAW` with any other protocol is
   `-EPROTONOSUPPORT`.
 
 **Memory (B3, C5).**
 - **Defaults:**
-  - TCP: 64 KiB each way;
+  - TCP: 64 KiB each way (128 KiB charged per prepared socket); the
+    retired transport retains those original buffers, with no RX backup;
   - UDP: 64 KiB of payload and 32 slots each way;
   - ICMP: 4 KiB and 8 slots.
 - **`SO_RCVBUF`/`SO_SNDBUF`** as Linux's `sock_setsockopt`: the value is
@@ -4699,110 +4807,178 @@ arrival, calls `send` and `readiness` on it inline, and checks it is still
 in `changed`.
 
 ```rust
-// crates/lumen-net/src/lib.rs (#459's PR 2)
-pub const NET_SOCKETS: usize = 1024;          // slots per interface set, fixed at boot
-pub const NET_ENTRIES: usize = 2 * NET_SOCKETS; // SockIds: sockets holding no slot yet, plus every slot
-pub const LISTEN_POOL_MAX: usize = 8;         // LISTEN sockets per listener per set
-pub const RX_BUDGET: usize = 16;              // poll_ingress_single calls per interface per round
+pub const NET_SOCKETS: usize = 1024;           // fixed slots per interface
+pub const NET_ENTRIES: usize = 2 * NET_SOCKETS; // IDs, including sockets without slots
+pub const LISTEN_POOL_MAX: usize = 8;
+pub const RX_BUDGET: usize = 16;
 pub const EPHEMERAL: core::ops::RangeInclusive<u16> = 32768..=60999;
-
-pub struct Loopback { /* `slots` preallocated packets of `mtu` bytes */ }
-impl Loopback { pub fn try_new(mtu: usize, slots: usize) -> Result<Self, NetError>; }  // NoMem
-
-/// The socket-memory budget: an atomic counter, usable outside any lock.
-pub struct Budget { /* limit, used: AtomicUsize */ }
+pub const SOMAXCONN: usize = 4096;
+pub const NET_MEM_CAP: usize = 32 * 1024 * 1024;
+pub fn clamp_backlog(backlog: i32) -> usize;
+pub fn buffer_size(value: i32, receive: bool) -> (usize, usize);
+pub struct BufSizes { pub rx: usize, pub tx: usize }
+pub struct Loopback { /* private fixed ring; Device tokens stay private */ }
+impl Loopback {
+    pub fn try_new(mtu: usize, slots: usize) -> Result<Self, NetError>;
+    pub fn queued(&self) -> usize;
+    pub fn full(&self) -> bool;
+}
+pub struct Budget { /* atomic used/limit */ }
 impl Budget {
     pub const fn new(limit: usize) -> Self;
-    pub fn try_charge(&'static self, bytes: usize) -> Result<Charge, NetError>;  // NoBufs
-    pub fn credit(&self, bytes: usize);       // for a Charge turned into_raw
+    pub const fn for_usable_memory(bytes: usize) -> Self;
+    pub fn try_charge(&'static self, bytes: usize) -> Result<Charge, NetError>;
     pub fn used(&self) -> usize;
+    pub fn limit(&self) -> usize;
 }
-pub struct Charge { /* &'static Budget, bytes; credits on drop */ }
-impl Charge { pub fn bytes(&self) -> usize; pub fn into_raw(self) -> usize; }
-
-/// Buffers allocated (`try_reserve_exact`) and charged before the stack
-/// lock is taken.
-pub struct BufSizes { pub rx: usize, pub tx: usize }
-pub struct TcpPrep { /* tcp::Socket with its buffers, its Charge */ }
-pub struct UdpPrep { /* .. */ }
-pub struct IcmpPrep { /* .. */ }
-pub enum Prep { Tcp(TcpPrep), Udp(UdpPrep), Icmp(IcmpPrep) }
+pub struct Charge { /* refunds on drop; raw credit is not public */ }
+impl Charge { pub fn bytes(&self) -> usize; }
+pub struct TcpPrep { /* transport buffers and charge */ }
+pub struct UdpPrep { /* packet buffers and charge */ }
+pub struct IcmpPrep { /* packet buffers, header cache and charge */ }
 pub fn prepare_tcp(budget: &'static Budget, sizes: BufSizes) -> Result<TcpPrep, NetError>;
 pub fn prepare_udp(budget: &'static Budget, sizes: BufSizes) -> Result<UdpPrep, NetError>;
 pub fn prepare_icmp(budget: &'static Budget) -> Result<IcmpPrep, NetError>;
-
-#[derive(Clone, Copy, PartialEq, Eq)] pub enum IfaceId { Lo, Eth0 }
-#[derive(Clone, Copy, PartialEq, Eq)] pub struct SockId { idx: u32, generation: u32 }
-impl SockId { pub fn index(self) -> usize; }   // into the kernel's NET_ENTRIES array
+pub enum ConnectPrep { Tcp(TcpPrep), Udp(UdpPrep), Icmp(IcmpPrep) }
+pub enum Preps<'a> {
+    None,
+    Tcp(&'a mut dyn Iterator<Item = TcpPrep>),
+    Udp(&'a mut dyn Iterator<Item = UdpPrep>),
+    Icmp(&'a mut dyn Iterator<Item = IcmpPrep>),
+}
+pub enum PrepFor<'a> { Bind(&'a BindReq), Connect(IpEndpoint), Send(Option<IpEndpoint>), Listen(usize) }
+pub enum Family { V4, V6 }
+impl Family { pub fn of(addr: IpAddress) -> Self; }
+pub enum IfaceId { Lo, Eth0 }
+pub struct SockId { /* index and wrapping generation */ }
+impl SockId { pub fn index(self) -> usize; }
 pub enum Proto { Tcp, Udp, IcmpEcho { raw: bool } }
-pub struct BindReq { pub addr: Option<IpAddress>, pub port: u16,   // None: wildcard; 0: ephemeral
-                     pub v6: bool, pub v6only: bool, pub reuse_addr: bool, pub reuse_port: bool }
+pub struct BindReq { pub addr: Option<IpAddress>, pub port: u16,
+    pub reuse_addr: bool, pub reuse_port: bool }
 pub struct Readiness { pub readable: bool, pub writable: bool, pub hup: bool,
-                       pub rdhup: bool, pub error: bool }
+    pub rdhup: bool, pub error: bool }
 pub enum Shut { Rd, Wr, RdWr }
 pub enum NetOpt { NoDelay(bool), Cork(bool), KeepAlive(bool), KeepIdle(Duration),
-                  KeepIntvl(Duration), KeepCnt(u32), Linger(Option<Duration>),
-                  Ttl(u8), Tos(u8), Broadcast(bool), V6Only(bool) }
+    KeepIntvl(Duration), KeepCnt(u32), Linger(Option<Duration>), Ttl(u8), Tos(u8),
+    Broadcast(bool), V6Only(bool), MaxSeg(u16) }
 pub enum OptQuery { NoDelay, Cork, KeepAlive, KeepIdle, KeepIntvl, KeepCnt, Linger,
-                    Ttl, Tos, Broadcast, V6Only, MaxSeg }
+    Ttl, Tos, Broadcast, V6Only, MaxSeg }
+pub struct RecvTicket { /* socket generation, interface, queue-head sequence */ }
+impl RecvTicket {
+    /// Limit TCP consumption to bytes successfully copied; datagrams consume whole.
+    pub fn prefix(self, n: usize) -> Self;
+}
 pub struct Received { pub copied: usize, pub full_len: usize,
-                      pub from: Option<IpEndpoint>, pub ticket: RecvTicket }  // which set, which item
+    pub from: Option<IpEndpoint>, pub ticket: RecvTicket }
 pub enum Lease { Configured { addr: Ipv4Cidr, router: Option<Ipv4Address>,
-                              dns: [Option<Ipv4Address>; 3], server: Ipv4Address },
-                 Deconfigured }
+    dns: [Option<Ipv4Address>; 3], server: Ipv4Address }, Deconfigured }
+pub enum EthConfig { Dhcp, Static { addr: Ipv4Cidr, router: Option<Ipv4Address> } }
 pub enum NetError { WouldBlock, InProgress, Already, IsConn, NotConn, AddrInUse,
-                    AddrNotAvail, ConnRefused, ConnReset, TimedOut, HostUnreach, Pipe,
-                    NetUnreach, MsgSize, NoBufs, NoMem, Inval, OpNotSupp }
-impl NetError { pub const fn to_errno(self) -> u32; }
-
-pub struct Stack<D: NetDevice> { /* lo + eth0 Interfaces and sets, PortTable, entries */ }
+    AddrNotAvail, ConnRefused, ConnAborted, ConnReset, TimedOut, HostUnreach, Pipe,
+    NetUnreach, MsgSize, NoBufs, NoMem, Inval, OpNotSupp, DestAddrReq, Acces, StaleTicket }
+impl NetError { pub const fn to_errno(self) -> Option<u32>; }
+pub struct Round { pub more: bool }
+pub struct Stack<D: NetDevice> { /* two interfaces/sets; private PortTable and live IDs */ }
 impl<D: NetDevice> Stack<D> {
-    pub fn try_new(lo: Loopback, now: Instant) -> Result<Self, NetError>;  // both sets' fixed storage
-    pub fn attach_eth(&mut self, dev: D, config: EthConfig, now: Instant); // Dhcp | Static {..}
-    pub fn open(&mut self, proto: Proto) -> Result<SockId, NetError>;      // Lumen state only
-    /// How many preps the next `bind`, `send` or `connect` on `id` needs
-    /// (two for a wildcard UDP socket, one per set).
-    pub fn preps_needed(&self, id: SockId, to: Option<IpEndpoint>) -> usize;
-    pub fn bind(&mut self, id: SockId, req: BindReq, preps: &mut dyn Iterator<Item = Prep>)
-        -> Result<(), NetError>;
-    pub fn connect(&mut self, id: SockId, remote: IpEndpoint, prep: Option<Prep>, now: Instant)
-        -> Result<(), NetError>;                                           // InProgress for TCP
-    pub fn disconnect(&mut self, id: SockId) -> Result<(), NetError>;      // UDP AF_UNSPEC
-    pub fn listen(&mut self, id: SockId, backlog: usize, pool: &mut dyn Iterator<Item = TcpPrep>)
-        -> Result<(), NetError>;
-    pub fn shortfalls(&self) -> &[(SockId, IfaceId, usize)];               // pools to refill
-    pub fn refill(&mut self, id: SockId, iface: IfaceId, prep: TcpPrep);
-    pub fn accept(&mut self, id: SockId) -> Result<(SockId, IpEndpoint), NetError>;
-    pub fn send(&mut self, id: SockId, data: &[u8], to: Option<IpEndpoint>,
-                preps: &mut dyn Iterator<Item = Prep>) -> Result<usize, NetError>;
-    pub fn recv(&mut self, id: SockId, buf: &mut [u8], peek: bool) -> Result<Received, NetError>;
-    pub fn consume(&mut self, id: SockId, ticket: RecvTicket);             // dequeues from that set
-    /// A datagram's length and ticket, without advancing the set alternation;
-    /// `recv_ticket` then takes exactly that datagram.
-    pub fn datagram_len(&self, id: SockId) -> Result<(usize, RecvTicket), NetError>;
-    pub fn recv_ticket(&mut self, id: SockId, ticket: RecvTicket, buf: &mut [u8], peek: bool)
-        -> Result<Received, NetError>;
-    pub fn shutdown(&mut self, id: SockId, how: Shut) -> Result<(), NetError>;
-    pub fn close(&mut self, id: SockId, linger_zero: bool);                // orphans keep running
-    pub fn readiness(&self, id: SockId) -> Readiness;                      // stale id: hup | error
-    pub fn take_error(&mut self, id: SockId) -> Option<NetError>;          // SO_ERROR
+    pub fn try_new(lo: Loopback, now: Instant, seed: u64) -> Result<Self, NetError>;
+    pub fn attach_eth(&mut self, dev: D, config: EthConfig, now: Instant, seed: u64) -> Result<(), NetError>;
+    pub fn configure_eth(&mut self, addr: Option<Ipv4Cidr>, router: Option<Ipv4Address>) -> Result<(), NetError>;
+    pub fn open(&mut self, family: Family, proto: Proto) -> Result<SockId, NetError>;
+    pub fn preps_needed(&self, id: SockId, operation: PrepFor<'_>) -> usize;
+    pub fn bind(&mut self, id: SockId, req: BindReq, preps: Preps<'_>, now: Instant) -> Result<(), NetError>;
+    pub fn connect(
+        &mut self,
+        id: SockId,
+        remote: IpEndpoint,
+        prep: Option<ConnectPrep>,
+        now: Instant,
+    ) -> Result<(), NetError>;
+    pub fn disconnect(&mut self, id: SockId) -> Result<(), NetError>;
+    pub fn poll_round(&mut self, now: Instant) -> Round;
+    pub fn shutdown(&mut self, id: SockId, how: Shut, now: Instant) -> Result<(), NetError>;
+    pub fn abort(&mut self, id: SockId, now: Instant) -> Result<(), NetError>;
+    pub fn close(&mut self, id: SockId, linger_zero: bool, now: Instant);
+    pub fn readiness(&self, id: SockId) -> Readiness;
+    pub fn take_error(&mut self, id: SockId) -> Option<NetError>;
     pub fn local_endpoint(&self, id: SockId) -> Option<IpEndpoint>;
     pub fn remote_endpoint(&self, id: SockId) -> Option<IpEndpoint>;
-    pub fn set_opt(&mut self, id: SockId, opt: NetOpt) -> Result<(), NetError>;
-    pub fn get_opt(&self, id: SockId, q: OptQuery) -> Result<NetOpt, NetError>;
-    pub fn poll_round(&mut self, now: Instant) -> Round;                   // more: loop again at once
-    pub fn poll_at(&self, now: Instant) -> Option<Instant>;
-    pub fn changed(&mut self) -> &[SockId];                                // since the last call
-    pub fn lease_event(&mut self) -> Option<Lease>;
     pub fn iface_of(&self, id: SockId) -> Option<IfaceId>;
+    pub fn set_opt(&mut self, id: SockId, opt: NetOpt, now: Instant) -> Result<(), NetError>;
+    pub fn get_opt(&self, id: SockId, q: OptQuery) -> Result<NetOpt, NetError>;
+    pub fn changed(&mut self) -> &[SockId];
+    pub fn lease_event(&mut self) -> Option<Lease>;
+    pub fn poll_at(&self, now: Instant) -> Option<Instant>;
+    pub fn port_count(&self) -> usize;
+    pub fn time_wait_ports(&self) -> impl Iterator<Item = (u16, Instant)> + '_;
+    pub fn socket_count(&self) -> usize;
+    pub fn entry_count(&self) -> usize;
+    pub fn has_eth(&self) -> bool;
+    pub fn device_info(&self) -> Option<NetInfo>;
+    pub fn failed_transmits(&self) -> usize;
+    pub fn eth_tx_ready(&self) -> bool;
+    pub fn listen(
+        &mut self,
+        id: SockId,
+        backlog: usize,
+        pool: &mut dyn Iterator<Item = TcpPrep>,
+        now: Instant,
+    ) -> Result<(), NetError>;
+    pub fn shortfalls(&self) -> &[(SockId, IfaceId, usize)];
+    pub fn refill(&mut self, id: SockId, iface: IfaceId, prep: TcpPrep, now: Instant) -> Result<bool, NetError>;
+    pub fn accept(&mut self, id: SockId) -> Result<(SockId, IpEndpoint), NetError>;
+    pub fn send(
+        &mut self,
+        id: SockId,
+        data: &[u8],
+        to: Option<IpEndpoint>,
+        preps: Preps<'_>,
+        now: Instant,
+    ) -> Result<usize, NetError>;
+    pub fn datagram_len(&self, id: SockId) -> Result<(usize, RecvTicket), NetError>;
+    pub fn recv_ticket(
+        &mut self,
+        id: SockId,
+        ticket: RecvTicket,
+        buf: &mut [u8],
+        peek: bool,
+    ) -> Result<Received, NetError>;
+    pub fn recv(&mut self, id: SockId, buf: &mut [u8], peek: bool) -> Result<Received, NetError>;
+    pub fn consume(&mut self, id: SockId, ticket: RecvTicket) -> Result<(), NetError>;
 }
-pub struct Round { pub more: bool }
 ```
 
-A method given a stale `SockId` (its generation no longer matches)
-returns `NetError::Inval`. `Lease`'s `dns` is a fixed array (no heap);
-`changed` and `shortfalls` have fixed capacity. #459's PR 2 writes a host
-test for each row of the error and timeout lists above.
+A stale `SockId` normally gives `NetError::Inval`. Exceptions: receive
+`consume`/`recv_ticket` give `StaleTicket`; `readiness` gives error+hup;
+`preps_needed` returns 0; `close` does nothing; `refill` returns `Ok(false)`;
+optional accessors (`take_error`, endpoints, `iface_of`) return `None`.
+`StaleTicket` never becomes a user errno: retry from `datagram_len`.
+`Pipe` also has no direct `to_errno` mapping: the syscall layer applies
+SIGPIPE/MSG_NOSIGNAL policy and returns EPIPE. `RecvTicket::prefix(n)` permits
+partial TCP consumption after copying to user memory; UDP/ICMP tickets
+consume a whole datagram even with a prefix of zero.
+
+`preps_needed` describes the particular call: TCP bind needs 0, TCP connect
+one new transport, UDP connect one missing-interface prep, a specific
+**datagram** bind one, a wildcard datagram bind one per covered interface,
+and listen its missing pool count. `Send(None)` uses the connected peer.
+After preparing outside the lock, re-call `preps_needed` in the **same lock
+hold** as the operation: coverage or pool occupancy may have changed.
+Batches contain typed homogeneous iterators; a wrong `ConnectPrep` kind
+returns `Inval`. `refill` returns `Ok(true)` when installed, `Ok(false)` when
+no longer needed (including a closed listener), or an error for B3 to count
+and warn about. `shortfalls()` contains at most `2 * NET_ENTRIES` tuples;
+copy it before releasing the lock. DHCP configuration failures retain the
+event for retry; only successfully applied leases reach `lease_event`.
+
+B3 supplies independent `lumen_rand` seeds to `try_new`/`attach_eth` for TCP
+ISNs and DHCP transaction IDs; clocks are not random seeds. `snapshot`,
+`observe`, `note_sent`, and `syn_action` walk only live IDs. Per round,
+deadlines and orphan reaping still scan the fixed entry array, and
+`changed()` scans the fixed dirty array when collected. Port expiration
+scans its fixed TIME-WAIT table; smoltcp scans each fixed SocketSet during
+polling. None of these scans copies receive queues. `Lease` DNS and the
+changed/shortfall lists have fixed storage. Host tests cover these errors,
+timers, allocation bounds and readiness wakes using made-up time.
 
 **virtio first** (rng, input, sound in M3; blk in M7; net in M9, designed in #450) under
 QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12
@@ -13387,7 +13563,8 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
     Linux;
   - a rebind over TIME-WAIT: the check first sees the port listed in the
     `net` command's TIME-WAIT ports (B3's command lists them), then
-    rebinds with `SO_REUSEADDR` and succeeds (the refusal without it is
+    rebinds with `SO_REUSEADDR` on both the original and new socket and
+    succeeds (the refusal without both flags is
     `cargo:lumen-net`'s, over a made-up `Instant`); two
     `SO_REUSEPORT` binds succeed; `IPV6_V6ONLY` decides whether `::` and
     0.0.0.0 conflict;
