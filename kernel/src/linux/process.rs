@@ -143,12 +143,13 @@ impl Pollable for TtyPoll {
 
 /// Exclusive kernel object attached to a [`KernelFile`] description.
 ///
-/// B1 appends `Sock` here; B5 and B6 append variants to [`AnonObj`].
+/// B5 and B6 append variants to [`AnonObj`].
 enum FileObj {
     Pipe(PipePoll),
     Tty(TtyPoll),
     #[allow(dead_code)] // constructed by B5/B6 via `KernelFile::new_anon`
     Anon(AnonObj),
+    Sock(Arc<dyn crate::net::sock::SockOps>),
 }
 
 /// An open file description as the kernel's FD tables hold it (Lock 2 its
@@ -231,6 +232,19 @@ impl KernelFile {
         Ok(file)
     }
 
+    /// Construct an open file description for a socket (`sockfs`, dev `0:8`),
+    /// attaching `sock` once for the lifetime of the description.
+    pub(crate) fn new_sock(
+        inode: Arc<dyn VfsInode>,
+        path: Arc<[u8]>,
+        flags: OpenFlags,
+        sock: Arc<dyn crate::net::sock::SockOps>,
+    ) -> Result<Self, VfsError> {
+        let mut file = Self::from_open_file(OpenFile::new_unchecked_flags(inode, path, flags)?);
+        file.obj = Some(FileObj::Sock(sock));
+        Ok(file)
+    }
+
     /// Unique `u64` identifier of this open file description (`OpenFile::id`,
     /// allocated by `lumen_vfs::next_open_file_id`; shared across `dup` and
     /// `fork`, used by B5 to key `epoll` interests by `(file.id(), fd)`).
@@ -267,6 +281,14 @@ impl KernelFile {
         }
     }
 
+    /// Borrow the underlying [`crate::net::sock::SockOps`] if this is a socket.
+    pub fn sock(&self) -> Option<&Arc<dyn crate::net::sock::SockOps>> {
+        match &self.obj {
+            Some(FileObj::Sock(sock)) => Some(sock),
+            _ => None,
+        }
+    }
+
     /// Readiness source for this open file description, used by both
     /// `poll_file` (`syscall/poll.rs`) and `epoll_ctl` (B5).
     ///
@@ -281,6 +303,7 @@ impl KernelFile {
             Some(FileObj::Pipe(pipe)) => Some(pipe),
             Some(FileObj::Tty(tty)) => Some(tty),
             Some(FileObj::Anon(anon)) => Some(anon.pollable()),
+            Some(FileObj::Sock(sock)) => Some(&**sock),
             None => self.inner.inode().pollable(),
         }
     }
@@ -340,6 +363,7 @@ impl KernelFile {
             }
             Some(FileObj::Tty(tty)) => tty.0.release(),
             Some(FileObj::Anon(anon)) => anon.release(),
+            Some(FileObj::Sock(sock)) => sock.release(),
             None => {}
         }
     }
@@ -374,6 +398,13 @@ impl Drop for KernelFile {
                     // Only a never-installed description retains its initial reference.
                     debug_assert_eq!(self.inner.fd_ref_count(), 1);
                     anon.release();
+                }
+            }
+            Some(FileObj::Sock(sock)) => {
+                if *self.end_refs.get_mut() == 1 {
+                    // Only a never-installed description retains its initial reference.
+                    debug_assert_eq!(self.inner.fd_ref_count(), 1);
+                    sock.release();
                 }
             }
             Some(FileObj::Tty(_)) | None => {}
@@ -1887,6 +1918,18 @@ fn with_current_fds<R>(f: impl FnOnce(&mut FdTable<FileRef>) -> R) -> R {
 /// `KernelFile::end_refs` under `Files::table` and releasing it on drop.
 pub fn current_io_file(fd: i32) -> Option<IoFile> {
     with_current_fds(|t| t.get(fd).map(|e| IoFile::new(&e.file)))
+}
+
+/// Clone the open file on `fd` and raise its counted FD/end reference under
+/// `Files::table` (for `SCM_RIGHTS` `InFlightFile`). Caller must balance with
+/// `KernelFile::dec_fd_ref` or `ReservedFd::install_ref`, outside every lock.
+pub fn clone_current_fd_ref(fd: i32) -> Option<FileRef> {
+    with_current_fds(|t| {
+        t.get(fd).map(|e| {
+            e.file.inc_fd_ref();
+            Arc::clone(&e.file)
+        })
+    })
 }
 
 /// The current process's open files on each of `fds` for `poll`/`select`,

@@ -311,6 +311,13 @@ impl ReservedFd {
         let r = self.reservation.take().expect("unconsumed reservation");
         self.files.table.lock().fds.install(r, file, cloexec)
     }
+
+    /// Install an existing description whose caller already holds one counted
+    /// FD reference (such as an `InFlightFile` received via `SCM_RIGHTS`).
+    pub fn install_ref(mut self, file: FileRef, cloexec: bool) -> i32 {
+        let r = self.reservation.take().expect("unconsumed reservation");
+        self.files.table.lock().fds.install(r, file, cloexec)
+    }
 }
 
 impl Drop for ReservedFd {

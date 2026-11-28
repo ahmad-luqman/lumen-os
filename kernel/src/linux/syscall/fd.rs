@@ -224,6 +224,9 @@ fn read(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
         let nonblock = file.is_nonblock();
         return pipe.read(buf.addr(), count, nonblock);
     }
+    if let Some(sock) = file.sock() {
+        return super::socket::read_sock(&**sock, buf, count, file.is_nonblock());
+    }
     if file.inode().is_tty() {
         return read_tty(&file, buf.addr(), count);
     }
@@ -241,6 +244,9 @@ fn write(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     if let Some(pipe) = file.pipe() {
         let nonblock = file.is_nonblock();
         return pipe.write(buf.addr(), count, nonblock);
+    }
+    if let Some(sock) = file.sock() {
+        return super::socket::write_sock(&**sock, buf, count, file.is_nonblock());
     }
     if let Some(tty) = file.tty() {
         return tty.write(buf.addr(), count, file.is_nonblock());
@@ -288,10 +294,14 @@ fn ioctl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
         }
         _ if file.tty().is_some() => file.tty().unwrap().ioctl(cmd, arg),
         ioctl::FIONREAD => {
-            let Some(pipe) = file.pipe() else {
+            let n = if let Some(pipe) = file.pipe() {
+                pipe.fionread()
+            } else if let Some(sock) = file.sock() {
+                sock.fionread()?
+            } else {
                 return Err(errno::ENOTTY);
             };
-            let n = i32::try_from(pipe.fionread()).unwrap_or(i32::MAX);
+            let n = i32::try_from(n).unwrap_or(i32::MAX);
             // SAFETY: `i32` is 4 bytes with no padding.
             unsafe { copy_pod_to_user(arg, &n) }.map_err(CopyError::to_errno)?;
             Ok(0)
@@ -343,6 +353,9 @@ fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let _pos = file.lock_pos();
     file.require_readable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
+    if let Some(sock) = file.sock() {
+        return super::socket::readv_sock(&**sock, &iovs, file.is_nonblock());
+    }
     if let Some(pipe) = file.pipe() {
         // copy_iovecs already checked that the sum fits isize::MAX.
         let planned = iovs.iter().map(|span| span.len as usize).sum();
@@ -414,6 +427,9 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let _pos = file.lock_pos();
     file.require_writable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
+    if let Some(sock) = file.sock() {
+        return super::socket::writev_sock(&**sock, &iovs, file.is_nonblock());
+    }
     if let Some(pipe) = file.pipe() {
         let nonblock = file.is_nonblock();
         // copy_iovecs already checked that the sum fits isize::MAX.

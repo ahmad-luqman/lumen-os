@@ -379,9 +379,10 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `current_thread`/`current_process`), `KernelFile` (`id()` exposing
   `OpenFile::id` from `lumen_vfs::next_open_file_id`, combined `end_refs`
   released via `release_end`, in-flight `IoFile` refcount guard,
-  `obj: Option<FileObj>` holding `Pipe(PipePoll)`, `Tty(TtyPoll)` or
-  `Anon(AnonObj)` with `AnonObj::{kind,pollable,release}`, and `pollable()`,
-  #379, #386, #388, #471), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
+  `obj: Option<FileObj>` holding `Pipe(PipePoll)`, `Tty(TtyPoll)`,
+  `Anon(AnonObj)` with `AnonObj::{kind,pollable,release}`, or
+  `Sock(Arc<dyn SockOps>)` via `new_sock`/`sock()`, and `pollable()`,
+  #379, #386, #388, #471, #472), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
   vfork and thread clone validation, #380, #382), `process/table.rs`
   (`ProcTable` behind `PROCS`: lumen-proc's tree, processes by pid, threads
   by tid, `WaitResult`, `link_init`/`link_root`/`link_thread`/
@@ -390,9 +391,10 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   clone against `RLIMIT_NPROC` through lumen-proc's `allows_new_task`,
   after `check_clone`; root not exempt; `nproc_task_count` the ktests'
   count, #435), `check` cross-checking them in the ktests), `process/files.rs` (`Files`: the 1024-slot FD table of
-  `KernelFile`s, shared/exclusive `FilesAccess` leases, `ReservedFd`,
+  `KernelFile`s, shared/exclusive `FilesAccess` leases, `ReservedFd`
+  with `install`/`install_ref`,
   `fork_copy`, `prepare_exec`/`copy_exec_into`; `FsState`/`FsInner` for
-  `Cwd` and umask, #379, #380, #381), `process/signal.rs` (`SignalState`,
+  `Cwd` and umask, #379, #380, #381, #472), `process/signal.rs` (`SignalState`,
   `ThreadSignals`, `Delivery`, `HandlerDelivery`, group exit/stop/cont,
   `wait_signal`, `sigaltstack`, `ctty`, #384, #385, #388; `Rlimits` (stack,
   `NOFILE`, `NPROC`) read and replaced through `Process::rlimit`
@@ -434,9 +436,9 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `create`/`set`/`get`/`delete`/`overrun`/`delivered`/`clear`);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern; M7's and
-  M8's `not_implemented` stubs are gone, while M9's 32 B0 stubs (#471) live
-  in `socket.rs`, `epoll.rs`, `evfd.rs` plus C7's in `io.rs`, `mem.rs`,
-  `sys.rs`; `sendmmsg`, `recvmmsg`, `membarrier`, `clone3`, `execveat`,
+  M8's `not_implemented` stubs are gone, while M9's remaining B0 stubs (#471)
+  live in `epoll.rs`, `evfd.rs` plus C7's in `io.rs`, `mem.rs`, `sys.rs`;
+  `socket.rs` holds B1's (#472) generic `SockOps` handlers; `sendmmsg`, `recvmmsg`, `membarrier`, `clone3`, `execveat`,
   `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` make
   up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
   (ARCHITECTURE section 8)), `unmap_past`
@@ -462,11 +464,12 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `timer_gettime`, `timer_getoverrun`, `timer_delete`, #392) and `sys`
   (`sched_yield`, `sched_setaffinity`, `sched_getaffinity`, `getpriority`,
   `setpriority`, `getrusage`, `sysinfo`, `prctl`, `statfs`, `fstatfs`,
-  `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391; M9's clusters, #471:
-  `socket`, `epoll`, `evfd` B0 stubs);
+  `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391; M9's clusters:
+  `socket` generic `SockOps` handlers (#472), `epoll` and `evfd` B0 stubs (#471));
   `fd` holds `open`/`openat`/`lseek` (with `open_fifo`, #386, and
-  `devpts::open`, #388, #389) and descriptor I/O/`ioctl` (`FIONREAD`, tty
-  requests) through the table, routing terminals by `VfsInode::is_tty`
+  `devpts::open`, #388, #389) and descriptor I/O/`ioctl` (`FIONBIO`,
+  `FIONREAD` on pipes/ttys/sockets, tty requests, routing socket
+  `read`/`write`/`readv`/`writev` to `SockOps`, #472) through the table, routing terminals by `VfsInode::is_tty`
   to their tty or the process's `ConsoleIo`, and the syscall ktests'
   shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_fd_of`: a failure
   naming the path, `ktest_open`, `ktest_install` and `ktest_install_file`:
@@ -485,6 +488,13 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `readlink`, `symlink`, `Start::link`, `Start::rename`) and
   `stat_from_metadata`/`statx_from_metadata`; the handlers' rules are in
   ARCHITECTURE section 8, "Handlers".
+  `net/` (M9; ARCHITECTURE sections 7, 8 and 10): `net/mod.rs` (`net::init`,
+  called at boot after `linux::init`, #472) and `net/sock.rs` (#472: the
+  generic socket file object: `SockKind`, `ShutdownHow`, `UserSpan`/
+  `UserIovec`, `InFlightFile`, `SendIo`, `RecvIo`, `RecvDone`, `SockOps`,
+  `block_on`, `sockfs` on `SOCK_DEV` `0:8` with `SockInode` reporting
+  `S_IFSOCK` and `socket:[ino]`, `new_socket_file`, and
+  `create_socket`/`create_socketpair` family dispatch).
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested; the `life`
   command's and the Life app's, a path dependency of `apps/`, #202).
