@@ -55,9 +55,14 @@ milestone = "M9"
 tests = ["ktest:lumen_kernel::net::virtio_net::virtio_net_failure_counts_drops_and_recovers_on_transmit"]
 
 [[feature]]
-name = "virtio-net caller errors preserve health; malformed RX completions drop, repost and continue (metadata seam)"
+name = "virtio-net caller errors preserve health; malformed RX completions drop, repost and continue to a maximum-length frame (completed-buffer seam)"
 milestone = "M9"
 tests = [
     "ktest:lumen_kernel::net::virtio_net::virtio_net_oversized_transmit_preserves_health",
     "ktest:lumen_kernel::net::virtio_net::virtio_net_receive_skips_bad_completions_and_reposts",
 ]
+
+[[feature]]
+name = "virtio-net RX skip budget requests another poll; empty completion source does not (completed-buffer metadata seam)"
+milestone = "M9"
+tests = ["ktest:lumen_kernel::net::virtio_net::virtio_net_receive_budget_rings_for_another_poll"]

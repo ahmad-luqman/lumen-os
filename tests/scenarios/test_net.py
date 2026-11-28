@@ -16,7 +16,7 @@ def test_virtio_net_frames(boot):
     m.expect(PROMPT, 60)
     # QEMU's configured MAC is the independent control for config-space reads.
     mac = m.qmp().command("qom-get", path="/machine/peripheral/lumen-nic", property="mac")
-    assert f"net: mac {mac}, link up, mtu 1500\n" in run(m, "net")
+    assert f"net: mac {mac}, link up (Up), mtu 1500\n" in run(m, "net")
     counts = re.compile(
         r"net: rx (\d+), tx (\d+), rx_drops (\d+), tx_drops (\d+), "
         r"tx_free (\d+)/16, reclaimed (\d+), irqs (\d+)"
