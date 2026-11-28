@@ -642,11 +642,11 @@ crate::ktest!(
         crate::kassert_eq!(M7_SYSCALLS.len(), 47);
         crate::kassert_eq!(m7_rows.len(), M7_SYSCALLS.len());
         for &(nr, name) in m6_rows {
-            crate::kassert!(in_table(M6_SYSCALLS, nr) && !in_table(M7_SYSCALLS, nr));
+            crate::kassert_eq!(tables_of(nr), (true, false, false, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m7_rows {
-            crate::kassert!(in_table(M7_SYSCALLS, nr) && !in_table(M6_SYSCALLS, nr));
+            crate::kassert_eq!(tables_of(nr), (false, true, false, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         // No number twice: with the lengths above, `M7_SYSCALLS` is exactly
@@ -767,8 +767,9 @@ crate::ktest!(
 );
 
 #[cfg(feature = "ktest")]
-fn in_table(table: &[(u32, &str)], nr: u32) -> bool {
-    table.iter().any(|&(n, _)| n == nr)
+fn tables_of(nr: u32) -> (bool, bool, bool, bool) {
+    let has = |t: &[(u32, &str)]| t.iter().any(|&(n, _)| n == nr);
+    (has(M6_SYSCALLS), has(M7_SYSCALLS), has(M8_SYSCALLS), has(M9_SYSCALLS))
 }
 
 crate::ktest!(
@@ -862,28 +863,25 @@ crate::ktest!(
         crate::kassert_eq!(M8_SYSCALLS.len(), 60);
         crate::kassert_eq!(m8_rows.len(), M8_SYSCALLS.len());
         for &(nr, name) in m6_rows {
-            crate::kassert!(in_table(M6_SYSCALLS, nr) && !in_table(M7_SYSCALLS, nr) && !in_table(M8_SYSCALLS, nr));
+            crate::kassert_eq!(tables_of(nr), (true, false, false, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m7_rows {
-            crate::kassert!(in_table(M7_SYSCALLS, nr) && !in_table(M6_SYSCALLS, nr) && !in_table(M8_SYSCALLS, nr));
+            crate::kassert_eq!(tables_of(nr), (false, true, false, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m8_rows {
-            crate::kassert!(in_table(M8_SYSCALLS, nr) && !in_table(M6_SYSCALLS, nr) && !in_table(M7_SYSCALLS, nr));
+            crate::kassert_eq!(tables_of(nr), (false, false, true, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(spec_nr, actual) in enosys_rows {
             crate::kassert_eq!(actual, spec_nr);
-            crate::kassert!(
-                !in_table(M6_SYSCALLS, spec_nr) && !in_table(M7_SYSCALLS, spec_nr) && !in_table(M8_SYSCALLS, spec_nr)
-            );
+            crate::kassert_eq!(tables_of(spec_nr), (false, false, false, false));
             crate::kassert_eq!(syscall_name(spec_nr), None);
         }
         // `sendfile` was `-ENOSYS` in M8 and moved to `M9_SYSCALLS` in M9 (C7).
         crate::kassert_eq!(general::__NR_sendfile, 40);
-        crate::kassert!(!in_table(M6_SYSCALLS, 40) && !in_table(M7_SYSCALLS, 40) && !in_table(M8_SYSCALLS, 40));
-        crate::kassert!(in_table(M9_SYSCALLS, 40));
+        crate::kassert_eq!(tables_of(40), (false, false, false, true));
         crate::kassert_eq!(syscall_name(40), Some("sendfile"));
         // No number twice: with the lengths above, `M8_SYSCALLS` is exactly
         // the 60 rows.
@@ -1264,15 +1262,10 @@ crate::ktest!(
         ];
         crate::kassert_eq!(M9_SYSCALLS.len(), 32);
         crate::kassert_eq!(m9_rows.len(), M9_SYSCALLS.len());
-        crate::kassert!(in_table(M6_SYSCALLS, 228) && !in_table(M9_SYSCALLS, 228));
+        crate::kassert_eq!(tables_of(228), (true, false, false, false));
         crate::kassert_eq!(syscall_name(228), Some("clock_gettime"));
         for &(nr, name) in m9_rows {
-            crate::kassert!(
-                in_table(M9_SYSCALLS, nr)
-                    && !in_table(M6_SYSCALLS, nr)
-                    && !in_table(M7_SYSCALLS, nr)
-                    && !in_table(M8_SYSCALLS, nr)
-            );
+            crate::kassert_eq!(tables_of(nr), (false, false, false, true));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         // No duplicate numbers in `M9_SYSCALLS`.

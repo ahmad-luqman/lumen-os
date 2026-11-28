@@ -4,12 +4,14 @@
 //! Used by kernel objects that have no path in any mounted filesystem:
 //! `epoll` (`anon_inode:[eventpoll]`), `eventfd` (`anon_inode:[eventfd]`) and
 //! `timerfd` (`anon_inode:[timerfd]`). Following Linux v6.12's
-//! `alloc_anon_inode` / `anon_inode_getfile`, every anonymous file shares one
-//! inode number ([`ANON_INO`]) on device `0:9`, reports `st_mode == 0o600`
+//! `alloc_anon_inode`, `alloc_file_pseudo` and
+//! `eventpoll_fops`/`eventfd_fops`/`timerfd_fops`, every anonymous file shares
+//! one inode number ([`ANON_INO`]) on device `0:9`, reports `st_mode == 0o600`
 //! (`InodeType::Anon`, `st_mode & S_IFMT == 0`), bypasses the VFS caches,
-//! treats `lseek` as `noop_llseek`, and refuses `mmap` with `-ENODEV`.
-//! `KernelFile::new_anon` attaches the kernel object (`AnonObj`) to the
-//! description.
+//! treats `lseek` as `noop_llseek`, refuses `pread64`/`pwrite64` with
+//! `-ESPIPE`, refuses `/proc/<pid>/fd/N` reopen with `-ENXIO` unless `O_PATH`
+//! is set, and refuses `mmap` with `-ENODEV`. `KernelFile::new_anon` attaches
+//! the kernel object (`AnonObj`) to the description.
 
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))] // constructed by B5/B6
 
@@ -241,10 +243,26 @@ crate::ktest!(
         use crate::linux::process::{self, KernelFile};
         use crate::linux::syscall::dispatch;
         use crate::linux::{errno, general};
-        use crate::user::copy_from_user;
+        use crate::user::{copy_from_user, copy_to_user};
         use crate::{kassert, kassert_eq};
+        use alloc::format;
         use core::mem::{offset_of, size_of};
         use lumen_vfs::OpenFlags;
+
+        fn call(nr: u32, a: [u64; 6]) -> u64 {
+            let mut frame = SyscallFrame {
+                rax: u64::from(nr),
+                rdi: a[0],
+                rsi: a[1],
+                rdx: a[2],
+                r10: a[3],
+                r8: a[4],
+                r9: a[5],
+                ..SyscallFrame::default()
+            };
+            let _ = dispatch(&mut frame);
+            frame.rax
+        }
 
         let cases = [
             (AnonKind::EventPoll, "anon_inode:[eventpoll]"),
@@ -254,9 +272,9 @@ crate::ktest!(
 
         process::in_test_process(move |pid| {
             let stat_va = process::KTEST_USER_VA;
+            let path_va = stat_va + 256;
             let mut prev_id = 0u64;
-            let mut first_ino = None;
-            let enodev = -(errno::ENODEV as i64) as u64;
+            let neg = |e: u32| -(e as i64) as u64;
 
             for (kind, expected_name) in cases {
                 let (inode, path) = new_inode(kind);
@@ -284,39 +302,16 @@ crate::ktest!(
                 kassert_eq!(f1.id(), f2.id());
                 drop((f1, f2));
 
-                // `fstat`: dev 0:9, shared st_ino, st_mode == 0o600 with no S_IFMT bits.
-                let mut fstat_frame = SyscallFrame {
-                    rax: u64::from(general::__NR_fstat),
-                    rdi: fd as u64,
-                    rsi: stat_va,
-                    ..SyscallFrame::default()
-                };
-                let _ = dispatch(&mut fstat_frame);
-                kassert_eq!(fstat_frame.rax, 0);
+                // `fstat`: dev 0:9, shared ANON_INO, st_mode == 0o600 with no S_IFMT bits.
+                kassert_eq!(call(general::__NR_fstat, [fd as u64, stat_va, 0, 0, 0, 0]), 0);
                 let mut raw = [0u8; size_of::<general::stat>()];
                 copy_from_user(&mut raw, stat_va).map_err(|_| "copy stat")?;
-                let st_dev = u64::from_le_bytes(
-                    raw[offset_of!(general::stat, st_dev)..offset_of!(general::stat, st_dev) + 8]
-                        .try_into()
-                        .expect("8 bytes"),
-                );
-                let st_ino = u64::from_le_bytes(
-                    raw[offset_of!(general::stat, st_ino)..offset_of!(general::stat, st_ino) + 8]
-                        .try_into()
-                        .expect("8 bytes"),
-                );
-                let st_mode = u32::from_le_bytes(
-                    raw[offset_of!(general::stat, st_mode)..offset_of!(general::stat, st_mode) + 4]
-                        .try_into()
-                        .expect("4 bytes"),
-                );
+                let le_u64 = |off: usize| u64::from_le_bytes(raw[off..off + 8].try_into().expect("8 bytes"));
+                let st_dev = le_u64(offset_of!(general::stat, st_dev));
+                let st_ino = le_u64(offset_of!(general::stat, st_ino));
+                let st_mode = le_u64(offset_of!(general::stat, st_mode)) as u32;
                 kassert_eq!(st_dev, ANON_DEV.raw());
                 kassert_eq!(st_ino, ANON_INO);
-                if let Some(prev) = first_ino {
-                    kassert_eq!(st_ino, prev);
-                } else {
-                    first_ino = Some(st_ino);
-                }
                 kassert_eq!(st_mode & general::S_IFMT, 0);
                 kassert_eq!(st_mode, 0o600);
 
@@ -324,32 +319,40 @@ crate::ktest!(
                 for (delta, whence) in
                     [(42i64, general::SEEK_SET), (17i64, general::SEEK_CUR), (-5i64, general::SEEK_END)]
                 {
-                    let mut seek_frame = SyscallFrame {
-                        rax: u64::from(general::__NR_lseek),
-                        rdi: fd as u64,
-                        rsi: delta as u64,
-                        rdx: u64::from(whence),
-                        ..SyscallFrame::default()
-                    };
-                    let _ = dispatch(&mut seek_frame);
-                    kassert_eq!(seek_frame.rax, 0);
+                    kassert_eq!(call(general::__NR_lseek, [fd as u64, delta as u64, u64::from(whence), 0, 0, 0]), 0);
                 }
+
+                // `pread64`/`pwrite64`: anonymous inodes have no position (-ESPIPE).
+                kassert_eq!(call(general::__NR_pread64, [fd as u64, stat_va, 8, 0, 0, 0]), neg(errno::ESPIPE));
+                kassert_eq!(call(general::__NR_pwrite64, [fd as u64, stat_va, 8, 0, 0, 0]), neg(errno::ESPIPE));
 
                 // `mmap`: anonymous inodes cannot be mapped (-ENODEV).
                 for map_flag in [general::MAP_SHARED, general::MAP_PRIVATE] {
-                    let mut mmap_frame = SyscallFrame {
-                        rax: u64::from(general::__NR_mmap),
-                        rdi: 0,
-                        rsi: 4096,
-                        rdx: u64::from(general::PROT_READ),
-                        r10: u64::from(map_flag),
-                        r8: fd as u64,
-                        r9: 0,
-                        ..SyscallFrame::default()
-                    };
-                    let _ = dispatch(&mut mmap_frame);
-                    kassert_eq!(mmap_frame.rax, enodev);
+                    kassert_eq!(
+                        call(
+                            general::__NR_mmap,
+                            [0, 4096, u64::from(general::PROT_READ), u64::from(map_flag), fd as u64, 0],
+                        ),
+                        neg(errno::ENODEV)
+                    );
                 }
+
+                // Reopening through `/proc/<pid>/fd/<fd>`: -ENXIO for O_RDWR, succeeds for O_PATH.
+                let proc_path = format!("/proc/{pid}/fd/{fd}\0");
+                copy_to_user(path_va, proc_path.as_bytes()).map_err(|_| "copy proc path")?;
+                kassert_eq!(
+                    call(
+                        general::__NR_openat,
+                        [general::AT_FDCWD as u64, path_va, u64::from(general::O_RDWR), 0, 0, 0],
+                    ),
+                    neg(errno::ENXIO)
+                );
+                let path_fd = call(
+                    general::__NR_openat,
+                    [general::AT_FDCWD as u64, path_va, u64::from(general::O_PATH), 0, 0, 0],
+                );
+                kassert!((path_fd as i64) >= 0);
+                kassert_eq!(call(general::__NR_close, [path_fd, 0, 0, 0, 0, 0]), 0);
 
                 let target = process::process_fd_target(pid, fd).ok_or("proc fd target missing")?;
                 kassert_eq!(target.1.as_slice(), expected_name.as_bytes());

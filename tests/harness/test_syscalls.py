@@ -782,23 +782,15 @@ STUBS_ISSUES = {"C7": 386, "C2": 381, "B1": 372}
 
 def test_stubs_reads_each_stub_and_its_doc():
     found = syscalls.stubs([STUBS_RS])
+    m8 = syscalls.stubs([STUBS_RS], milestone="M8")
+    m9 = syscalls.stubs([STUBS_RS], milestone="M9")
     assert set(found) == {"pipe2", "execve", "sendfile"}
-    assert set(syscalls.stubs([STUBS_RS], milestone="M8")) == {"pipe2", "execve"}
-    assert set(syscalls.stubs([STUBS_RS], milestone="M9")) == {"sendfile"}
+    assert set(m8) == {"pipe2", "execve"}
+    assert set(m9) == {"sendfile"}
     assert found["pipe2"].body == "not_implemented(general::__NR_pipe2)"
     assert found["execve"].doc.endswith("replaced by C2 (#381). It returns through the frame.")
-    assert (
-        syscalls.stub_problems(
-            syscalls.stubs([STUBS_RS], milestone="M8"), STUBS_DESIGN, STUBS_ISSUES
-        )
-        == []
-    )
-    assert (
-        syscalls.stub_problems(
-            syscalls.stubs([STUBS_RS], milestone="M9"), STUBS_DESIGN, {"C7": 484}
-        )
-        == []
-    )
+    assert syscalls.stub_problems(m8, STUBS_DESIGN, STUBS_ISSUES) == []
+    assert syscalls.stub_problems(m9, STUBS_DESIGN, {"C7": 484}) == []
     # Any visibility is read; a handler of a shape it can't read is refused.
     assert set(
         syscalls.stubs([STUBS_RS.replace("pub(super) fn sys_pipe2", "pub(crate) fn sys_pipe2")])

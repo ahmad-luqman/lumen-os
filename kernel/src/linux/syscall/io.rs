@@ -36,12 +36,14 @@ fn nonnegative(offset: u64) -> Result<u64, u32> {
 
 /// The open file on `fd` for a positional transfer: `EBADF` if it isn't
 /// open or is `O_PATH`, `ESPIPE` if it has no position (a terminal, pipe,
-/// FIFO or socket). Before the access mode's check, so
+/// FIFO, socket, or anonymous inode). Before the access mode's check, so
 /// a `pread64` on the write-only fd 1 is `ESPIPE`, not `EBADF`.
 fn positional_file(fd: Fd) -> Result<IoFile, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
-    if file.inode().is_tty() || matches!(file.inode().inode_type(), InodeType::Fifo | InodeType::Socket) {
+    if file.inode().is_tty()
+        || matches!(file.inode().inode_type(), InodeType::Fifo | InodeType::Socket | InodeType::Anon)
+    {
         return Err(errno::ESPIPE);
     }
     Ok(file)

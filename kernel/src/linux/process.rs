@@ -98,9 +98,16 @@ impl AnonObj {
         match *self {}
     }
 
-    /// Release hook called once when the description's last end reference
-    /// drops (`KernelFile::release_end`, outside locks 00–10): B5's epoll
-    /// release and B6's timerfd disarm.
+    /// Object-own teardown called once when the description's last end
+    /// reference drops ([`KernelFile::release_end`], outside locks 00–10) or
+    /// when a never-installed [`KernelFile`] is dropped: an epoll instance
+    /// closing its own set (B5), a timerfd disarming (B6). Each variant's
+    /// teardown must be idempotent.
+    ///
+    /// Target-side `epoll::release_file` (detaching a watched description from
+    /// every watching epoll instance) runs for every description kind (pipes,
+    /// ttys, sockets, anonymous objects and inode-pollable files), so B5 hooks
+    /// it in [`KernelFile::release_end`] before matching `self.obj`, not here.
     pub fn release(&self) {
         match *self {}
     }
@@ -112,9 +119,9 @@ struct PipePoll {
     pipe: Arc<crate::linux::pipe::PipeObject>,
     /// Zero except for a nonblocking FIFO reader opened with no writer,
     /// which snapshots w_opens. Otherwise w_opens >= 1 when open returns.
-    /// Copied from PipeEnd so polling need not take the pipe_end lock.
+    /// Copied from `PipeEnd` so polling need not take the `PipePoll::end` lock.
     writer_generation: u64,
-    /// End ownership released once when `end_refs` reaches 0.
+    /// End ownership released once when `end_refs` reaches 0 (level-10c leaf).
     end: SpinLock<Option<crate::linux::pipe::PipeEnd>>,
 }
 
@@ -320,6 +327,10 @@ impl KernelFile {
     }
 
     fn release_end(&self) {
+        // B5 hooks target-side `epoll::release_file` here, before matching
+        // `self.obj`, so every watched description kind (pipes, ttys, sockets,
+        // anonymous objects and inode-pollable files) detaches from watching
+        // epoll instances.
         match &self.obj {
             Some(FileObj::Pipe(pipe)) => {
                 let end = pipe.end.lock().take();
@@ -349,13 +360,23 @@ impl core::ops::DerefMut for KernelFile {
 
 impl Drop for KernelFile {
     fn drop(&mut self) {
-        if let Some(FileObj::Pipe(pipe)) = &mut self.obj
-            && let Some(end) = pipe.end.get_mut().take()
-        {
-            // Only a never-installed description retains its initial reference.
-            debug_assert_eq!(*self.end_refs.get_mut(), 1);
-            debug_assert_eq!(self.inner.fd_ref_count(), 1);
-            end.release();
+        match &mut self.obj {
+            Some(FileObj::Pipe(pipe)) => {
+                if let Some(end) = pipe.end.get_mut().take() {
+                    // Only a never-installed description retains its initial reference.
+                    debug_assert_eq!(*self.end_refs.get_mut(), 1);
+                    debug_assert_eq!(self.inner.fd_ref_count(), 1);
+                    end.release();
+                }
+            }
+            Some(FileObj::Anon(anon)) => {
+                if *self.end_refs.get_mut() == 1 {
+                    // Only a never-installed description retains its initial reference.
+                    debug_assert_eq!(self.inner.fd_ref_count(), 1);
+                    anon.release();
+                }
+            }
+            Some(FileObj::Tty(_)) | None => {}
         }
     }
 }

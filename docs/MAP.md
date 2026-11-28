@@ -340,9 +340,11 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `/dev/console`, `console_file`),
   `vfs/anon.rs` (M9 B0, #471: unmounted anonymous inodes on `ANON_DEV` `0:9`
   with shared `ANON_INO`, `InodeType::Anon` giving `st_mode == 0600` with no
-  `S_IFMT` bits, `noop_llseek` in `lseek`, `-ENODEV` in `mmap`, and
-  `AnonKind`/`AnonInode`/`new_inode` naming `anon_inode:[eventpoll]`,
-  `anon_inode:[eventfd]` and `anon_inode:[timerfd]`)
+  `S_IFMT` bits, and `AnonKind`/`AnonInode`/`new_inode` naming
+  `anon_inode:[eventpoll]`, `anon_inode:[eventfd]` and `anon_inode:[timerfd]`;
+  `noop_llseek` and `/proc/<pid>/fd/N` reopen `-ENXIO` unless `O_PATH` live in
+  `linux/syscall/fd.rs`, `pread64`/`pwrite64` `-ESPIPE` in `linux/syscall/io.rs`,
+  and `mmap` `-ENODEV` in `vfs/page_cache.rs`'s `page_cache::mappable`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `mounts`: an errored ext4 volume
   `ro,errors=remount-ro`, `format_mounts_of`, #349; `/proc/<pid>/maps` from
@@ -460,7 +462,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `timer_gettime`, `timer_getoverrun`, `timer_delete`, #392) and `sys`
   (`sched_yield`, `sched_setaffinity`, `sched_getaffinity`, `getpriority`,
   `setpriority`, `getrusage`, `sysinfo`, `prctl`, `statfs`, `fstatfs`,
-  `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391);
+  `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391; M9's clusters, #471:
+  `socket`, `epoll`, `evfd` B0 stubs);
   `fd` holds `open`/`openat`/`lseek` (with `open_fifo`, #386, and
   `devpts::open`, #388, #389) and descriptor I/O/`ioctl` (`FIONREAD`, tty
   requests) through the table, routing terminals by `VfsInode::is_tty`
