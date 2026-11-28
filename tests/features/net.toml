@@ -1,6 +1,11 @@
-# Features: networking and socket ABI. See tests/features/README.md for the format.
+# Features: networking, the socket ABI and AF_UNIX sockets. See tests/features/README.md for the format.
 
 [[feature]]
 name = "Socket ABI: sockaddr, cmsg and option values (logic)"
 milestone = "M9"
 tests = ["cargo:lumen-sockabi"]
+
+[[feature]]
+name = "AF_UNIX stream and datagram queues (logic)"
+milestone = "M9"
+tests = ["cargo:lumen-unix"]
