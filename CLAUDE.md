@@ -15,6 +15,7 @@ make deps-dev        # pinned Alpine developer packages (tools/alpine-packages.l
 make rootfs-dev      # deterministic Alpine M8/M9 developer image (build/alpine-dev.ext4: gcc, g++, make, git, sqlite3, vim, curl, python3, ruby)
 make deps-zig        # pinned zig C cross-compiler for host-built Linux test binaries (sha256-checked)
 make libc-test       # fetch musl libc-test (pinned commit) and build it with zig into build/libc-test/
+make gvisor-tests    # fetch pinned gVisor/gtest/Abseil and cross-build static syscall tests with zig
 make app NAME=foo    # a new app: apps/foo copied from apps/template (tools/new-app.sh); `make build` bundles it
 make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play; DESKTOP=1 starts the desktop; ROOTFS=1 attaches build/alpine-rootfs.ext4 via virtio-blk)
 make debug           # QEMU paused + gdb attached, stopped at kmain

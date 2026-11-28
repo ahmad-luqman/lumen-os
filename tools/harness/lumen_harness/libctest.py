@@ -432,12 +432,12 @@ def run_native(
             except subprocess.TimeoutExpired:
                 # runtest itself hung: an error (its exit code isn't 0 or 1),
                 # after whatever it printed before it was killed.
-                _kill_group(proc.pid)
+                kill_group(proc.pid)
                 stdout, _ = proc.communicate()
                 lines += stdout.decode(errors="replace").splitlines()
                 lines.append(f"runtest did not end within {timeout_s + grace_s} s")
                 code = 124
-            _kill_group(proc.pid)
+            kill_group(proc.pid)
             lines.append(f"EXIT {test} {code}")
             return "\n".join(lines) + "\n"
 
@@ -452,14 +452,30 @@ def run_native(
     return "".join(out)
 
 
-def _kill_group(pgid: int) -> None:
-    """SIGKILL every process left in runtest's process group, if any."""
+def kill_group(pgid: int) -> None:
+    """SIGKILL every process left in a runner's process group, if any."""
     try:
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # Darwin may report EPERM after the last live group member exits,
+        # even for signal 0. An unreaped zombie has no getpgid entry. Do not
+        # hide EPERM for a live leader or a group with signalable members.
+        if os.uname().sysname == "Darwin":
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                try:
+                    os.getpgid(pgid)
+                except ProcessLookupError:
+                    return
+        raise
 
 
+_PT_DYNAMIC = 2
 _PT_INTERP = 3
 _PT_GNU_STACK = 0x6474E551
 _EM_X86_64 = 62
@@ -474,6 +490,8 @@ class Elf:
     stack_size: int
     # The section names, in order (none without a section header table).
     sections: tuple[str, ...] = ()
+    # A PT_DYNAMIC segment, even in a file without PT_INTERP (e.g. a DSO).
+    dynamic: bool = False
 
 
 def read_elf(path: Path) -> Elf:
@@ -487,7 +505,7 @@ def read_elf(path: Path) -> Elf:
         raise ValueError(f"{path} is not x86-64 (e_machine {machine})")
     (phoff,) = struct.unpack_from("<Q", data, 32)
     phentsize, phnum = struct.unpack_from("<HH", data, 54)
-    interp, stack_size = None, 0
+    interp, stack_size, dynamic = None, 0, False
     for i in range(phnum):
         p_type, _, p_offset, _, _, p_filesz, p_memsz = struct.unpack_from(
             "<IIQQQQQ", data, phoff + i * phentsize
@@ -496,6 +514,8 @@ def read_elf(path: Path) -> Elf:
             interp = data[p_offset : p_offset + p_filesz].rstrip(b"\0").decode()
         elif p_type == _PT_GNU_STACK:
             stack_size = p_memsz
+        elif p_type == _PT_DYNAMIC:
+            dynamic = True
     (shoff,) = struct.unpack_from("<Q", data, 40)
     shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 58)
     headers = [struct.unpack_from("<IIQQQQ", data, shoff + i * shentsize) for i in range(shnum)]
@@ -507,7 +527,7 @@ def read_elf(path: Path) -> Elf:
         sections = tuple(
             data[names + h[0] : data.index(b"\0", names + h[0])].decode() for h in headers
         )
-    return Elf(interp, stack_size, sections)
+    return Elf(interp, stack_size, sections, dynamic)
 
 
 # zig cc's Debug mode (no -O flag) compiles UBSan in and links its runtime;

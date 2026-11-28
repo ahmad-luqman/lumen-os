@@ -1092,6 +1092,56 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   timeouts and flaky failures with `RETRY ` prefix; `NATIVE_RETRY_FAILURES`,
   #422; the built binaries' linkage checked; `run_native`, the host
   reference run, `runtest -t 30`).
+- `tools/fetch-gvisor-tests.sh`, `tools/build-gvisor-tests.sh` (`make
+  gvisor-tests`, #454): commit-pinned gVisor, googletest and Abseil git trees,
+  verified with fsck in worktree-local `build/gvisor-sources`. Fetch may
+  download; build uses verified git archives offline. Standalone CMake/Ninja
+  with zig 0.15.2 targets static x86_64-linux-musl; Release is `-O3 -DNDEBUG`,
+  source paths are remapped for reproducibility, and zero `PT_GNU_STACK`
+  preserves musl's default pthread stack size (as GNU ld does).
+  `gvisor.build_rules`/`Rule` parse the pinned BUILD vocabulary, rejecting
+  unknown expressions/attributes; 34 socket/epoll/eventfd/timerfd source
+  closures use object libraries to retain parameterized registrations.
+  The adapter preserves gtest/Abseil initialization and SIGPIPE masking
+  without Benchmark or Bazel runfiles. `tests.txt`, `not-built.txt` and
+  `build-report.json` record binaries, omissions, sizes, hashes, build time,
+  runner kernel and cmake/ninja versions; per-target logs explain failures.
+  `lumen_harness/gvisor.py` owns case/list parsers, frozen `Run`, and
+  `run_binary` in batched or per-case mode. The reference runs each exact case
+  as root in its own process and network namespace (`unshare --net`, with
+  `lo` up), matching gVisor test/runner and a fresh Lumen boot. Retries also
+  get fresh namespaces. This isolates
+  socket state and stress tests' reductions of `ip_local_port_range`; failed
+  namespace setup is fatal, with no fallback to the host network. Its watchdog
+  allows 300 s per case, with a separate 120 s listing budget; process groups
+  are killed before reaping. TIMEOUT retries once; FAIL retries once only for
+  a `flaky` entry.
+  The retry decides, including ERROR or missing output; first attempts stay
+  in the report. Crashed/unfinished cases become ERROR and batches resume
+  past them. ERROR and missing results are never excusable. Xfail kinds
+  allow FAIL (`fail`), SKIP (`skip`), TIMEOUT after retry (`timeout`), or
+  PASS/FAIL/TIMEOUT (`flaky`), each with a reason and issue. `compare` requires
+  every baseline pass minus xfails; annotated native skips may skip or pass.
+  `check_xfail_binaries` checks the entire list against `tests.txt` before
+  per-binary comparison. Explicit resume filters contain only remaining cases
+  so a long positive list is never doubled by exclusions.
+  `native-report.json` records final cases, first attempts, listed/not-run
+  counts, errors and unmeasured binaries; identity metadata includes uid,
+  capabilities, mode, `netns: per-case`, zig version and kernel. Builds clear
+  stale native output.
+  `gvisor record <downloaded gvisor-reference artifact dir> --output
+  tests/conformance/gvisor-native.txt` rejects incomplete or non-root/batched
+  runs or reports without `netns: per-case`. It records pass IDs plus annotated
+  skips/failures. The reference test compares the entire set with a bounded
+  diff; missing baselines fail the gvisor-reference workflow.
+  `tests/harness/test_gvisor.py` checks the helpers
+  and native gate; `test_ci_config.py` shares action-pin checks across workflows.
+  `.github/workflows/gvisor-reference.yml` gates the full native reference
+  separately from ci.yml's feature gate. Run 46096200249 (per case, root,
+  a netns per case) measured 8,324 cases: 8,031 pass, 293 skip, none failing;
+  native 552 s, job 14m11s (a cold build 434 s, run 46062869835); limits are
+  15/30/45 minutes, >2x headroom each. No Lumen execution is
+  wired here.
 - `tools/fetch-zig.sh` (`make deps-zig`, #368): zig 0.15.2 into
   `build/deps/zig`, sha256-pinned per host, ziglang.org then two community
   mirrors, installed under `build/deps/zig.lock`; a C cross-compiler for
