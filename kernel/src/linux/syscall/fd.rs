@@ -548,6 +548,9 @@ fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
         // at 0, whatever is asked (Linux's `null_lseek`; their offset is
         // never read).
         InodeType::CharDevice => Ok(0),
+        // Anonymous inodes (`anon_inodefs`): Linux's `noop_llseek` leaves
+        // `f_pos` unchanged and returns it.
+        InodeType::Anon => Ok(*file.offset.lock()),
         InodeType::Fifo | InodeType::Socket => Err(errno::ESPIPE),
         _ => {
             let mut off = file.offset.lock();

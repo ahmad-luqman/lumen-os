@@ -13,11 +13,9 @@
 
 use super::at::{Fd, UserPtr};
 use super::fd::{FILE_CHUNK, checked_len, partial, vfs, write_chunks_from_user};
-use super::{MAX_SINGLE_IO, finish};
-use crate::linux::errno;
-#[cfg(feature = "ktest")]
-use crate::linux::general;
+use super::{MAX_SINGLE_IO, finish, not_implemented};
 use crate::linux::process::IoFile;
+use crate::linux::{errno, general};
 use crate::user::{copy_to_user, user_range_valid};
 use lumen_vfs::{InodeType, OpenFlags, VfsInode};
 
@@ -184,13 +182,13 @@ pub(super) fn sys_sync() -> u64 {
     0
 }
 
-/// `sendfile(out, in, offset, count)` (40): M9 stub, replaced by C7.
+/// `sendfile(out, in, offset, count)` (40): M9 stub, replaced by C7 (#484).
 pub(super) fn sys_sendfile(_out_fd: Fd, _in_fd: Fd, _offset: UserPtr, _count: u64) -> u64 {
-    super::not_implemented(crate::linux::general::__NR_sendfile)
+    not_implemented(general::__NR_sendfile)
 }
 
 /// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` (326): M9
-/// stub, replaced by C7.
+/// stub, replaced by C7 (#484).
 pub(super) fn sys_copy_file_range(
     _fd_in: Fd,
     _off_in: UserPtr,
@@ -199,7 +197,7 @@ pub(super) fn sys_copy_file_range(
     _len: u64,
     _flags: u32,
 ) -> u64 {
-    super::not_implemented(crate::linux::general::__NR_copy_file_range)
+    not_implemented(general::__NR_copy_file_range)
 }
 
 #[cfg(feature = "ktest")]

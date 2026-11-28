@@ -338,7 +338,9 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   0:5, `PTY_MAX` = 256, `TtyEnd` open-description lifetime, `open`
   allocating PTY pairs on `/dev/ptmx` and resolving `/dev/tty` and
   `/dev/console`, `console_file`),
-  `vfs/anon.rs` (M9 B0, #471: unmounted anonymous inodes on `ANON_DEV` `0:9`,
+  `vfs/anon.rs` (M9 B0, #471: unmounted anonymous inodes on `ANON_DEV` `0:9`
+  with shared `ANON_INO`, `InodeType::Anon` giving `st_mode == 0600` with no
+  `S_IFMT` bits, `noop_llseek` in `lseek`, `-ENODEV` in `mmap`, and
   `AnonKind`/`AnonInode`/`new_inode` naming `anon_inode:[eventpoll]`,
   `anon_inode:[eventfd]` and `anon_inode:[timerfd]`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
@@ -348,7 +350,7 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   updated on `execve`, #381; the node
   kinds, inode numbers, fds and numeric names `lumen_vfs::procfs`'s).
   `linux/` (M6–M9; ARCHITECTURE section 8): `linux/mod.rs` the
-  `linux-raw-sys` re-exports (incl. `net` via `lumen-sockabi`, #471),
+  `linux-raw-sys` re-exports (incl. `net` declared in `kernel/Cargo.toml`, #471),
   `M6_SYSCALLS`, `M7_SYSCALLS`, `M8_SYSCALLS` and `M9_SYSCALLS` (32 new M9
   numbers, #471) (the numbers, `syscall_name`; pinned by the
   `abi_constants_match_spec`, `m7_abi_constants_match_spec`,
@@ -372,10 +374,12 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   methods such as `record_exit`), `UserThread` (a tid, its process,
   `clear_child_tid`, robust list; held in the scheduler thread's
   `UserThreadState::linux`, so a syscall finds it lock-free through
-  `current_thread`/`current_process`), `KernelFile` (global monotonic `id`,
-  combined `end_refs`, in-flight `IoFile` refcount guard, optional
-  `PipeEnd`, `TtyEnd` and `AnonObj`, and `pollable()`, #379, #386, #388,
-  #471), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
+  `current_thread`/`current_process`), `KernelFile` (`id()` exposing
+  `OpenFile::id` from `lumen_vfs::next_open_file_id`, combined `end_refs`
+  released via `release_end`, in-flight `IoFile` refcount guard,
+  `obj: Option<FileObj>` holding `Pipe(PipePoll)`, `Tty(TtyPoll)` or
+  `Anon(AnonObj)` with `AnonObj::{kind,pollable,release}`, and `pollable()`,
+  #379, #386, #388, #471), `process/clone.rs` (`ProcessClone`, `clone_flags`: fork,
   vfork and thread clone validation, #380, #382), `process/table.rs`
   (`ProcTable` behind `PROCS`: lumen-proc's tree, processes by pid, threads
   by tid, `WaitResult`, `link_init`/`link_root`/`link_thread`/
@@ -670,8 +674,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   ceiling; `raised_to`, after a raise on disk landed or failed), and `page`
   (#265: the page cache's arithmetic, `spans` (`PageSpans`),
   `pages_in`, `valid_len`, `resize_tail`; `short_count`, a read or write
-  failing part-way, #321); `SetTime::resolve` (#302) in
-  `types` (host-tested; `tests/ext4plus_htree_hash.rs`: the vendored
+  failing part-way, #321); `InodeType::Anon` (#471, zero mode and dirent-type
+  bits) and `SetTime::resolve` (#302) in `types` (host-tested; `tests/ext4plus_htree_hash.rs`: the vendored
   ext4plus's htree hash against e2fsprogs', #313).
 - `crates/lumen-futex`: futex wait queues as logic (M8, #338; ARCHITECTURE
   section 8): `FutexTable<K, W>` (an opaque key, FIFO per key: `enqueue`,
@@ -1058,12 +1062,15 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   /bin/busybox` run's output, exit code and leaked frames (`BusyboxRun`,
   `BUSYBOX_EXIT`), #324, and `warm_up`: one uncounted
   `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts),
-  `syscalls.py` (#337, #451: M8 and M9 syscall censuses — stdlib-only `build`
-  turning `strace -f -X raw` traces into deterministic `tests/linux/m<8|9>-census.toml`
-  with socket families/types/protocols, sockopt `<level>:<optname>` pairs,
-  epoll/message/timerfd/eventfd flags and ioctls, and `report` / `report --milestone M9`
-  (`report_m9`) comparing against the kernel's dispatch table, M6–M8 tables, ROADMAP
-  M9/M10 rows, M8 `ENOSYS_BY_DECISION`, CPU-time clocks, and #450 design probes),
+  `syscalls.py` (#337, #451, #471: M8 and M9 syscall censuses — stdlib-only
+  `build` turning `strace -f -X raw` traces into deterministic
+  `tests/linux/m<8|9>-census.toml` with socket families/types/protocols,
+  sockopt `<level>:<optname>` pairs, epoll/message/timerfd/eventfd flags and
+  ioctls; `report` / `report --milestone M9` (`report_m9`) comparing against
+  the kernel's dispatch table, M6–M9 tables, ROADMAP M9/M10 rows, M8+M9
+  `ENOSYS_BY_DECISION`, CPU-time clocks, and #450 design probes; and
+  dispatch/stub validators `M8_ARGS`/`M9_ARGS`/`EXPECTED_ARGS`, `arm_problems`,
+  `STUB_MARK`/`stubs`/`stub_problems`, and `design_issues` for M8 and M9),
   `libctest.py` (#345, #396: musl libc-test transcripts, one
   `EXIT <path> <code>` line per test, read as `Outcome` (`PASS`, `FAIL`,
   `TIMEOUT`, `ERROR`), a runner error never a verdict;

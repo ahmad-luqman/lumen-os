@@ -80,7 +80,7 @@ use crate::term;
 use crate::user::UserExit;
 use crate::vfs::KernelVfsLock;
 
-/// Anonymous-inode kernel object held in [`KernelFile::anon`] (`vfs/anon.rs`,
+/// Anonymous-inode kernel object held in [`KernelFile`] (`vfs/anon.rs`,
 /// dev `0:9`; ARCHITECTURE sections 8 and 10).
 ///
 /// B5 (`epoll`) and B6 (`eventfd`, `timerfd`) append their variants here.
@@ -88,20 +88,34 @@ use crate::vfs::KernelVfsLock;
 pub enum AnonObj {}
 
 impl AnonObj {
+    /// The anonymous-inode kind (`eventpoll`, `eventfd`, or `timerfd`).
+    pub fn kind(&self) -> crate::vfs::anon::AnonKind {
+        match *self {}
+    }
+
     /// Readiness source for this anonymous object.
     pub fn pollable(&self) -> &dyn Pollable {
+        match *self {}
+    }
+
+    /// Release hook called once when the description's last end reference
+    /// drops (`KernelFile::release_end`, outside locks 00–10): B5's epoll
+    /// release and B6's timerfd disarm.
+    pub fn release(&self) {
         match *self {}
     }
 }
 
 /// [`Pollable`] wrapper binding a [`crate::linux::pipe::PipeObject`] to one
-/// open description's `writer_generation` snapshot.
+/// open description's `writer_generation` snapshot and end ownership.
 struct PipePoll {
     pipe: Arc<crate::linux::pipe::PipeObject>,
     /// Zero except for a nonblocking FIFO reader opened with no writer,
     /// which snapshots w_opens. Otherwise w_opens >= 1 when open returns.
     /// Copied from PipeEnd so polling need not take the pipe_end lock.
     writer_generation: u64,
+    /// End ownership released once when `end_refs` reaches 0.
+    end: SpinLock<Option<crate::linux::pipe::PipeEnd>>,
 }
 
 impl Pollable for PipePoll {
@@ -120,25 +134,31 @@ impl Pollable for TtyPoll {
     }
 }
 
+/// Exclusive kernel object attached to a [`KernelFile`] description.
+///
+/// B1 appends `Sock` here; B5 and B6 append variants to [`AnonObj`].
+enum FileObj {
+    Pipe(PipePoll),
+    Tty(TtyPoll),
+    #[allow(dead_code)] // constructed by B5/B6 via `KernelFile::new_anon`
+    Anon(AnonObj),
+}
+
 /// An open file description as the kernel's FD tables hold it (Lock 2 its
 /// offset and directory cursor, Lock 0 its whole-call position), together with
 /// its unique description ID (`OpenFile::id`), combined end reference count,
-/// and optional pipe/FIFO, terminal, or anonymous-inode object ownership.
+/// and optional exclusive kernel object ([`FileObj`]).
 pub struct KernelFile {
     inner: OpenFile<KernelVfsLock<u64>>,
     /// Active in-flight syscall references (`Fd::file`, `poll`).
     #[cfg(feature = "ktest")]
     io_refs: AtomicU32,
     /// Combined descriptor + in-flight syscall count (`fd_refs + io_refs`),
-    /// starting at 1. Transitioning 1 -> 0 runs pipe/FIFO end release once.
+    /// starting at 1. Transitioning 1 -> 0 runs [`Self::release_end`] once.
     end_refs: AtomicU32,
-    /// Shared pipe state for anonymous pipes and opened (non-`O_PATH`) FIFOs.
-    pipe: Option<PipePoll>,
-    /// End ownership released once when `end_refs` reaches 0.
-    pipe_end: SpinLock<Option<crate::linux::pipe::PipeEnd>>,
-    tty: Option<TtyPoll>,
-    /// Anonymous-inode object (`epoll`, `eventfd`, `timerfd`).
-    anon: Option<AnonObj>,
+    /// Exclusive kernel-side object (pipe/FIFO, terminal, anonymous object,
+    /// or socket in B1).
+    obj: Option<FileObj>,
 }
 
 impl KernelFile {
@@ -148,10 +168,7 @@ impl KernelFile {
             #[cfg(feature = "ktest")]
             io_refs: AtomicU32::new(0),
             end_refs: AtomicU32::new(1),
-            pipe: None,
-            pipe_end: SpinLock::new(None),
-            tty: None,
-            anon: None,
+            obj: None,
         }
     }
 
@@ -166,13 +183,13 @@ impl KernelFile {
         Ok(Self::from_open_file(OpenFile::new_unchecked_flags(inode, path, flags)?))
     }
 
-    /// Construct an open file description for an anonymous inode (`vfs/anon.rs`,
-    /// dev `0:9`) and its kernel object.
+    /// Construct an open file description for an anonymous kernel object
+    /// (`vfs/anon.rs`, dev `0:9`), deriving the inode kind from [`AnonObj::kind`].
     #[allow(dead_code)] // used by B5/B6
-    pub fn new_anon(kind: crate::vfs::anon::AnonKind, flags: OpenFlags, anon: AnonObj) -> Result<Self, VfsError> {
-        let (inode, path) = crate::vfs::anon::new_inode(kind);
+    pub fn new_anon(flags: OpenFlags, anon: AnonObj) -> Result<Self, VfsError> {
+        let (inode, path) = crate::vfs::anon::new_inode(anon.kind());
         let mut file = Self::from_open_file(OpenFile::new_unchecked_flags(inode, path, flags)?);
-        file.anon = Some(anon);
+        file.obj = Some(FileObj::Anon(anon));
         Ok(file)
     }
 
@@ -190,9 +207,10 @@ impl KernelFile {
 
     /// Attach an opened FIFO/pipe end before installing into an FD table.
     pub fn attach_pipe_end(&mut self, end: crate::linux::pipe::PipeEnd) {
-        debug_assert!(self.pipe.is_none() && self.pipe_end.get_mut().is_none());
-        self.pipe = Some(PipePoll { pipe: Arc::clone(end.pipe()), writer_generation: end.writer_generation() });
-        *self.pipe_end.get_mut() = Some(end);
+        debug_assert!(self.obj.is_none());
+        let pipe = Arc::clone(end.pipe());
+        let writer_generation = end.writer_generation();
+        self.obj = Some(FileObj::Pipe(PipePoll { pipe, writer_generation, end: SpinLock::new(Some(end)) }));
     }
 
     pub(crate) fn new_tty_end(
@@ -202,26 +220,32 @@ impl KernelFile {
         end: crate::vfs::devpts::TtyEnd,
     ) -> Result<Self, VfsError> {
         let mut file = Self::from_open_file(OpenFile::new_unchecked_flags(inode, path, flags)?);
-        file.tty = Some(TtyPoll(end));
+        file.obj = Some(FileObj::Tty(TtyPoll(end)));
         Ok(file)
     }
 
-    /// Unique `u64` identifier of this open file description (from the global
-    /// monotonic `OpenFileId` counter; shared across `dup` and `fork`, used by
-    /// B5 to key `epoll` interests by `(file.id(), fd)`).
+    /// Unique `u64` identifier of this open file description (`OpenFile::id`,
+    /// allocated by `lumen_vfs::next_open_file_id`; shared across `dup` and
+    /// `fork`, used by B5 to key `epoll` interests by `(file.id(), fd)`).
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by B5
     pub fn id(&self) -> u64 {
         self.inner.id.0
     }
 
     pub(crate) fn tty(&self) -> Option<&crate::vfs::devpts::TtyEnd> {
-        self.tty.as_ref().map(|t| &t.0)
+        match &self.obj {
+            Some(FileObj::Tty(tty)) => Some(&tty.0),
+            _ => None,
+        }
     }
 
     /// Borrow the attached anonymous-inode object, if any.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by B5/B6
     pub fn anon(&self) -> Option<&AnonObj> {
-        self.anon.as_ref()
+        match &self.obj {
+            Some(FileObj::Anon(anon)) => Some(anon),
+            _ => None,
+        }
     }
 
     pub fn is_nonblock(&self) -> bool {
@@ -230,30 +254,28 @@ impl KernelFile {
 
     /// Borrow the underlying `PipeObject` if this is a pipe or opened FIFO.
     pub fn pipe(&self) -> Option<&Arc<crate::linux::pipe::PipeObject>> {
-        self.pipe.as_ref().map(|p| &p.pipe)
+        match &self.obj {
+            Some(FileObj::Pipe(pipe)) => Some(&pipe.pipe),
+            _ => None,
+        }
     }
 
     /// Readiness source for this open file description, used by both
     /// `poll_file` (`syscall/poll.rs`) and `epoll_ctl` (B5).
     ///
-    /// Returns `None` for `O_PATH` descriptors and file kinds that have no
-    /// readiness source (regular files, directories, procfs, `/dev/null`, etc.:
-    /// `poll` treats them as [`PollMask::ALWAYS_READY`], while `epoll_ctl`
-    /// refuses them with `-EPERM`).
+    /// Callers must check `O_PATH` before calling `pollable()`: `poll`/`select`
+    /// answer `POLLNVAL`, and `epoll_ctl` must treat `O_PATH` as not open
+    /// (`-EBADF`, matching Linux's `fdget` skipping `FMODE_PATH`) before asking
+    /// here. Returning `None` means the file has no readiness source: `poll`
+    /// treats it as [`PollMask::ALWAYS_READY`], while `epoll_ctl` refuses it
+    /// with `-EPERM`.
     pub fn pollable(&self) -> Option<&dyn Pollable> {
-        if self.inner.is_path() {
-            return None;
+        match &self.obj {
+            Some(FileObj::Pipe(pipe)) => Some(pipe),
+            Some(FileObj::Tty(tty)) => Some(tty),
+            Some(FileObj::Anon(anon)) => Some(anon.pollable()),
+            None => self.inner.inode().pollable(),
         }
-        if let Some(pipe) = &self.pipe {
-            return Some(pipe);
-        }
-        if let Some(tty) = &self.tty {
-            return Some(tty);
-        }
-        if let Some(anon) = &self.anon {
-            return Some(anon.pollable());
-        }
-        self.inner.inode().pollable()
     }
 
     /// Count of descriptors sharing this description, raising both `fd_refs`
@@ -262,16 +284,16 @@ impl KernelFile {
     pub fn inc_fd_ref(&self) {
         self.inner.inc_fd_ref();
         let prev = self.end_refs.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(prev > 0, "inc_fd_ref after last pipe end release");
+        debug_assert!(prev > 0, "inc_fd_ref after last end release");
     }
 
     /// Release one descriptor reference; if neither descriptors nor in-flight
-    /// syscalls remain, releases any attached pipe/FIFO end in thread context.
+    /// syscalls remain, runs [`Self::release_end`] once in thread context.
     /// May take Lock 0: never hold locks 1–10 or OpenFile::pos here.
     pub fn dec_fd_ref(&self) -> u32 {
         let rem = self.inner.dec_fd_ref();
         if self.end_refs.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.release_pipe_end();
+            self.release_end();
         }
         rem
     }
@@ -284,7 +306,7 @@ impl KernelFile {
 
     fn inc_io_ref(&self) {
         let prev = self.end_refs.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(prev > 0, "inc_io_ref after last pipe end release");
+        debug_assert!(prev > 0, "inc_io_ref after last end release");
         #[cfg(feature = "ktest")]
         self.io_refs.fetch_add(1, Ordering::Relaxed);
     }
@@ -293,17 +315,21 @@ impl KernelFile {
         #[cfg(feature = "ktest")]
         self.io_refs.fetch_sub(1, Ordering::Relaxed);
         if self.end_refs.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.release_pipe_end();
+            self.release_end();
         }
     }
 
-    fn release_pipe_end(&self) {
-        let end = self.pipe_end.lock().take();
-        if let Some(end) = end {
-            end.release();
-        }
-        if let Some(end) = &self.tty {
-            end.0.release();
+    fn release_end(&self) {
+        match &self.obj {
+            Some(FileObj::Pipe(pipe)) => {
+                let end = pipe.end.lock().take();
+                if let Some(end) = end {
+                    end.release();
+                }
+            }
+            Some(FileObj::Tty(tty)) => tty.0.release(),
+            Some(FileObj::Anon(anon)) => anon.release(),
+            None => {}
         }
     }
 }
@@ -323,7 +349,9 @@ impl core::ops::DerefMut for KernelFile {
 
 impl Drop for KernelFile {
     fn drop(&mut self) {
-        if let Some(end) = self.pipe_end.get_mut().take() {
+        if let Some(FileObj::Pipe(pipe)) = &mut self.obj
+            && let Some(end) = pipe.end.get_mut().take()
+        {
             // Only a never-installed description retains its initial reference.
             debug_assert_eq!(*self.end_refs.get_mut(), 1);
             debug_assert_eq!(self.inner.fd_ref_count(), 1);

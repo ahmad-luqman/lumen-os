@@ -3,15 +3,19 @@
 //!
 //! Used by kernel objects that have no path in any mounted filesystem:
 //! `epoll` (`anon_inode:[eventpoll]`), `eventfd` (`anon_inode:[eventfd]`) and
-//! `timerfd` (`anon_inode:[timerfd]`). Each instance allocates a fresh inode
-//! number on device `0:9`, bypasses the VFS caches, and attaches its object
-//! to `KernelFile::anon`.
+//! `timerfd` (`anon_inode:[timerfd]`). Following Linux v6.12's
+//! `alloc_anon_inode` / `anon_inode_getfile`, every anonymous file shares one
+//! inode number ([`ANON_INO`]) on device `0:9`, reports `st_mode == 0o600`
+//! (`InodeType::Anon`, `st_mode & S_IFMT == 0`), bypasses the VFS caches,
+//! treats `lseek` as `noop_llseek`, and refuses `mmap` with `-ENODEV`.
+//! `KernelFile::new_anon` attaches the kernel object (`AnonObj`) to the
+//! description.
 
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))] // constructed by B5/B6
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, Ino, InodeType, Metadata, SetTime, Timespec, VfsError, VfsInode, mode_after_chown,
@@ -24,11 +28,12 @@ use crate::time;
 /// Device identifier for the internal `anon_inodefs` (`0:9`, never mounted).
 pub const ANON_DEV: DevId = DevId::makedev(0, 9);
 
-static NEXT_ANON_INO: AtomicU64 = AtomicU64::new(1);
+/// Shared inode number reported by every anonymous file (matching Linux's
+/// shared `anon_inode_inode`).
+pub const ANON_INO: Ino = 1;
 
 /// The kind of anonymous inode (`anon_inodefs`, dev `0:9`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // constructed by B5/B6
 pub enum AnonKind {
     /// `epoll` instance (`anon_inode:[eventpoll]`).
     EventPoll,
@@ -40,7 +45,6 @@ pub enum AnonKind {
 
 impl AnonKind {
     /// The link target shown in `/proc/<pid>/fd/<n>`.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by B5/B6
     pub const fn path(self) -> &'static str {
         match self {
             Self::EventPoll => "anon_inode:[eventpoll]",
@@ -61,24 +65,20 @@ struct AnonMeta {
 }
 
 /// Unmounted anonymous inode on `anon_inodefs` (dev `0:9`, never cached).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // constructed by B5/B6
 pub struct AnonInode {
     lock_id: u64,
-    ino: Ino,
     kind: AnonKind,
     open_count: AtomicU32,
     meta: SleepMutex<AnonMeta>,
 }
 
 impl AnonInode {
-    /// Allocate a fresh anonymous inode of `kind` with a unique inode number on
-    /// [`ANON_DEV`].
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // constructed by B5/B6
+    /// Allocate an anonymous inode of `kind` on [`ANON_DEV`] with shared
+    /// [`ANON_INO`] and `0o600` mode (no `S_IFMT` bits).
     pub fn new(kind: AnonKind) -> Self {
         let now = time::realtime_timespec();
         Self {
             lock_id: next_lock_id(),
-            ino: NEXT_ANON_INO.fetch_add(1, Ordering::Relaxed),
             kind,
             open_count: AtomicU32::new(0),
             meta: SleepMutex::new(AnonMeta {
@@ -94,14 +94,12 @@ impl AnonInode {
     }
 
     /// The anonymous inode's kind (`eventpoll`, `eventfd`, or `timerfd`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by B5/B6
     pub const fn kind(&self) -> AnonKind {
         self.kind
     }
 }
 
 /// Allocate an anonymous inode of `kind` and its `/proc/<pid>/fd` display path.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by B5/B6
 pub fn new_inode(kind: AnonKind) -> (Arc<dyn VfsInode>, Arc<[u8]>) {
     (Arc::new(AnonInode::new(kind)), Arc::from(kind.path().as_bytes()))
 }
@@ -116,11 +114,11 @@ impl VfsInode for AnonInode {
     }
 
     fn ino(&self) -> Ino {
-        self.ino
+        ANON_INO
     }
 
     fn inode_type(&self) -> InodeType {
-        InodeType::File
+        InodeType::Anon
     }
 
     fn open_count(&self) -> u32 {
@@ -143,8 +141,8 @@ impl VfsInode for AnonInode {
         let meta = self.meta.lock();
         Ok(Metadata {
             dev: ANON_DEV,
-            ino: self.ino,
-            inode_type: InodeType::File,
+            ino: ANON_INO,
+            inode_type: InodeType::Anon,
             mode: meta.mode,
             nlink: 1,
             uid: meta.uid,
@@ -192,7 +190,7 @@ impl VfsInode for AnonInode {
         if let Some(g) = gid {
             meta.gid = g;
         }
-        meta.mode = mode_after_chown(InodeType::File, meta.mode);
+        meta.mode = mode_after_chown(InodeType::Anon, meta.mode);
         meta.ctime = time::realtime_timespec();
         Ok(())
     }
@@ -239,8 +237,13 @@ impl VfsInode for AnonInode {
 
 crate::ktest!(
     fn anon_inodes_report_dev_0_9_and_proc_fd_names() {
+        use crate::arch::syscall::SyscallFrame;
         use crate::linux::process::{self, KernelFile};
+        use crate::linux::syscall::dispatch;
+        use crate::linux::{errno, general};
+        use crate::user::copy_from_user;
         use crate::{kassert, kassert_eq};
+        use core::mem::{offset_of, size_of};
         use lumen_vfs::OpenFlags;
 
         let cases = [
@@ -250,20 +253,17 @@ crate::ktest!(
         ];
 
         process::in_test_process(move |pid| {
-            let mut prev_ino = 0u64;
+            let stat_va = process::KTEST_USER_VA;
             let mut prev_id = 0u64;
+            let mut first_ino = None;
+            let enodev = -(errno::ENODEV as i64) as u64;
+
             for (kind, expected_name) in cases {
                 let (inode, path) = new_inode(kind);
                 kassert_eq!(inode.dev_id(), ANON_DEV);
                 kassert_eq!((inode.dev_id().major(), inode.dev_id().minor()), (0, 9));
                 kassert!(!inode.cacheable());
-                kassert!(inode.ino() > prev_ino);
-                prev_ino = inode.ino();
-                let st = inode.stat().map_err(|_| "stat failed")?;
-                kassert_eq!(st.dev, ANON_DEV);
-                kassert_eq!(st.ino, inode.ino());
-                kassert_eq!(st.mode, 0o600);
-                kassert_eq!(st.nlink, 1);
+                kassert_eq!(inode.ino(), ANON_INO);
                 kassert_eq!(
                     inode.as_any().and_then(|a| a.downcast_ref::<AnonInode>()).map(AnonInode::kind),
                     Some(kind)
@@ -283,6 +283,73 @@ crate::ktest!(
                 let f2 = process::current_io_file(dup_fd).ok_or("dup_fd missing")?;
                 kassert_eq!(f1.id(), f2.id());
                 drop((f1, f2));
+
+                // `fstat`: dev 0:9, shared st_ino, st_mode == 0o600 with no S_IFMT bits.
+                let mut fstat_frame = SyscallFrame {
+                    rax: u64::from(general::__NR_fstat),
+                    rdi: fd as u64,
+                    rsi: stat_va,
+                    ..SyscallFrame::default()
+                };
+                let _ = dispatch(&mut fstat_frame);
+                kassert_eq!(fstat_frame.rax, 0);
+                let mut raw = [0u8; size_of::<general::stat>()];
+                copy_from_user(&mut raw, stat_va).map_err(|_| "copy stat")?;
+                let st_dev = u64::from_le_bytes(
+                    raw[offset_of!(general::stat, st_dev)..offset_of!(general::stat, st_dev) + 8]
+                        .try_into()
+                        .expect("8 bytes"),
+                );
+                let st_ino = u64::from_le_bytes(
+                    raw[offset_of!(general::stat, st_ino)..offset_of!(general::stat, st_ino) + 8]
+                        .try_into()
+                        .expect("8 bytes"),
+                );
+                let st_mode = u32::from_le_bytes(
+                    raw[offset_of!(general::stat, st_mode)..offset_of!(general::stat, st_mode) + 4]
+                        .try_into()
+                        .expect("4 bytes"),
+                );
+                kassert_eq!(st_dev, ANON_DEV.raw());
+                kassert_eq!(st_ino, ANON_INO);
+                if let Some(prev) = first_ino {
+                    kassert_eq!(st_ino, prev);
+                } else {
+                    first_ino = Some(st_ino);
+                }
+                kassert_eq!(st_mode & general::S_IFMT, 0);
+                kassert_eq!(st_mode, 0o600);
+
+                // `lseek`: `noop_llseek` leaves offset at 0 and returns 0.
+                for (delta, whence) in
+                    [(42i64, general::SEEK_SET), (17i64, general::SEEK_CUR), (-5i64, general::SEEK_END)]
+                {
+                    let mut seek_frame = SyscallFrame {
+                        rax: u64::from(general::__NR_lseek),
+                        rdi: fd as u64,
+                        rsi: delta as u64,
+                        rdx: u64::from(whence),
+                        ..SyscallFrame::default()
+                    };
+                    let _ = dispatch(&mut seek_frame);
+                    kassert_eq!(seek_frame.rax, 0);
+                }
+
+                // `mmap`: anonymous inodes cannot be mapped (-ENODEV).
+                for map_flag in [general::MAP_SHARED, general::MAP_PRIVATE] {
+                    let mut mmap_frame = SyscallFrame {
+                        rax: u64::from(general::__NR_mmap),
+                        rdi: 0,
+                        rsi: 4096,
+                        rdx: u64::from(general::PROT_READ),
+                        r10: u64::from(map_flag),
+                        r8: fd as u64,
+                        r9: 0,
+                        ..SyscallFrame::default()
+                    };
+                    let _ = dispatch(&mut mmap_frame);
+                    kassert_eq!(mmap_frame.rax, enodev);
+                }
 
                 let target = process::process_fd_target(pid, fd).ok_or("proc fd target missing")?;
                 kassert_eq!(target.1.as_slice(), expected_name.as_bytes());

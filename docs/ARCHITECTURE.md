@@ -5312,7 +5312,7 @@ section 7's stack and is a dependency of B2 and B3. The developer image
 
 | Label | Scope | Depends on | Owns (files; interfaces; tests) | Sections |
 |---|---|---|---|---|
-| B0 | the skeleton | #450, #464 | `M9_SYSCALLS` (appended to `linux/mod.rs`), stub modules `syscall/socket.rs`, `syscall/epoll.rs`, `syscall/evfd.rs`, `vfs/anon.rs` (anonymous inodes, dev `0:9`, named `anon_inode:[eventpoll]`, `[eventfd]`, `[timerfd]`), `KernelFile::id` (a global counter), `KernelFile::anon: Option<AnonObj>` (B5 and B6 append their arms) and `KernelFile::pollable()`, which `poll_file` and `epoll_ctl` both use, `syscalls.py`'s `PLANNED`/`ENOSYS_BY_DECISION` changes, empty `tests/scenarios/test_net.py`, `tools/linux-m9/` (modes `m9_net`, `m9_unix`, `m9_io`, `m9_proc`, `dnsd`; in `test_rootfs_dev.py`'s fixture tuple); `cargo:lumen-sockabi` (#464), `ktest:lumen_kernel::linux::m9_abi_constants_match_spec`, `harness:test_syscalls::test_m9_table_covers_the_census` | 8, 15 |
+| B0 | the skeleton | #450, #464 | `M9_SYSCALLS` (appended to `linux/mod.rs`), stub modules `syscall/socket.rs`, `syscall/epoll.rs`, `syscall/evfd.rs`, `vfs/anon.rs` (anonymous inodes on dev `0:9` sharing one inode number, `InodeType::Anon` with `st_mode == 0600` and no `S_IFMT` bits, `noop_llseek`, `mmap` `-ENODEV`, named `anon_inode:[eventpoll]`, `[eventfd]`, `[timerfd]`), `KernelFile::id()` (`OpenFile::id` from `lumen_vfs::next_open_file_id`), `KernelFile::obj: Option<FileObj>` (`Pipe`, `Tty`, `Anon(AnonObj)` with `AnonObj::kind()`/`release()` via `release_end`; B1 adds `Sock`, B5 and B6 append `AnonObj` arms) and `KernelFile::pollable()`, which `poll_file` and `epoll_ctl` both use, `syscalls.py`'s `PLANNED`/`ENOSYS_BY_DECISION` changes, empty `tests/scenarios/test_net.py`, `tools/linux-m9/` (modes `m9_net`, `m9_unix`, `m9_io`, `m9_proc`, `dnsd`; in `test_rootfs_dev.py`'s fixture tuple); `cargo:lumen-sockabi` (#464), `ktest:lumen_kernel::linux::m9_abi_constants_match_spec`, `harness:test_syscalls::test_m9_table_covers_the_census` | 8, 15 |
 | B1 | socket file objects and every socket handler | B0 | `kernel/src/net/mod.rs`, `kernel/src/net/sock.rs`: `SockOps`, `block_on`, `InFlightFile`, sockfs (dev `0:8`), `KernelFile::sock`; every handler in `syscall/socket.rs` written once as generic `SockOps` dispatch (address decode, `msghdr`, `CmsgIter`/`CmsgWriter`, slot reservation and install), so families only implement `SockOps`; `socket`/`socketpair` dispatch by family, `read`/`write`/`readv`/`writev` as send and receive, `S_IFSOCK` `fstat`, `/proc/<pid>/fd` `socket:[ino]`, `FIONBIO`, `FIONREAD`; `ktest:lumen_kernel::net::sock::socket_and_socketpair_dispatch_by_family`, `ktest:lumen_kernel::net::sock::socket_io_and_poll_reach_sockops` | 8 |
 | B2 | `NetDevice` and virtio-net | B0, #459's PR 2, #463 | `kernel/src/net/virtio_net.rs` (in `DRIVERS`), `share`'s no-bounce path for recorded DMA runs (`virtio.rs`), the `net` shell command and its `selftest`, `RUNS` if its count needs it; `scenario:test_net::test_virtio_net_frames` | 7 |
 | B3 | the stack and the `net` thread | B1, B2, #459's PR 2 | `kernel/src/net/stack.rs` (`NetStack`, the thread, readiness, listener refill, the SYN filter's kernel side, the `net` command's TIME-WAIT list), `kernel/src/net/inet.rs` (`InetSocket` and its `Proto` enum, whose arms C3, C4 and C6 append; section 7's code block); `cargo:lumen-net` (#459), `ktest:lumen_kernel::net::stack::loopback_tcp_echo_through_the_net_thread`, `ktest:lumen_kernel::net::stack::readiness_notifies_after_the_stack_lock`, `ktest:lumen_kernel::net::stack::listen_pool_refills_between_polls`, `ktest:lumen_kernel::net::stack::socket_limits_give_enobufs` | 7, 9 |
@@ -5356,8 +5356,7 @@ check per issue), and these append-only regions with named owners:
 option arms (C2's `SO_PASSCRED`, C5's table), lumen-sockabi's `SockOpt`
 variants (C6's ICMPv6 options) and `AnonObj`'s arms (B5, B6).
 `net/inet.rs` is B3's, then C5's (after C3 and C4 merge);
-`linux/process.rs` gains B0's `KernelFile::id` and `anon`, B1's
-`KernelFile::sock`, and B5's `KernelFile::epitems` and release hook. Each issue updates its area's `docs/MAP.md` entry.
+`linux/process.rs` gains B0's `KernelFile::id()` (`OpenFile::id`), `FileObj` (`Pipe`, `Tty`, `Anon(AnonObj)`), `release_end` and `pollable()`, B1's `FileObj::Sock`, and B5's `KernelFile::epitems` and release hook. Each issue updates its area's `docs/MAP.md` entry.
 
 **B0's stubs.** Only new numbers get typed `-ENOSYS` stubs, each issue in
 the last column replacing its own. B0 appends `M9_SYSCALLS` to
@@ -5501,7 +5500,11 @@ The rules every implementor keeps:
   UDP, the next datagram's length); other socket requests `-ENOTTY` (the census saw
   only `FIONBIO` and `FIOCLEX`).
 - `fcntl`'s `F_SETFL` `O_NONBLOCK` reaches sockets, epoll, eventfd and
-  timerfd; `lseek` on them `-ESPIPE`.
+  timerfd; `lseek` on sockets is `-ESPIPE`, while anonymous inodes (`epoll`,
+  `eventfd`, `timerfd`) leave the offset unchanged and return it
+  (`noop_llseek`, as Linux v6.12's `anon_inode_getfile`), report `st_mode ==
+  0600` with no `S_IFMT` bits (`InodeType::Anon`) and one shared inode number
+  on dev `0:9` (`alloc_anon_inode`), and refuse `mmap` with `-ENODEV`.
 - `poll`, `ppoll`, `select`, `pselect6` reach every new kind through
   `Pollable`.
 - `mknodat` (259) makes `S_IFSOCK` nodes (C1, section 10), and an `open`

@@ -1012,6 +1012,7 @@ fn vfstest_stat(ctx: &mut Ctx<'_>, path: &str) {
                 InodeType::BlockDevice => "block",
                 InodeType::Fifo => "fifo",
                 InodeType::Socket => "socket",
+                InodeType::Anon => "anon",
             };
             let _ = writeln!(
                 ctx.out,

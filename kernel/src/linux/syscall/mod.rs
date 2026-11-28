@@ -206,8 +206,9 @@ fn first_report(nr: u64) -> bool {
     false
 }
 
-/// Log a syscall answered `-ENOSYS` (a number with no arm) once per number,
-/// with its name when one of the kernel's tables has it.
+/// Log an unimplemented syscall (a number with no dispatch arm, or a stub via
+/// [`not_implemented`]) once per boot, with its name when one of the kernel's
+/// tables has it.
 fn log_unknown_once(nr: u64) {
     if first_report(nr) {
         match u32::try_from(nr).ok().and_then(crate::linux::syscall_name) {
@@ -217,7 +218,7 @@ fn log_unknown_once(nr: u64) {
     }
 }
 
-/// Log an unimplemented syscall stub once per boot and return `-ENOSYS`.
+/// Log an unimplemented syscall once per boot and return `-ENOSYS`.
 fn not_implemented(nr: u32) -> u64 {
     log_unknown_once(u64::from(nr));
     neg_errno(errno::ENOSYS)

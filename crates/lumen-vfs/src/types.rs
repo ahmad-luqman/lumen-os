@@ -80,6 +80,8 @@ pub enum InodeType {
     Fifo,
     /// Unix domain socket (`S_IFSOCK`).
     Socket,
+    /// Anonymous kernel inode (`anon_inodefs`, `st_mode & S_IFMT == 0`).
+    Anon,
 }
 
 impl InodeType {
@@ -93,6 +95,7 @@ impl InodeType {
             Self::File => 0o100000,
             Self::Symlink => 0o120000,
             Self::Socket => 0o140000,
+            Self::Anon => 0,
         }
     }
 
@@ -117,6 +120,7 @@ impl InodeType {
             Self::File => 8,
             Self::Symlink => 10,
             Self::Socket => 12,
+            Self::Anon => 0,
         }
     }
 }
@@ -586,6 +590,25 @@ impl fmt::Debug for Escaped<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anon_inode_type_has_zero_mode_and_dt_bits() {
+        assert_eq!(InodeType::Anon.to_mode_bits(), 0);
+        assert_eq!(InodeType::Anon.to_dt_type(), 0);
+        assert!(!InodeType::Anon.is_special());
+        for kind in [
+            InodeType::File,
+            InodeType::Dir,
+            InodeType::Symlink,
+            InodeType::CharDevice,
+            InodeType::BlockDevice,
+            InodeType::Fifo,
+            InodeType::Socket,
+        ] {
+            assert_ne!(kind.to_mode_bits(), 0);
+            assert_ne!(kind.to_dt_type(), 0);
+        }
+    }
 
     #[test]
     fn set_time_resolves_each_variant() {

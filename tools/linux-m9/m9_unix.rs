@@ -17,11 +17,7 @@ use core::ffi::c_int;
 const USAGE: &str = "usage: m9_unix <mode>";
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
-    // SAFETY: `main`'s `argc`/`argv` come from musl's startup over the kernel's
-    // initial stack and stay valid for the life of the program.
-    let (args, n) = unsafe { common::args(argc, argv) };
-    let _ = &args[..n];
+pub extern "C" fn main() -> c_int {
     say!("{USAGE}");
     common::USAGE_EXIT
 }

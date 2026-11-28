@@ -1,7 +1,8 @@
 //! What M9's test programs share (`mod common;` in each; ARCHITECTURE
 //! section 15, "M9's tests"): the raw `syscall`, a line written in one
 //! `write`, the panic handler, argument bytes, the checks' runner, and M9
-//! syscall numbers and errno constants.
+//! syscall numbers and errno constants (declared up front by B0 so parallel C
+//! lanes do not collide editing `common.rs`).
 //!
 //! A mode runs its checks through [`run_checks`]: one `ok <check>` line per
 //! check passed; the first failed check prints `FAIL <check>: <what> (got
@@ -27,8 +28,6 @@ unsafe extern "C" {
 /// `panic=abort` nothing ever calls it.
 #[unsafe(no_mangle)]
 extern "C" fn rust_eh_personality() {}
-
-pub const WRITE: u64 = 1;
 
 /// The exit code for arguments no mode takes (`EX_USAGE`).
 pub const USAGE_EXIT: c_int = 64;
@@ -78,7 +77,7 @@ impl Line {
         let mut off = 0;
         while off < self.len {
             let rest = &self.buf[off..self.len];
-            let n = sys(WRITE, [1, rest.as_ptr() as u64, rest.len() as u64, 0, 0, 0]);
+            let n = sys(SYS_WRITE, [1, rest.as_ptr() as u64, rest.len() as u64, 0, 0, 0]);
             if n <= 0 {
                 break;
             }

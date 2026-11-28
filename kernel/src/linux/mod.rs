@@ -641,14 +641,12 @@ crate::ktest!(
         crate::kassert_eq!(m6_rows.len() + m7_rows.len(), 49);
         crate::kassert_eq!(M7_SYSCALLS.len(), 47);
         crate::kassert_eq!(m7_rows.len(), M7_SYSCALLS.len());
-        let in_m6 = |nr: u32| M6_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m7 = |nr: u32| M7_SYSCALLS.iter().any(|&(n, _)| n == nr);
         for &(nr, name) in m6_rows {
-            crate::kassert!(in_m6(nr) && !in_m7(nr));
+            crate::kassert!(in_table(M6_SYSCALLS, nr) && !in_table(M7_SYSCALLS, nr));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m7_rows {
-            crate::kassert!(in_m7(nr) && !in_m6(nr));
+            crate::kassert!(in_table(M7_SYSCALLS, nr) && !in_table(M6_SYSCALLS, nr));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         // No number twice: with the lengths above, `M7_SYSCALLS` is exactly
@@ -768,17 +766,22 @@ crate::ktest!(
     }
 );
 
+#[cfg(feature = "ktest")]
+fn in_table(table: &[(u32, &str)], nr: u32) -> bool {
+    table.iter().any(|&(n, _)| n == nr)
+}
+
 crate::ktest!(
     fn m8_abi_constants_match_spec() {
         use core::mem::{offset_of, size_of};
 
         // 1. Every row of ARCHITECTURE.md section 8's M8 syscall table, by
         //    number. Eleven are M6's and four M7's (changed in M8, still in
-        //    their tables); two stay `-ENOSYS` by decision (in no table, and
-        //    `syscalls.py`'s `ENOSYS_BY_DECISION`); the other 60 are
-        //    `M8_SYSCALLS`. Each spec number's name through `syscall_name`
-        //    must be the row's, so the tables' `linux-raw-sys` constants
-        //    equal these numbers.
+        //    their tables); `membarrier` stays `-ENOSYS` by decision (in no
+        //    table, and `syscalls.py`'s `ENOSYS_BY_DECISION`), while `sendfile`
+        //    moved to `M9_SYSCALLS` in M9; the other 60 are `M8_SYSCALLS`.
+        //    Each spec number's name through `syscall_name` must be the row's,
+        //    so the tables' `linux-raw-sys` constants equal these numbers.
         let m6_rows: &[(u32, &str)] = &[
             (13, "rt_sigaction"),
             (14, "rt_sigprocmask"),
@@ -793,7 +796,7 @@ crate::ktest!(
             (302, "prlimit64"),
         ];
         let m7_rows: &[(u32, &str)] = &[(72, "fcntl"), (73, "flock"), (76, "truncate"), (77, "ftruncate")];
-        let enosys_rows: &[(u32, u32)] = &[(40, general::__NR_sendfile), (324, general::__NR_membarrier)];
+        let enosys_rows: &[(u32, u32)] = &[(324, general::__NR_membarrier)];
         let m8_rows: &[(u32, &str)] = &[
             (7, "poll"),
             (15, "rt_sigreturn"),
@@ -858,27 +861,29 @@ crate::ktest!(
         ];
         crate::kassert_eq!(M8_SYSCALLS.len(), 60);
         crate::kassert_eq!(m8_rows.len(), M8_SYSCALLS.len());
-        let in_m6 = |nr: u32| M6_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m7 = |nr: u32| M7_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m8 = |nr: u32| M8_SYSCALLS.iter().any(|&(n, _)| n == nr);
         for &(nr, name) in m6_rows {
-            crate::kassert!(in_m6(nr) && !in_m7(nr) && !in_m8(nr));
+            crate::kassert!(in_table(M6_SYSCALLS, nr) && !in_table(M7_SYSCALLS, nr) && !in_table(M8_SYSCALLS, nr));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m7_rows {
-            crate::kassert!(in_m7(nr) && !in_m6(nr) && !in_m8(nr));
+            crate::kassert!(in_table(M7_SYSCALLS, nr) && !in_table(M6_SYSCALLS, nr) && !in_table(M8_SYSCALLS, nr));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m8_rows {
-            crate::kassert!(in_m8(nr) && !in_m6(nr) && !in_m7(nr));
+            crate::kassert!(in_table(M8_SYSCALLS, nr) && !in_table(M6_SYSCALLS, nr) && !in_table(M7_SYSCALLS, nr));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(spec_nr, actual) in enosys_rows {
             crate::kassert_eq!(actual, spec_nr);
-            crate::kassert!(!in_m6(spec_nr) && !in_m7(spec_nr) && !in_m8(spec_nr));
+            crate::kassert!(
+                !in_table(M6_SYSCALLS, spec_nr) && !in_table(M7_SYSCALLS, spec_nr) && !in_table(M8_SYSCALLS, spec_nr)
+            );
+            crate::kassert_eq!(syscall_name(spec_nr), None);
         }
-        // `membarrier` stays `-ENOSYS` in M9; `sendfile` moved to `M9_SYSCALLS`.
-        crate::kassert_eq!(syscall_name(324), None);
+        // `sendfile` was `-ENOSYS` in M8 and moved to `M9_SYSCALLS` in M9 (C7).
+        crate::kassert_eq!(general::__NR_sendfile, 40);
+        crate::kassert!(!in_table(M6_SYSCALLS, 40) && !in_table(M7_SYSCALLS, 40) && !in_table(M8_SYSCALLS, 40));
+        crate::kassert!(in_table(M9_SYSCALLS, 40));
         crate::kassert_eq!(syscall_name(40), Some("sendfile"));
         // No number twice: with the lengths above, `M8_SYSCALLS` is exactly
         // the 60 rows.
@@ -1223,7 +1228,6 @@ crate::ktest!(
         // 1. Every row of ARCHITECTURE.md section 8's M9 syscall table, by
         //    number. `clock_gettime` (228) is M6's (extended in C7); the other
         //    32 are `M9_SYSCALLS`.
-        let m6_rows: &[(u32, &str)] = &[(228, "clock_gettime")];
         let m9_rows: &[(u32, &str)] = &[
             (28, "madvise"),
             (40, "sendfile"),
@@ -1258,26 +1262,25 @@ crate::ktest!(
             (326, "copy_file_range"),
             (441, "epoll_pwait2"),
         ];
-        crate::kassert_eq!(m6_rows.len() + m9_rows.len(), 33);
         crate::kassert_eq!(M9_SYSCALLS.len(), 32);
         crate::kassert_eq!(m9_rows.len(), M9_SYSCALLS.len());
-        let in_m6 = |nr: u32| M6_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m7 = |nr: u32| M7_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m8 = |nr: u32| M8_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m9 = |nr: u32| M9_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        for &(nr, name) in m6_rows {
-            crate::kassert!(in_m6(nr) && !in_m9(nr));
-            crate::kassert_eq!(syscall_name(nr), Some(name));
-        }
+        crate::kassert!(in_table(M6_SYSCALLS, 228) && !in_table(M9_SYSCALLS, 228));
+        crate::kassert_eq!(syscall_name(228), Some("clock_gettime"));
         for &(nr, name) in m9_rows {
-            crate::kassert!(in_m9(nr) && !in_m6(nr) && !in_m7(nr) && !in_m8(nr));
+            crate::kassert!(
+                in_table(M9_SYSCALLS, nr)
+                    && !in_table(M6_SYSCALLS, nr)
+                    && !in_table(M7_SYSCALLS, nr)
+                    && !in_table(M8_SYSCALLS, nr)
+            );
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         // No duplicate numbers in `M9_SYSCALLS`.
         for (i, &(nr, _)) in M9_SYSCALLS.iter().enumerate() {
             crate::kassert!(M9_SYSCALLS[i + 1..].iter().all(|&(other, _)| other != nr));
         }
-        // Section 8 "Stays `-ENOSYS` in M9": in no table.
+        // Section 8 "Stays `-ENOSYS` in M9": M9's additions and re-checked rows
+        // (M8's other `-ENOSYS` decisions are pinned in `m8_abi_constants_match_spec`).
         for &(spec_nr, actual) in &[
             (282, general::__NR_signalfd),
             (289, general::__NR_signalfd4),
@@ -1288,6 +1291,7 @@ crate::ktest!(
             crate::kassert_eq!(actual, spec_nr);
             crate::kassert_eq!(syscall_name(spec_nr), None);
         }
+        crate::kassert_eq!(general::membarrier_cmd::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as u32, 0x10);
 
         // 2. M9 socket, epoll, eventfd, timerfd, madvise and ioctl constants.
         //    Address families.
@@ -1297,8 +1301,9 @@ crate::ktest!(
         crate::kassert_eq!(net::AF_INET6, 10);
         crate::kassert_eq!(net::AF_NETLINK, 16);
         crate::kassert_eq!(net::AF_PACKET, 17);
-        //    Socket types and creation flags (`SOCK_*`; on Linux x86-64
-        //    `SOCK_NONBLOCK == O_NONBLOCK` and `SOCK_CLOEXEC == O_CLOEXEC`).
+        //    Socket types and creation flags (`linux-raw-sys` 0.12.1 lacks
+        //    `SOCK_NONBLOCK`/`SOCK_CLOEXEC`, so they stay pinned through
+        //    `O_NONBLOCK`/`O_CLOEXEC`, which have the same values on x86-64).
         crate::kassert_eq!(net::SOCK_STREAM, 1);
         crate::kassert_eq!(net::SOCK_DGRAM, 2);
         crate::kassert_eq!(net::SOCK_RAW, 3);
@@ -1463,8 +1468,10 @@ crate::ktest!(
             crate::kassert_eq!(actual, spec);
         }
 
-        // 4. The user-visible M9 structs' Linux x86-64 sizes and key offsets,
-        //    pinned against both `linux-raw-sys` and `lumen-sockabi::abi`.
+        // 4. The user-visible M9 structs' Linux x86-64 sizes and key offsets:
+        //    sizes are pinned against `linux-raw-sys` and `lumen-sockabi`
+        //    (except `itimerspec`, which `lumen-sockabi` does not define);
+        //    field offsets are checked against `linux-raw-sys` only.
         crate::kassert_eq!(size_of::<net::sockaddr_in>(), 16);
         crate::kassert_eq!(lumen_sockabi::SOCKADDR_IN_LEN, 16);
         crate::kassert_eq!(offset_of!(net::sockaddr_in, sin_family), 0);
