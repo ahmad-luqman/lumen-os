@@ -512,6 +512,7 @@ dependencies = [
  "lumen-heap",
  "lumen-input",
  "lumen-mm",
+ "lumen-net",
  "lumen-pci",
  "lumen-perf",
  "lumen-pipe",

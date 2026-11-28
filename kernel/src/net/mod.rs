@@ -10,3 +10,5 @@ pub mod sock;
 /// `linux::init`. Populated by B3 (`NetStack` and the `net` thread) and B4
 /// (address configuration).
 pub fn init() {}
+
+pub mod virtio_net;

@@ -16,9 +16,13 @@
 //!   at the same address). `dma_dealloc` logs a refusal with what was
 //!   recorded and returns non-zero (the crate's `Dma::drop` then panics);
 //!   `unshare` panics with it.
-//! - **Bounce buffers, not address translation.** The crate shares
-//!   whatever buffer a request uses (a caller's slice, a driver's `Box`, a
-//!   stack local), and the device needs one physical address for it, but
+//! - **Direct DMA shares and bounce buffers.** A range wholly inside a
+//!   recorded DMA run shares its own physical address without allocation
+//!   or copying. An unbalanced direct share makes `dma_dealloc` refuse
+//!   and log the live share count; the caller's deallocation assert then
+//!   panics. Other buffers take the bounce path below. The crate shares
+//!   whatever buffer a request uses (a caller's slice, a driver's `Box`,
+//!   a stack local), and the device needs one physical address for it, but
 //!   the heap and the stacks are windows mapped one page at a time: a
 //!   buffer crossing a page there isn't physically contiguous. So `share`
 //!   copies into (or zeroes) a fresh run and `unshare` copies back and
@@ -129,15 +133,18 @@ use crate::sync::SpinLock;
 /// plus rng about 3 plus virtio-blk 5 per bound device (2 persistent queue
 /// `Dma` runs + up to 3 transient `Bounce` runs, max 20 for `MAX_BLK_DEVICES = 4`)
 /// is about 99 at boot; with sound's 96 buffers in flight and 3 for a
-/// control request, about 198 worst-case while sound streams.
+/// control request, about 198 worst-case while sound streams. #473 adds
+/// 32 packet buffers + 4 queue runs for virtio-net: 234 worst case, leaving
+/// 22 spare entries (at least the required margin of 16). Direct shares
+/// increment a counter in the owning entry; they consume no extra runs.
 const RUNS: usize = 256;
 
 /// What a run in the table was handed out as: `dma_dealloc` frees only a
-/// `Dma` run of that many pages, `unshare` only a `Bounce` run of that
-/// buffer length (its frames follow from the length).
+/// `Dma` run of that many pages with no live shares. `unshare` decrements
+/// a direct DMA share, or frees a `Bounce` run of that buffer length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-    Dma { pages: usize },
+    Dma { pages: usize, shares: usize },
     Bounce { len: usize },
 }
 
@@ -430,7 +437,8 @@ static PROBING: SpinLock<Option<(PciAddr, [Option<BarMapping>; 6])>> = SpinLock:
 static PROBE: SpinLock<()> = SpinLock::new(());
 
 /// `virtio-drivers`' hardware abstraction: DMA from the frame allocator,
-/// bounce buffers for shared buffers, and MMIO through the probed device's
+/// counted direct shares of recorded DMA ranges, bounce buffers for other
+/// shared buffers, and MMIO through the probed device's
 /// BAR mappings.
 #[derive(Debug)]
 pub struct VirtioHal;
@@ -442,7 +450,9 @@ pub struct VirtioHal;
 // common configuration is aliased once more, by `VirtioTransport`, a
 // deliberate and benign exception: see the module doc); `share` returns a
 // fresh run holding the buffer's contents (or zeros) that nothing else uses
-// until `unshare`.
+// until `unshare`. A range wholly inside an owned DMA run instead shares
+// that run directly; its live share count prevents deallocation until all
+// shares return after completion or reset.
 unsafe impl Hal for VirtioHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (u64, NonNull<u8>) {
         let mut table = TABLE.lock();
@@ -463,7 +473,7 @@ unsafe impl Hal for VirtioHal {
         // SAFETY: a fresh run nothing else uses, in the HHDM.
         unsafe { core::ptr::write_bytes(run.ptr(), 0, run.len()) };
         let ptr = NonNull::new(run.ptr()).expect("HHDM addresses aren't null");
-        (record(&mut table, run, Kind::Dma { pages }), ptr)
+        (record(&mut table, run, Kind::Dma { pages, shares: 0 }), ptr)
     }
 
     unsafe fn dma_dealloc(paddr: u64, vaddr: NonNull<u8>, pages: usize) -> i32 {
@@ -477,7 +487,7 @@ unsafe impl Hal for VirtioHal {
             return refused(format_args!("dma_alloc returned {hhdm:p} for it"));
         }
         let mut table = TABLE.lock();
-        let taken = take(&mut table, paddr, Kind::Dma { pages });
+        let taken = take(&mut table, paddr, Kind::Dma { pages, shares: 0 });
         let freed = taken.map(|run| run.free());
         drop(table);
         match freed {
@@ -487,6 +497,9 @@ unsafe impl Hal for VirtioHal {
                 -2
             }
             Err(Miss::NotOutstanding) => refused(format_args!("no run is outstanding there")),
+            Err(Miss::Differs(Kind::Dma { pages: recorded, shares })) if recorded == pages && shares > 0 => {
+                refused(format_args!("{shares} live DMA shares"))
+            }
             Err(Miss::Differs(kind)) => refused(format_args!("the run there is {kind:?}")),
         }
     }
@@ -503,6 +516,10 @@ unsafe impl Hal for VirtioHal {
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> u64 {
         let len = buffer.len();
         let mut table = TABLE.lock();
+        if let Some((paddr, shares)) = direct_share(&mut table[..], buffer) {
+            *shares = shares.checked_add(1).expect("virtio: DMA share count overflow");
+            return paddr;
+        }
         let outstanding = count(&table);
         if outstanding == RUNS {
             panic!("virtio: sharing a {len}-byte buffer: the run table is full ({RUNS} outstanding)");
@@ -529,6 +546,11 @@ unsafe impl Hal for VirtioHal {
     unsafe fn unshare(paddr: u64, buffer: NonNull<[u8]>, direction: BufferDirection) {
         let len = buffer.len();
         let mut table = TABLE.lock();
+        if let Some((direct, shares)) = direct_share(&mut table[..], buffer) {
+            assert_eq!(paddr, direct, "virtio: unshare of a DMA buffer at the wrong address");
+            *shares = shares.checked_sub(1).expect("virtio: DMA unshare without a live share");
+            return; // Its owner may free only after every share returns.
+        }
         let run = take(&mut table, paddr, Kind::Bounce { len }).unwrap_or_else(|miss| {
             let outstanding = count(&table);
             panic!("virtio: unshare of {paddr:#x} ({len} bytes): {miss:?} ({outstanding} runs outstanding)")
@@ -1369,13 +1391,13 @@ crate::ktest!(
             let mut table = TABLE.lock();
             kassert!(matches!(
                 take(&mut table, dma, Kind::Bounce { len: 100 }),
-                Err(Miss::Differs(Kind::Dma { pages: 1 }))
+                Err(Miss::Differs(Kind::Dma { pages: 1, shares: 0 }))
             ));
             kassert!(matches!(
                 take(&mut table, bounce, Kind::Bounce { len: 99 }),
                 Err(Miss::Differs(Kind::Bounce { len: 100 }))
             ));
-            kassert!(matches!(take(&mut table, 0x1000, Kind::Dma { pages: 1 }), Err(Miss::NotOutstanding)));
+            kassert!(matches!(take(&mut table, 0x1000, Kind::Dma { pages: 1, shares: 0 }), Err(Miss::NotOutstanding)));
         }
         // SAFETY: the buffer and address `share` returned.
         unsafe { VirtioHal::unshare(bounce, shared, BufferDirection::DriverToDevice) };
@@ -1530,11 +1552,23 @@ crate::ktest!(
 
         use crate::pci::{self, Binding, ClaimError, Probed, ktest_command};
         use crate::{kassert, kassert_eq};
-        let d = ktest_device(1)?;
+        // #473: virtio-net is bound at boot now. Q35 SATA has both I/O and
+        // memory BARs, but holds the boot ISO: restore its command register
+        // on every exit, including a failed assertion, after the claim drops.
+        let d =
+            pci::devices().iter().find(|d| (d.vendor, d.device) == (0x8086, 0x2922)).ok_or("no q35 SATA controller")?;
         let nowhere = lumen_pci::PciAddr::new(0, 0x80, 31, 7).ok_or("addr")?;
         kassert_eq!(pci::claim(nowhere, "ktest").map(|_| ()), Err(ClaimError::NoSuchFunction));
         let bits = MEMORY_SPACE | BUS_MASTER | IO_SPACE;
-        // Firmware left it decoding I/O only, mastering nothing.
+        struct RestoreCommand(PciAddr, u16);
+        impl Drop for RestoreCommand {
+            fn drop(&mut self) {
+                ktest_command(self.0, Some(self.1));
+            }
+        }
+        let restore = RestoreCommand(d.addr, ktest_command(d.addr, None));
+        // Deliberately set an adverse initial state; this is not a claim
+        // about what firmware left in the command register.
         kassert_eq!(ktest_command(d.addr, Some(IO_SPACE)) & bits, IO_SPACE);
         let res = pci::claim(d.addr, "ktest").map_err(|_| "the claim failed")?;
         kassert_eq!(pci::binding(d.addr), Some(Binding::Probing("ktest")));
@@ -1561,6 +1595,10 @@ crate::ktest!(
         for (b, text) in shown {
             kassert_eq!(alloc::format!("{b}"), text);
         }
+        drop(res);
+        let original = restore.1;
+        drop(restore);
+        kassert_eq!(ktest_command(d.addr, None), original);
         Ok(())
     }
 );
@@ -1782,6 +1820,101 @@ crate::ktest!(
             "WARN  virtio: {addr}: the device answered but its MSI-X interrupt never came (said once)\n"
         );
         kassert_eq!(log.matches(line.as_str()).count(), 1);
+        Ok(())
+    }
+);
+
+/// The physical address and owner's live-share counter only for a range
+/// wholly inside a recorded DMA run. Heap/stack buffers and HHDM bounce
+/// runs retain the bounce path. The table lock protects the counter through
+/// its update; no copying, zeroing or allocation is needed on x86-64.
+fn direct_share(table: &mut [Option<Entry>], buffer: NonNull<[u8]>) -> Option<(u64, &mut usize)> {
+    let start = buffer.as_ptr().cast::<u8>() as usize;
+    table.iter_mut().flatten().find_map(|entry| {
+        let offset = start.checked_sub(entry.run.ptr() as usize)?;
+        if offset >= entry.run.len() || buffer.len() > entry.run.len() - offset {
+            return None;
+        }
+        match &mut entry.kind {
+            Kind::Dma { shares, .. } => Some((entry.run.phys() + offset as u64, shares)),
+            Kind::Bounce { .. } => None,
+        }
+    })
+}
+
+crate::ktest!(
+    fn dma_subranges_share_without_bouncing_or_freeing_the_owner() {
+        use crate::{kassert, kassert_eq};
+        let before = outstanding_runs();
+        let (phys, ptr) = VirtioHal::dma_alloc(2, BufferDirection::Both);
+        kassert!(phys != 0);
+        // SAFETY: this test owns the two-page run until the final dealloc.
+        let sub = unsafe { NonNull::slice_from_raw_parts(ptr.add(4000), 600) };
+        for direction in [BufferDirection::DriverToDevice, BufferDirection::DeviceToDriver] {
+            // SAFETY: no device uses this test buffer; it stays allocated.
+            unsafe { sub.as_ptr().cast::<u8>().write_bytes(0x5a, sub.len()) };
+            // SAFETY: the allocated subrange stays alive until unshare.
+            let shared = unsafe { VirtioHal::share(sub, direction) };
+            kassert_eq!(shared, phys + 4000);
+            kassert_eq!(outstanding_runs(), before + 1);
+            kassert_eq!(*direct_share(&mut TABLE.lock()[..], sub).ok_or("missing DMA range")?.1, 1);
+            // A second share of the same range must pin it independently.
+            // SAFETY: test-owned memory, no device accesses this buffer.
+            let second = unsafe { VirtioHal::share(sub, direction) };
+            kassert_eq!(*direct_share(&mut TABLE.lock()[..], sub).ok_or("missing DMA range")?.1, 2);
+            // SAFETY: intentional early free; Hal must refuse without freeing.
+            kassert_eq!(unsafe { VirtioHal::dma_dealloc(phys, ptr, 2) }, -1);
+            kassert!(all_allocated(phys, 2, true));
+            // SAFETY: balances only the second share; the first stays live.
+            unsafe { VirtioHal::unshare(second, sub, direction) };
+            kassert_eq!(*direct_share(&mut TABLE.lock()[..], sub).ok_or("missing DMA range")?.1, 1);
+            // Sharing RX must not zero or copy the existing DMA contents.
+            // SAFETY: the test owns the range and no device is accessing it.
+            unsafe {
+                kassert_eq!(sub.as_ptr().cast::<u8>().read(), 0x5a);
+                hhdm(shared).write(0xa7);
+                VirtioHal::unshare(shared, sub, direction);
+                kassert_eq!(sub.as_ptr().cast::<u8>().read(), 0xa7);
+            }
+            kassert!(all_allocated(phys, 2, true));
+            kassert_eq!(outstanding_runs(), before + 1);
+        }
+        // An exact-end range shares directly, and balances its live count.
+        // SAFETY: offset 8000 and length 192 fit this two-page allocation.
+        let tail = unsafe { NonNull::slice_from_raw_parts(ptr.add(8000), 192) };
+        // SAFETY: no device accesses this owned range.
+        let tail_phys = unsafe { VirtioHal::share(tail, BufferDirection::DriverToDevice) };
+        kassert_eq!(tail_phys, phys + 8000);
+        kassert_eq!(outstanding_runs(), before + 1);
+        // SAFETY: balances the exact-end share.
+        unsafe { VirtioHal::unshare(tail_phys, tail, BufferDirection::DriverToDevice) };
+        // These pointers are lookup inputs only: never dereferenced.
+        // SAFETY: one-past-the-end pointer, used only for an empty lookup.
+        let at_end = unsafe { NonNull::slice_from_raw_parts(ptr.add(8192), 0) };
+        {
+            let mut table = TABLE.lock();
+            let entry =
+                table.iter_mut().find(|e| e.as_ref().is_some_and(|e| e.run.phys() == phys)).ok_or("missing DMA run")?;
+            // Check this run alone: a neighbouring recorded DMA allocation
+            // would legitimately own the one-past-end address itself.
+            kassert_eq!(direct_share(core::slice::from_mut(entry), at_end), None);
+        }
+        let outside = NonNull::slice_from_raw_parts(ptr, 8193);
+        kassert_eq!(direct_share(&mut TABLE.lock()[..], outside), None);
+        let overflow = NonNull::slice_from_raw_parts(ptr, usize::MAX);
+        kassert_eq!(direct_share(&mut TABLE.lock()[..], overflow), None);
+        let source = [0u8; 32];
+        let source_ptr = NonNull::from(source.as_slice());
+        // SAFETY: source remains valid through the matching unshare.
+        let bounce = unsafe { VirtioHal::share(source_ptr, BufferDirection::DriverToDevice) };
+        let inside_bounce = NonNull::slice_from_raw_parts(NonNull::new(hhdm(bounce + 1)).unwrap(), 16);
+        kassert_eq!(direct_share(&mut TABLE.lock()[..], inside_bounce), None);
+        // SAFETY: balances the bounce share of the unchanged source.
+        unsafe { VirtioHal::unshare(bounce, source_ptr, BufferDirection::DriverToDevice) };
+        kassert_eq!(*direct_share(&mut TABLE.lock()[..], sub).ok_or("missing DMA range")?.1, 0);
+        // SAFETY: both pages remain allocated, with no outstanding device access.
+        kassert_eq!(unsafe { VirtioHal::dma_dealloc(phys, ptr, 2) }, 0);
+        kassert_eq!(outstanding_runs(), before);
         Ok(())
     }
 );

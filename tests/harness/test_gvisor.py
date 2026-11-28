@@ -398,6 +398,10 @@ def test_native_runner_kills_children_after_a_successful_parent(tmp_path):
         stat = Path(f"/proc/{pid}/stat")
         try:
             return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        except ProcessLookupError:
+            # Reaped between open and read: fs/proc/base.c's proc_single_show
+            # finds no task and the read fails with ESRCH.
+            return False
         except FileNotFoundError:
             return sys.platform != "linux"
 

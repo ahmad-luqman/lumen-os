@@ -196,7 +196,7 @@ def test_lspci_lists_virtio_devices(boot):
 def test_lspci_driver_column(boot):
     # Each driver's issue adds its row and tests its own probe outcome (rng
     # in test_dev, the tablet in test_input, sound in test_sound, blk in
-    # test_blk): virtio-rng, the tablet, sound and virtio-blk bind; every
+    # test_blk, net in test_net): rng, tablet, sound, blk and net bind; every
     # other function, the other virtio ones included, shows "no driver".
     m = shell(boot, devices=Devices.every())
     rows = lspci_rows(m)
@@ -209,14 +209,15 @@ def test_lspci_driver_column(boot):
         "virtio rng": "virtio-rng: bound",
         "virtio sound": "sound: bound",
         "virtio block": "virtio-blk: bound",
+        "virtio network": "virtio-net: bound",
     }, rows
     assert re.search(
-        r"INFO  drivers: 4 bound, 0 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n",
+        r"INFO  drivers: 5 bound, 0 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n",
         m.output,
     )
     assert "WARN  drivers" not in m.output
     # The column filters like the others.
-    assert run(m, "lspci | where driver = 'no driver' | count") == f"{len(rows) - 4}\n"
+    assert run(m, "lspci | where driver = 'no driver' | count") == f"{len(rows) - 5}\n"
 
 
 def test_lspci_records_filter(boot):
