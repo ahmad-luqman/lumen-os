@@ -83,19 +83,48 @@ use crate::vfs::KernelVfsLock;
 /// Anonymous-inode kernel object held in [`KernelFile`] (`vfs/anon.rs`,
 /// dev `0:9`; ARCHITECTURE sections 8 and 10).
 ///
-/// B5 (`epoll`) and B6 (`eventfd`, `timerfd`) append their variants here.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // variants appended by B5/B6
-pub enum AnonObj {}
+/// B5 (`epoll`) appends its variant here.
+pub enum AnonObj {
+    /// `eventfd` counter (`anon_inode:[eventfd]`; B6, #477).
+    EventFd(Arc<crate::linux::evfd::EventFd>),
+    /// `timerfd` expiry counter (`anon_inode:[timerfd]`; B6, #477).
+    TimerFd(Arc<crate::linux::evfd::TimerFd>),
+}
 
 impl AnonObj {
     /// The anonymous-inode kind (`eventpoll`, `eventfd`, or `timerfd`).
     pub fn kind(&self) -> crate::vfs::anon::AnonKind {
-        match *self {}
+        match self {
+            Self::EventFd(_) => crate::vfs::anon::AnonKind::EventFd,
+            Self::TimerFd(_) => crate::vfs::anon::AnonKind::TimerFd,
+        }
     }
 
     /// Readiness source for this anonymous object.
     pub fn pollable(&self) -> &dyn Pollable {
-        match *self {}
+        match self {
+            Self::EventFd(ev) => &**ev,
+            Self::TimerFd(tf) => &**tf,
+        }
+    }
+
+    /// Consume one 8-byte counter value (`eventfd_read` / `timerfd_read_iter`),
+    /// blocking interruptibly (`-ERESTARTSYS`) unless `nonblock` (`-EAGAIN`).
+    pub fn read_u64(&self, nonblock: bool) -> Result<u64, u32> {
+        match self {
+            Self::EventFd(ev) => ev.read_u64(nonblock),
+            Self::TimerFd(tf) => tf.read_u64(nonblock),
+        }
+    }
+
+    /// Whether `write(2)` / `writev(2)` are supported (`FMODE_CAN_WRITE` in
+    /// Linux v6.12 `fs/read_write.c` `vfs_writev`). Exhaustive so any new
+    /// variant (B5's `EventPoll`) must decide at compile time.
+    pub fn can_write(&self) -> bool {
+        match self {
+            Self::EventFd(_) => true,
+            Self::TimerFd(_) => false,
+        }
     }
 
     /// Object-own teardown called once when the description's last end
@@ -109,7 +138,10 @@ impl AnonObj {
     /// ttys, sockets, anonymous objects and inode-pollable files), so B5 hooks
     /// it in [`KernelFile::release_end`] before matching `self.obj`, not here.
     pub fn release(&self) {
-        match *self {}
+        match self {
+            Self::EventFd(_) => {}
+            Self::TimerFd(tf) => tf.disarm(),
+        }
     }
 }
 
@@ -143,11 +175,10 @@ impl Pollable for TtyPoll {
 
 /// Exclusive kernel object attached to a [`KernelFile`] description.
 ///
-/// B5 and B6 append variants to [`AnonObj`].
+/// B5 (`epoll`) appends its variant to [`AnonObj`].
 enum FileObj {
     Pipe(PipePoll),
     Tty(TtyPoll),
-    #[allow(dead_code)] // constructed by B5/B6 via `KernelFile::new_anon`
     Anon(AnonObj),
     Sock(Arc<dyn crate::net::sock::SockOps>),
 }
@@ -193,7 +224,6 @@ impl KernelFile {
 
     /// Construct an open file description for an anonymous kernel object
     /// (`vfs/anon.rs`, dev `0:9`), deriving the inode kind from [`AnonObj::kind`].
-    #[allow(dead_code)] // used by B5/B6
     pub fn new_anon(flags: OpenFlags, anon: AnonObj) -> Result<Self, VfsError> {
         let (inode, path) = crate::vfs::anon::new_inode(anon.kind());
         let mut file = Self::from_open_file(OpenFile::new_unchecked_flags(inode, path, flags)?);
@@ -261,7 +291,6 @@ impl KernelFile {
     }
 
     /// Borrow the attached anonymous-inode object, if any.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by B5/B6
     pub fn anon(&self) -> Option<&AnonObj> {
         match &self.obj {
             Some(FileObj::Anon(anon)) => Some(anon),

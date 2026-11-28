@@ -108,8 +108,16 @@ impl Timers {
     }
 }
 
+/// Sentinel owner field in [`Key`] for `TimerFd` entries. Process pids start at
+/// [`lumen_proc::INIT_PID`] (1) and [`lumen_proc::FIRST_PID`] (2), so `0` can
+/// never collide with a process timer key.
+const TIMERFD_OWNER: u32 = 0;
+
 type Key = (u64, u32, u64);
-type Entry = (Weak<Process>, TimerId);
+enum Entry {
+    Process(Weak<Process>, TimerId),
+    TimerFd(Weak<crate::linux::evfd::TimerFd>),
+}
 static TIMERS: SpinLock<BTreeMap<Key, Entry>> = SpinLock::new(BTreeMap::new());
 static EARLIEST: AtomicU64 = AtomicU64::new(u64::MAX);
 static WAKE: sched::WaitQueue = sched::WaitQueue::new();
@@ -132,9 +140,53 @@ fn insert_entry_for(pid: u32, owner: &Weak<Process>, id: TimerId, timer: &PosixT
         && let (Some(deadline), Some(instance)) = (timer.setting.deadline(), timer.instance)
     {
         let mut map = TIMERS.lock();
-        map.insert((deadline, pid, instance), (owner.clone(), id));
+        map.insert((deadline, pid, instance), Entry::Process(owner.clone(), id));
         publish(&map);
     }
+}
+
+/// Apply a timerfd `Requeue` (remove old key, insert new key) to `TIMERS`,
+/// keyed `(deadline, TIMERFD_OWNER, instance)`.
+///
+/// Call only through `TimerFd::apply`, with `count` held.
+///
+/// Lock order (ARCHITECTURE section 9, level 10c): caller holds the timerfd's
+/// `count` lock while calling this; `TIMERS` nests inside it, and `WAKE` is
+/// never taken here. Returns `true` when the newly inserted deadline is
+/// already due (`<= time::now_ns()`); the caller must invoke [`wake_worker`]
+/// only after releasing `TimerFd::count`.
+pub(crate) fn requeue_timerfd(
+    target: &Weak<crate::linux::evfd::TimerFd>,
+    instance: u64,
+    requeue: lumen_eventfd::Requeue,
+) -> bool {
+    if requeue.is_none() {
+        return false;
+    }
+    let (removed, wake) = {
+        let mut map = TIMERS.lock();
+        let removed = requeue.remove.and_then(|old| map.remove(&(old, TIMERFD_OWNER, instance)));
+        debug_assert!(matches!(removed, None | Some(Entry::TimerFd(_))), "requeue_timerfd removed non-timerfd entry");
+        if let Some(new) = requeue.insert {
+            map.insert((new, TIMERFD_OWNER, instance), Entry::TimerFd(target.clone()));
+        }
+        publish(&map);
+        (removed, requeue.insert.is_some_and(|new| new <= time::now_ns()))
+    };
+    drop(removed);
+    wake
+}
+
+/// Wake the background `timers` worker thread (call outside `TimerFd::count`
+/// and `TIMERS`).
+pub(crate) fn wake_worker() {
+    WAKE.wake_all();
+}
+
+/// Whether `TIMERS` currently holds any entry for timerfd `instance` (ktests).
+#[cfg(feature = "ktest")]
+pub(crate) fn has_timerfd_entry(instance: u64) -> bool {
+    TIMERS.lock().keys().any(|key| key.1 == TIMERFD_OWNER && key.2 == instance)
 }
 
 /// Boot CPU tick: one deadline load while idle; signal generation stays in thread context.
@@ -167,10 +219,20 @@ pub fn init() {
                 publish(&map);
                 expired
             };
-            for ((_, _, instance), (owner, id)) in expired {
-                if let Some(process) = owner.upgrade() {
-                    PROCS.lock().expire_timer(&process, id, instance, now);
-                    // The final Process reference is dropped outside all locks.
+            for ((_, _, instance), entry) in expired {
+                match entry {
+                    Entry::Process(owner, id) => {
+                        if let Some(process) = owner.upgrade() {
+                            PROCS.lock().expire_timer(&process, id, instance, now);
+                            // The final Process reference is dropped outside all locks.
+                        }
+                    }
+                    Entry::TimerFd(timerfd) => {
+                        if let Some(timerfd) = timerfd.upgrade() {
+                            timerfd.expire(now);
+                            // The final TimerFd reference is dropped outside all locks.
+                        }
+                    }
                 }
             }
         }

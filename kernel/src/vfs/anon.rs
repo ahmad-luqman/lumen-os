@@ -13,8 +13,6 @@
 //! is set, and refuses `mmap` with `-ENODEV`. `KernelFile::new_anon` attaches
 //! the kernel object (`AnonObj`) to the description.
 
-#![cfg_attr(not(feature = "ktest"), allow(dead_code))] // constructed by B5/B6
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -38,6 +36,7 @@ pub const ANON_INO: Ino = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnonKind {
     /// `epoll` instance (`anon_inode:[eventpoll]`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // constructed by B5
     EventPoll,
     /// `eventfd` instance (`anon_inode:[eventfd]`).
     EventFd,
@@ -96,6 +95,7 @@ impl AnonInode {
     }
 
     /// The anonymous inode's kind (`eventpoll`, `eventfd`, or `timerfd`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // inspected by ktests / B5
     pub const fn kind(&self) -> AnonKind {
         self.kind
     }

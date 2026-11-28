@@ -328,3 +328,33 @@ def test_ptyrun_console_relay(boot, tmp_path):
     assert CRASH_BEGIN not in m.output[start:]
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_eventfd_and_timerfd(boot, tmp_path):
+    """M9 B6 (#477): ring-3 checks of `eventfd`/`eventfd2` and
+    `timerfd_create`/`timerfd_settime`/`timerfd_gettime` (counter and semaphore
+    modes, blocking/non-blocking reads and writes, overflow wait, `poll` masks
+    and `POLLIN`/`POLLOUT` wakes with infinite timeout, one-shot and interval
+    timers on `CLOCK_MONOTONIC`, `TFD_TIMER_ABSTIME` on `CLOCK_REALTIME`,
+    `gettime` after disarm, `/proc/self/fd` anon names, and `EINTR`/`SA_RESTART`
+    signal interruption)."""
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+    start = len(m.output)
+    program = "/usr/local/bin/m9_io"
+    m.send_line(f"linux {program} evfd")
+    for check in (
+        "eventfd_counter_and_semaphore",
+        "eventfd_blocking_and_overflow_wait",
+        "eventfd_poll_masks",
+        "timerfd_monotonic_oneshot_and_interval",
+        "timerfd_realtime_abstime_and_poll",
+        "signal_interruption",
+    ):
+        match = m.expect(re.compile(rf"^(ok|FAIL) {check}[^\r\n]*\r?\n", re.MULTILINE), 60)
+        assert match.group(1) == "ok", f"{match.group(0).strip()}\n{m.output[start:]}"
+    m.expect(rf"linux: {re.escape(program)} exit=0 leaked_frames=-?\d+\n", 30)
+    m.expect(r"lumen> ", 10)
+    assert CRASH_BEGIN not in m.output[start:]
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

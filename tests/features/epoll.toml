@@ -9,3 +9,13 @@ tests = ["cargo:lumen-epoll"]
 name = "eventfd counters and timerfd expiry counts (logic)"
 milestone = "M9"
 tests = ["cargo:lumen-eventfd"]
+
+[[feature]]
+name = "`eventfd`/`eventfd2` and `timerfd_create`/`timerfd_settime`/`timerfd_gettime` (alarm clocks always `-EPERM`: no `CAP_WAKE_ALARM`; #477, B6)"
+milestone = "M9"
+tests = [
+    "cargo:lumen-eventfd",
+    "ktest:lumen_kernel::linux::evfd::timerfd_expiries_count_on_the_timers_worker",
+    "ktest:lumen_kernel::linux::evfd::eventfd_and_timerfd_syscall_edges_and_faults",
+    "scenario:test_linux_io::test_eventfd_and_timerfd",
+]

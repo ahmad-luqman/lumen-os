@@ -462,16 +462,23 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `set_capacity`/`fionread`/`poll_open`/`deliver_sigpipe`, `PipeEnd`,
   `PipeInode` for anonymous `pipefs` on dev 0:6, `FifoSlot` and
   `open_fifo` for ext4/tmpfs FIFOs);
+  `linux/evfd.rs` (M9 B6, #477: `EventFd` over `SpinLock<EventCounter>` with
+  `readers_seq`/`writers_seq`, `readers`/`writers` `WaitQueue`s and
+  `KernelPollHead`, and `TimerFd` over `SpinLock<TimerCount>` on `TimerClock`
+  with `seq`, `wq`, `KernelPollHead` and `instance`, backing
+  `AnonObj::EventFd`/`AnonObj::TimerFd` and driven by `TIMERS`);
   `linux/timer.rs` (`#[path = "timer.rs"]` under `process`, re-exported as
-  `linux::timer`, #392: `Timers`, `TimerId` (`Real`, `Posix`),
-  `PosixTimer`, `TimerNotify`, global `TIMERS` deadline map with boot-CPU
-  `on_tick` wakeup and timer worker thread from `timer::init`,
-  `create`/`set`/`get`/`delete`/`overrun`/`delivered`/`clear`);
+  `linux::timer`, #392, #477: `Timers`, `TimerId` (`Real`, `Posix`),
+  `PosixTimer`, `TimerNotify`, global `TIMERS` deadline map with `Entry`
+  covering `Process` and `TimerFd` targets (`TIMERFD_OWNER`, `requeue_timerfd`,
+  `wake_worker`), boot-CPU `on_tick` wakeup and timer worker thread from
+  `timer::init`, `create`/`set`/`get`/`delete`/`overrun`/`delivered`/`clear`);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern; M7's and
   M8's `not_implemented` stubs are gone, while M9's remaining B0 stubs (#471)
-  live in `epoll.rs`, `evfd.rs` plus C7's in `io.rs`, `mem.rs`, `sys.rs`;
-  `socket.rs` holds B1's (#472) generic `SockOps` handlers; `sendmmsg`, `recvmmsg`, `membarrier`, `clone3`, `execveat`,
+  live in `epoll.rs` plus C7's in `io.rs`, `mem.rs`, `sys.rs`;
+  `socket.rs` holds B1's (#472) generic `SockOps` handlers and `evfd.rs` holds
+  B6's (#477) `eventfd`/`eventfd2`/`timerfd_*` handlers; `sendmmsg`, `recvmmsg`, `membarrier`, `clone3`, `execveat`,
   `futex_waitv`, the scheduler-policy calls, `signalfd*` and `times` make
   up `ENOSYS_BY_DECISION` in `tools/harness/lumen_harness/syscalls.py`
   (ARCHITECTURE section 8)), `unmap_past`
@@ -498,12 +505,15 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   (`sched_yield`, `sched_setaffinity`, `sched_getaffinity`, `getpriority`,
   `setpriority`, `getrusage`, `sysinfo`, `prctl`, `statfs`, `fstatfs`,
   `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391; M9's clusters:
-  `socket` generic `SockOps` handlers (#472), `epoll` and `evfd` B0 stubs (#471));
+  `socket` generic `SockOps` handlers (#472), `evfd` `eventfd`/`eventfd2` and
+  `timerfd_create`/`timerfd_settime`/`timerfd_gettime` handlers (#477), and
+  `epoll` B0 stubs (#471));
   `fd` holds `open`/`openat`/`lseek` (with `open_fifo`, #386,
   `devpts::open`, #388, #389, and `/proc/<pid>/fd/N` reopen `-ENXIO`
   unless `O_PATH` for anon/socket inodes, #471, #472) and descriptor
   I/O/`ioctl` (`FIONREAD` on pipes/ttys/sockets, tty requests, routing
-  socket `read`/`write`/`readv`/`writev` to `SockOps`, #472) through the table, routing terminals by `VfsInode::is_tty`
+  socket `read`/`write`/`readv`/`writev` to `SockOps`, #472, and eventfd/
+  timerfd `read`/`write`/`readv`/`writev` to `AnonObj`, #477) through the table, routing terminals by `VfsInode::is_tty`
   to their tty or the process's `ConsoleIo`, and the syscall ktests'
   shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_fd_of`: a failure
   naming the path, `ktest_open`, `ktest_install` and `ktest_install_file`:

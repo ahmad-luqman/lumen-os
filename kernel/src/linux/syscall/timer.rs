@@ -22,7 +22,7 @@ fn read_setting(ptr: UserPtr, micros: bool) -> Result<(u64, u64), u32> {
     }
     Ok((values[0], values[1]))
 }
-fn write_setting(ptr: UserPtr, setting: (u64, u64), micros: bool) -> Result<u64, u32> {
+pub(super) fn write_setting(ptr: UserPtr, setting: (u64, u64), micros: bool) -> Result<u64, u32> {
     let mut bytes = [0; 32];
     for (ns, pair) in [setting.0, setting.1].into_iter().zip(bytes.as_chunks_mut::<16>().0) {
         // Round remaining nanoseconds up to timeval resolution so a live
