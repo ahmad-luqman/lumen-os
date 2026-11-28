@@ -994,7 +994,34 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `wasmtime` and checks the app interface's shape.
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built; virtio devices through `Devices`; `press`/`type_text` for keys,
-  `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`,
+  `move_pointer`/`click` for the tablet; #453: restricted IPv4 user networking,
+  `Devices.services` TCP guest forwards to per-run Unix sockets (`Service`
+  port/path tuples), `_user_netdev` shared option builder,
+  `require_user_network` slirp capability check, `user_network_probe_args`
+  for CPU-free Ethernet injection tests: UDP is dropped; TCP outside guestfwd
+  is reset), `netfix.py` (#453: `NetFixture`,
+  HTTP/HTTPS/TCP echo on private Unix sockets, `SERVICE_PORTS` names the ports
+  (repo shares HTTPS), `net.socket(name)` looks up a socket, and `net.services`
+  composes with a scenario's `Devices`;
+  one relay per connection, no idle deadlines; guest EOF drains replies,
+  service EOF drains/drops late guest bytes; expected disconnects are informational;
+  relay stderr goes to `relay.log` (or `/dev/null` if unavailable),
+  service requests/errors to `services.log`;
+  timestamp/PID and service connection IDs correlate events; both logs copied
+  to optional artifacts on teardown (late relay output may be lost); unexpected
+  service errors fail or annotate an existing body exception;
+  per-run CA and signed apk index from sha256-checked, hard-linked packages
+  (read-only symlink fallback for cross-filesystem/protected caches);
+  `prepare_image` replaces CAfile bundles and all inherited CApath entries with
+  the run CA (PEM plus a new-style OpenSSL subject-hash link); all fixture
+  certificate generation, apk signing and hashing use #452's OpenSSL >= 3
+  discovery (LUMEN_OPENSSL, Homebrew, PATH). It replaces `/etc/apk/repositories` with the local
+  repository URL, installs local /etc/hosts and a loopback resolver
+  into an ext4 copy, with inherited apk keys replaced by the run key; UDP/DNS scenarios use guest
+  loopback, not host UDP forwarding; host tests in `tests/harness/test_netfix.py`,
+  synthetic APK inputs shared with the probe in `tests/harness/conftest.py`
+  and the archive helper in `tests/harness/netfix_fakes.py`),
+  `qmp.py`, `tap.py`, `image.py`,
   `audit.py` (also checks `.lumen_fixup_nofault`, #373, and requires smoltcp
   crate-root definitions in each ELF and the kernel-crate IR through
   `check_smoltcp_symbols`/`check_smoltcp_ir`, #459; `emit_kernel_ir` also
