@@ -7,7 +7,8 @@
 pub mod sock;
 
 /// Initialize the networking subsystem at boot, after `vfs::init` and
-/// `linux::init`.
+/// `linux::init`. Populated by B3 (`NetStack` and the `net` thread) and B4
+/// (address configuration).
 pub fn init() {
     log::debug!(target: "net", "net subsystem initialized");
 }

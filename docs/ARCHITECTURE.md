@@ -5380,12 +5380,12 @@ syscall is in neither `M6_SYSCALLS`–`M9_SYSCALLS` nor that list.
 |---|---|---|---|
 | 28 | `madvise(addr, len, advice)` | **moved from M10** for ruby's fibers (the census: advice 8): `addr` not page-aligned `-EINVAL`, `len` 0 returns 0; `MADV_FREE` (8) checks the range is mapped (`-ENOMEM` otherwise) and anonymous (a file mapping `-EINVAL`, as Linux's `madvise_free_single_vma`) and keeps the pages, which Linux's lazy free allows (it may reclaim them, never must); every other advice `-EINVAL` until M10 | C7 |
 | 40 | `sendfile(out, in, offset, count)` | **implemented** (ruby-gem's file copies: the census): `in` a regular file (else `-EINVAL`), `out` any writable descriptor (a socket or pipe included); `offset` `NULL` reads at and moves `in`'s position, else reads at `*offset` and writes the new offset back; `count` capped at `MAX_RW_COUNT` (`0x7ffff000`); copies through a kernel buffer in chunks, each read holding only `in`'s locks and each write only `out`'s, so section 9's Lock 0 stays one at a time (`copy_file_range` the same); a non-blocking `out` that takes nothing `-EAGAIN`; returns the bytes written | C7 |
-| 41 | `socket(domain, type, protocol)` | `AF_UNIX` (1), `AF_INET` (2), `AF_INET6` (10); any other family `-EAFNOSUPPORT` (`AF_NETLINK` and `AF_PACKET` included: the census saw neither). `type`'s low bits `SOCK_STREAM` (1), `SOCK_DGRAM` (2), `SOCK_SEQPACKET` (5, `AF_UNIX` only; inet `-ESOCKTNOSUPPORT`, as `inet_create` with no SCTP) or `SOCK_RAW` (3: inet with ICMP only; `AF_UNIX` makes a `SOCK_DGRAM` socket, as `unix_create`, which gVisor tests); flags `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, any other bit `-EINVAL`; `protocol` 0 or the type's own (TCP 6, UDP 17; ICMP 1 or ICMPv6 58 with `SOCK_DGRAM` or `SOCK_RAW`), else `-EPROTONOSUPPORT`; the slot reserved first (`-EMFILE`) | B1, C1, C3, C4, C6 |
-| 42 | `connect(fd, addr, addrlen)` | `SockAddr::decode` with `Call::Connect`, after `peek_family` catches `AF_UNSPEC`; inet: section 7's TCP and UDP rules (`-EINPROGRESS`, `-EALREADY`, `-EISCONN`, `-ECONNREFUSED`, `-ENETUNREACH`; `AF_UNSPEC` disconnects a datagram socket); unix: the path or abstract name looked up in the bound-socket tables (section 10), `-ECONNREFUSED` if absent or not listening, `-EPROTOTYPE` for another type, a full backlog `-EAGAIN` with `O_NONBLOCK`, else a wait; interrupted as "Signals and sockets" below | C1, C3, C4 |
+| 41 | `socket(domain, type, protocol)` | `AF_UNIX` (1), `AF_INET` (2), `AF_INET6` (10); any other family `-EAFNOSUPPORT` (`AF_NETLINK` and `AF_PACKET` included: the census saw neither); `type >= SOCK_MAX` (11) `-EINVAL` before an unknown family (`__sock_create`). `type`'s low bits `SOCK_STREAM` (1), `SOCK_DGRAM` (2), `SOCK_SEQPACKET` (5, `AF_UNIX` only; inet `-ESOCKTNOSUPPORT`, as `inet_create` with no SCTP) or `SOCK_RAW` (3: inet with ICMP only; `AF_UNIX` makes a `SOCK_DGRAM` socket, as `unix_create`, which gVisor tests); flags `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, any other bit `-EINVAL`; `protocol` 0 or the family/type's own (`AF_UNIX`: 0 or `PF_UNIX` (1), checked before type as `unix_create`; inet: TCP 6, UDP 17, ICMP 1 or ICMPv6 58 with `SOCK_DGRAM` or `SOCK_RAW`), else `-EPROTONOSUPPORT` (or `-EINVAL` for inet `protocol` outside `0..IPPROTO_MAX`); the slot reserved first (`-EMFILE`) | B1, C1, C3, C4, C6 |
+| 42 | `connect(fd, addr, addrlen)` | `SockAddr::decode` with `Call::Connect`, after `peek_family` catches `AF_UNSPEC` (dispatched to `SockOps::disconnect`; plain `AF_INET` on `AF_INET6` is routed for UDP/datagram sockets only, as `__ip6_datagram_connect`); inet: section 7's TCP and UDP rules (`-EINPROGRESS`, `-EALREADY`, `-EISCONN`, `-ECONNREFUSED`, `-ENETUNREACH`); unix: the path or abstract name looked up in the bound-socket tables (section 10), `-ECONNREFUSED` if absent or not listening, `-EPROTOTYPE` for another type, a full backlog `-EAGAIN` with `O_NONBLOCK`, else a wait; interrupted as "Signals and sockets" below | C1, C3, C4 |
 | 43 | `accept(fd, addr, addrlen)` | `accept4(fd, addr, addrlen, 0)` (busybox nc: the census) | C1, C4 |
-| 44 | `sendto(fd, buf, len, flags, addr, addrlen)` | `sendmsg` with one span and an optional name (a datagram socket's decoded by `SockAddr::decode_dest` with `Call::SendTo`; a stream socket ignores it) | C1, C3, C4 |
+| 44 | `sendto(fd, buf, len, flags, addr, addrlen)` | `sendmsg` with one span and an optional name: a non-null `addr` is always copied and length-checked (`move_addr_to_kernel`: `-EFAULT`/`-EINVAL`), setting `SendIo::named` (`addrlen != 0`), and decoded by `SockAddr::decode_dest` with `Call::SendTo` for datagram/raw sockets only (stream/seqpacket leave `SendIo::to` as `None`, with `SendIo::named` preserved so `unix_stream_sendmsg` can answer `-EISCONN`/`-EOPNOTSUPP` and seqpacket can ignore it) | C1, C3, C4 |
 | 45 | `recvfrom(fd, buf, len, flags, addr, addrlen)` | `recvmsg` with one span, the name written back truncated to `*addrlen` with the full length stored, as Linux's `move_addr_to_user` | C1, C3, C4 |
-| 46 | `sendmsg(fd, msg, flags)` | `msghdr` copied in (`-EFAULT`; a negative `msg_namelen` `-EINVAL`, above 128 clamped, `clamp_msg_namelen`), a datagram socket's name decoded by `SockAddr::decode_dest` with `Call::SendMsg` (0 is no address; a stream socket ignores the name), at most `UIO_MAXIOV` (1024) spans (`-EMSGSIZE`), the control buffer walked by `CmsgIter` (`SCM_RIGHTS` at most `SCM_MAX_FD` 253 descriptors, else `-EINVAL`; `SCM_CREDENTIALS`, section 10); flags `MSG_DONTWAIT`, `MSG_NOSIGNAL`, `MSG_MORE` (accepted, no effect), `MSG_EOR` (seqpacket); `MSG_OOB` `-EOPNOTSUPP`; a stream socket whose peer is gone `-EPIPE` with `SIGPIPE` unless `MSG_NOSIGNAL`; per family a destination on a connected socket follows Linux (unix datagrams: lumen-unix's `DgramPeer::resolve_send_target` uses the destination given, no `-EISCONN`, and `-ENOTCONN` without one) | C1, C2, C3, C4, C5 |
+| 46 | `sendmsg(fd, msg, flags)` | `msghdr` copied in (`-EFAULT`; a negative `msg_namelen` `-EINVAL`, above 128 clamped, `clamp_msg_namelen`), any non-null `msg_name` copied and length-checked (`msg_namelen != 0` sets `SendIo::named`), decoded by `SockAddr::decode_dest` with `Call::SendMsg` for datagram/raw sockets only (0 is no address; stream/seqpacket leave `to: None`, with `named` preserved for `unix_stream_sendmsg`), at most `UIO_MAXIOV` (1024) spans (`-EMSGSIZE`), the control buffer walked by `CmsgIter` (`SCM_RIGHTS` at most `SCM_MAX_FD` 253 descriptors, else `-EINVAL`; `SCM_CREDENTIALS`, section 10); flags `MSG_DONTWAIT`, `MSG_NOSIGNAL`, `MSG_MORE` (accepted, no effect), `MSG_EOR` (seqpacket); `MSG_OOB` `-EOPNOTSUPP`; a stream socket whose peer is gone `-EPIPE` with `SIGPIPE` unless `MSG_NOSIGNAL`; per family a destination on a connected socket follows Linux (unix datagrams: lumen-unix's `DgramPeer::resolve_send_target` uses the destination given, no `-EISCONN`, and `-ENOTCONN` without one) | C1, C2, C3, C4, C5 |
 | 47 | `recvmsg(fd, msg, flags)` | flags `MSG_PEEK`, `MSG_TRUNC`, `MSG_DONTWAIT`, `MSG_WAITALL` (stream), `MSG_CMSG_CLOEXEC`; `MSG_ERRQUEUE` `-EAGAIN` (no error queues); `MSG_OOB` `-EINVAL` (no urgent data, as Linux's TCP); `msg_flags` gets `MSG_TRUNC` and `MSG_CTRUNC`; received descriptors installed after the queue lock is released, and those that don't fit are closed with `MSG_CTRUNC` set (lumen-unix's `take_fds`) | C1, C2, C3, C4, C5 |
 | 48 | `shutdown(fd, how)` | `how` outside 0..=2 `-EINVAL`; an unconnected inet socket `-ENOTCONN` (a unix one returns 0, as `unix_shutdown`); TCP: section 7; unix: lumen-unix's `shutdown` | C1, C4 |
 | 49 | `bind(fd, addr, addrlen)` | `SockAddr::decode` with `Call::Bind` (Linux's length check before the family; `-EINVAL`, `-EAFNOSUPPORT`); already bound `-EINVAL`; inet: the port table (section 7); unix: a path, an abstract name, or autobind for `addrlen == 2` (section 10) | C1, C3, C4 |
@@ -5425,22 +5425,31 @@ and C6 only implement it, in parallel:
 // kernel/src/net/sock.rs (B1)
 pub enum SockKind { Stream, Dgram, Seqpacket, Raw }
 /// A descriptor in flight in SCM_RIGHTS: its end reference is counted
-/// (`inc_fd_ref`) while it lives, and `Drop` runs `dec_fd_ref`, so it is
-/// dropped only outside every lock (section 9's end-release rule).
-pub struct InFlightFile(FileRef);
+/// (`inc_fd_ref`) while it lives, and `Drop` runs `release_inflight_file`
+/// (releasing `flock` and `end_refs` on the last reference, as Linux's final
+/// `fput` → `locks_remove_file`), so it is dropped only outside every lock
+/// (section 9's end-release rule).
+pub struct InFlightFile(ManuallyDrop<FileRef>);
 /// One send's user side, decoded by the handler: spans checked
-/// (`UIO_MAXIOV`), a datagram socket's destination decoded by
-/// lumen-sockabi's `SockAddr::decode_dest`, and the
-/// control buffer (at most 131072 bytes, Linux's `optmem_max` since 6.8;
-/// `-ENOBUFS` past it) walked with `CmsgIter`: `SCM_RIGHTS` resolved to
-/// `InFlightFile`s, `SCM_CREDENTIALS` decoded, messages at levels other
-/// than `SOL_SOCKET` skipped, an unknown `SOL_SOCKET` type `-EINVAL`.
+/// (`UIO_MAXIOV`), any non-null destination copied and length-checked
+/// (`named == true` when `msg_namelen != 0`; decoded into `to` by
+/// lumen-sockabi's `SockAddr::decode_dest` for datagram/raw sockets only,
+/// while stream/seqpacket receive `to: None` with `named` preserved for
+/// `unix_stream_sendmsg`), and the control buffer (at most 131072 bytes,
+/// Linux's `optmem_max` since 6.8; `-ENOBUFS` past it) walked with `CmsgIter`:
+/// `SCM_RIGHTS` resolved to `InFlightFile`s, `SCM_CREDENTIALS` decoded,
+/// messages at levels other than `SOL_SOCKET` skipped, an unknown
+/// `SOL_SOCKET` type `-EINVAL`.
 pub struct SendIo<'a> { pub iov: UserIovec<'a>, pub to: Option<SockAddr>,
-                        pub rights: Vec<InFlightFile>, pub creds: Option<Ucred>,
-                        pub flags: u32, pub nonblock: bool }
-/// One receive's: spans, room for descriptors (from `msg_controllen`),
-/// flags.
-pub struct RecvIo<'a> { pub iov: UserIovec<'a>, pub max_fds: usize,
+                        pub named: bool, pub rights: Vec<InFlightFile>,
+                        pub creds: Option<Ucred>, pub flags: u32,
+                        pub nonblock: bool }
+/// One receive's user side: spans and flags.
+/// `RecvDone::rights` returns every descriptor the consumed message carried
+/// (clones under `MSG_PEEK`); the handler installs what fits into the control
+/// buffer and `RLIMIT_NOFILE`, sets `MSG_CTRUNC` if truncated, and drops the
+/// rest outside every lock, as Linux's `scm_detach_fds`.
+pub struct RecvIo<'a> { pub iov: UserIovec<'a>,
                         pub flags: u32, pub nonblock: bool }
 /// The handler installs `rights`, encodes them and `creds` with
 /// `CmsgWriter`, and copies the control buffer out.
@@ -5453,6 +5462,13 @@ pub trait SockOps: Pollable + Send + Sync {
     fn listen(&self, backlog: i32) -> Result<(), u32>;
     fn accept(&self, nonblock: bool) -> Result<(Arc<dyn SockOps>, Option<SockAddr>), u32>;
     fn connect(&self, addr: &SockAddr, nonblock: bool) -> Result<(), u32>;
+    /// `connect(fd, { sa_family: AF_UNSPEC }, >= 2)` per Linux v6.12:
+    /// - unix stream/seqpacket: `-EINVAL` (`unix_validate_addr`);
+    /// - TCP: disconnect, 0 (`__inet_stream_connect` → `prot->disconnect`;
+    ///   note for C4: lumen-net's `Stack::disconnect` is UDP-only, so TCP's
+    ///   `AF_UNSPEC` needs an abort-style path);
+    /// - UDP, raw, ping and unix dgram: disconnect, 0.
+    fn disconnect(&self) -> Result<(), u32>;
     /// Takes what it queues from `io.rights`; what is left goes back to
     /// the handler, which drops it after the call.
     fn send(&self, io: &mut SendIo<'_>) -> Result<usize, u32>;

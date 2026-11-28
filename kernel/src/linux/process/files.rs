@@ -306,15 +306,14 @@ impl ReservedFd {
 
     /// Install a fresh description, whose one FD reference becomes this
     /// slot. The reserved descriptor cannot have been taken by a dup.
-    pub fn install(mut self, file: KernelFile, cloexec: bool) -> i32 {
-        let file = Arc::new(file);
-        let r = self.reservation.take().expect("unconsumed reservation");
-        self.files.table.lock().fds.install(r, file, cloexec)
+    pub fn install(self, file: KernelFile, cloexec: bool) -> i32 {
+        self.install_inflight(crate::net::sock::InFlightFile::from_fresh(file), cloexec)
     }
 
-    /// Install an existing description whose caller already holds one counted
-    /// FD reference (such as an `InFlightFile` received via `SCM_RIGHTS`).
-    pub fn install_ref(mut self, file: FileRef, cloexec: bool) -> i32 {
+    /// Install an [`crate::net::sock::InFlightFile`], moving its counted FD/end
+    /// reference directly into this slot with no counter traffic.
+    pub fn install_inflight(mut self, file: crate::net::sock::InFlightFile, cloexec: bool) -> i32 {
+        let file = file.into_file_ref();
         let r = self.reservation.take().expect("unconsumed reservation");
         self.files.table.lock().fds.install(r, file, cloexec)
     }

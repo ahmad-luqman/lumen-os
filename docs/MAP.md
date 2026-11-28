@@ -392,7 +392,7 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   after `check_clone`; root not exempt; `nproc_task_count` the ktests'
   count, #435), `check` cross-checking them in the ktests), `process/files.rs` (`Files`: the 1024-slot FD table of
   `KernelFile`s, shared/exclusive `FilesAccess` leases, `ReservedFd`
-  with `install`/`install_ref`,
+  with `install`/`install_inflight`,
   `fork_copy`, `prepare_exec`/`copy_exec_into`; `FsState`/`FsInner` for
   `Cwd` and umask, #379, #380, #381, #472), `process/signal.rs` (`SignalState`,
   `ThreadSignals`, `Delivery`, `HandlerDelivery`, group exit/stop/cont,
@@ -405,7 +405,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   exit order: detach, unlink, release `mm`/`files`/`fs`, then the tree, its
   `NoMem` retried), `install_current_fd`/`insert_current_fd`/
   `dup_current_fd`(`_from`)/`close_current_fd` (close and exit releasing
-  POSIX and `flock` locks outside `PROCS`, `release_fd`), `ps_rows` for the shell's `ps`,
+  POSIX and `flock` locks outside `PROCS`, `release_fd`,
+  `release_inflight_file`), `ps_rows` for the shell's `ps`,
   the advisory locks' wait queue and release count (`lock_releases`,
   `locks_released`, `wait_for_lock_release`: `F_SETLKW` and blocking
   `flock`, #254), `Stdio` (fds 0/1/2 on `/dev/console` bound to the console
@@ -466,10 +467,11 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `setpriority`, `getrusage`, `sysinfo`, `prctl`, `statfs`, `fstatfs`,
   `clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, #391; M9's clusters:
   `socket` generic `SockOps` handlers (#472), `epoll` and `evfd` B0 stubs (#471));
-  `fd` holds `open`/`openat`/`lseek` (with `open_fifo`, #386, and
-  `devpts::open`, #388, #389) and descriptor I/O/`ioctl` (`FIONBIO`,
-  `FIONREAD` on pipes/ttys/sockets, tty requests, routing socket
-  `read`/`write`/`readv`/`writev` to `SockOps`, #472) through the table, routing terminals by `VfsInode::is_tty`
+  `fd` holds `open`/`openat`/`lseek` (with `open_fifo`, #386,
+  `devpts::open`, #388, #389, and `/proc/<pid>/fd/N` reopen `-ENXIO`
+  unless `O_PATH` for anon/socket inodes, #471, #472) and descriptor
+  I/O/`ioctl` (`FIONREAD` on pipes/ttys/sockets, tty requests, routing
+  socket `read`/`write`/`readv`/`writev` to `SockOps`, #472) through the table, routing terminals by `VfsInode::is_tty`
   to their tty or the process's `ConsoleIo`, and the syscall ktests'
   shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_fd_of`: a failure
   naming the path, `ktest_open`, `ktest_install` and `ktest_install_file`:
@@ -489,9 +491,10 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `stat_from_metadata`/`statx_from_metadata`; the handlers' rules are in
   ARCHITECTURE section 8, "Handlers".
   `net/` (M9; ARCHITECTURE sections 7, 8 and 10): `net/mod.rs` (`net::init`,
-  called at boot after `linux::init`, #472) and `net/sock.rs` (#472: the
-  generic socket file object: `SockKind`, `ShutdownHow`, `UserSpan`/
-  `UserIovec`, `InFlightFile`, `SendIo`, `RecvIo`, `RecvDone`, `SockOps`,
+  called at boot after `linux::init` and populated by B3/B4, #472) and
+  `net/sock.rs` (#472: the generic socket file object: `SockKind`,
+  `ShutdownHow`, `UserSpan`/`UserIovec`, `InFlightFile`, `SendIo` (with
+  `named`), `RecvIo`, `RecvDone`, `SockOps` (with required `disconnect`),
   `block_on`, `sockfs` on `SOCK_DEV` `0:8` with `SockInode` reporting
   `S_IFSOCK` and `socket:[ino]`, `new_socket_file`, and
   `create_socket`/`create_socketpair` family dispatch).

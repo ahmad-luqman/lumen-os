@@ -875,16 +875,24 @@ def test_each_m8_stub_returns_enosys_and_names_its_issue():
     assert set(found) <= set(tables["M8"])
 
 
+B1_SOCKET_SYSCALLS = {
+    "socket", "connect", "accept", "sendto", "recvfrom", "sendmsg", "recvmsg", "shutdown",
+    "bind", "listen", "getsockname", "getpeername", "socketpair", "setsockopt", "getsockopt",
+    "accept4",
+}  # fmt: skip
+
+
 def test_each_m9_stub_returns_enosys_and_names_its_issue():
     """ARCHITECTURE section 8, "B0's stubs": every remaining M9 stub (its doc
     says "M9 stub") only returns `not_implemented`'s -ENOSYS for its own
     number, its doc names the exact issues section 8's M9 table names for it,
-    and every stub is an M9 syscall's."""
+    and the remaining stubs are exactly M9's table minus B1's 16 socket
+    syscalls."""
     found = syscalls.stubs(syscalls.cluster_sources(DISPATCH_FILE.parent), milestone="M9")
     design = syscalls.design_issues(ARCHITECTURE_MD.read_text(), milestone="M9")
     assert syscalls.stub_problems(found, design, M9_ISSUES) == []
     tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
-    assert set(found) <= set(tables["M9"])
+    assert set(found) == set(tables["M9"]) - B1_SOCKET_SYSCALLS
 
 
 def test_the_report_lists_a_stub_under_its_milestone(capsys):

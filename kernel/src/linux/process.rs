@@ -1828,9 +1828,20 @@ fn release_fd(files: &Files, file: FileRef) {
     release_locks(&file, LockOwners::Members(files), last);
 }
 
+/// Release one counted FD/end reference held by an [`crate::net::sock::InFlightFile`]
+/// dropped without being installed into a descriptor table (Linux v6.12 final
+/// `fput` -> `locks_remove_file`). When this was the last FD reference, releases
+/// description-owned `flock` locks outside every lock.
+pub fn release_inflight_file(file: FileRef) {
+    if file.dec_fd_ref() == 0 {
+        release_locks(&file, LockOwners::None, true);
+    }
+}
+
 enum LockOwners<'a> {
     Members(&'a Files),
     Pid(u32),
+    None,
 }
 
 /// Release record locks and optionally flock under one inode lock, then
@@ -1841,6 +1852,7 @@ fn release_locks(file: &FileRef, owners: LockOwners<'_>, flock: bool) {
         freed = match owners {
             LockOwners::Members(files) => files.release_members(locks),
             LockOwners::Pid(pid) => locks.release_posix_for_pid(pid),
+            LockOwners::None => false,
         };
         if flock {
             freed |= locks.release_flock(file.id);
