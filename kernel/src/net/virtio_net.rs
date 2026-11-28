@@ -1,9 +1,11 @@
 //! Nonblocking virtio Ethernet with fixed DMA buffers (M9 B2, #473).
 //! The device has one serialized caller; its IRQ only wakes that caller.
-//! B3 moves it from the temporary shell owner into `NetStack::inner`.
+//! The shell owns it under `DEVICE` for B2; B3 will move it into
+//! `NetStack::inner`, whose sleep mutex serializes the net thread.
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
 use lumen_net::{ETH_FRAME_MAX, NetDevice, NetInfo, TxError};
@@ -18,7 +20,8 @@ use crate::virtio::{self, Doorbell, ProbeError, StatusHandle, VirtioHal, VirtioT
 
 const QUEUE_SIZE: usize = 16;
 const BUFFER_SIZE: usize = 2048;
-const SELFTEST_TIMEOUT_NS: u64 = 5_000_000_000;
+/// A 30 s hang guard, not a completion-time requirement on a busy host.
+const SELFTEST_TIMEOUT_NS: u64 = 30_000_000_000;
 type Raw = VirtIONetRaw<VirtioHal, VirtioTransport, QUEUE_SIZE>;
 
 pub const DRIVER: Driver = Driver { name: "virtio-net", matches, probe };
@@ -27,8 +30,24 @@ pub const DRIVER: Driver = Driver { name: "virtio-net", matches, probe };
 /// and ring the same bell for work queued by syscalls.
 pub static BELL: Doorbell = Doorbell::new();
 
-// B2 alone drives the device from the shell. No lock lives in the driver.
-static DEVICE: SleepMutex<Option<VirtioNetDevice>> = SleepMutex::new(None);
+// B2 shell calls hold this sleep mutex. The device itself has no lock.
+static DEVICE: SleepMutex<DeviceSlot> = SleepMutex::new(DeviceSlot::Empty);
+
+#[allow(clippy::large_enum_variant, reason = "one static slot; inline ownership needs no extra heap allocation")]
+enum DeviceSlot {
+    Empty,
+    Probed(VirtioNetDevice),
+    Taken,
+}
+
+impl DeviceSlot {
+    fn as_mut(&mut self) -> Option<&mut VirtioNetDevice> {
+        match self {
+            Self::Probed(device) => Some(device),
+            Self::Empty | Self::Taken => None,
+        }
+    }
+}
 
 fn on_irq() {
     BELL.ring();
@@ -40,36 +59,43 @@ fn matches(info: &DeviceInfo) -> bool {
 
 fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     // Probes run serially. Decline a second NIC before making its transport.
-    if DEVICE.lock().is_some() {
+    if !matches!(*DEVICE.lock(), DeviceSlot::Empty) {
         return Err(ProbeError::NotMine);
     }
     let transport = virtio::transport(res, on_irq)?;
     let status = transport.status();
     let raw = Raw::new(transport).map_err(ProbeError::Device)?;
+    let rx = buffers(BufferDirection::DeviceToDriver).map_err(ProbeError::Device)?;
+    let tx = buffers(BufferDirection::DriverToDevice).map_err(ProbeError::Device)?;
     let mut device = VirtioNetDevice {
-        raw,
-        rx: buffers(BufferDirection::DeviceToDriver).map_err(ProbeError::Device)?,
-        tx: buffers(BufferDirection::DriverToDevice).map_err(ProbeError::Device)?,
+        raw: ManuallyDrop::new(raw),
+        rx,
+        tx,
         rx_tokens: [None; QUEUE_SIZE],
         tx_pending: [None; QUEUE_SIZE],
         status,
-        failed: false,
+        health: Health::Up,
         warned: false,
-        broken: false,
         counts: Counts::default(),
     };
     for slot in 0..QUEUE_SIZE {
         device.post_receive(slot).map_err(ProbeError::Device)?;
     }
     virtio::check_device(&status)?;
-    *DEVICE.lock() = Some(device);
+    let mut slot = DEVICE.lock();
+    assert!(matches!(*slot, DeviceSlot::Empty));
+    *slot = DeviceSlot::Probed(device);
     Ok(())
 }
 
 /// Transfers the boot-probed device to B3's stack, once.
 #[allow(dead_code, reason = "B3 takes ownership when the net thread lands")]
 pub fn take_device() -> Option<VirtioNetDevice> {
-    DEVICE.lock().take()
+    let mut slot = DEVICE.lock();
+    match core::mem::replace(&mut *slot, DeviceSlot::Taken) {
+        DeviceSlot::Probed(device) => Some(device),
+        DeviceSlot::Empty | DeviceSlot::Taken => None,
+    }
 }
 
 /// One page owned through the Hal's DMA run table, of which 2048 bytes are
@@ -102,7 +128,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         // SAFETY: these are the allocation's original values. The raw
-        // device is the first field and resets before any Buffer is dropped.
+        // device resets and unshares its pending buffers before fields drop.
         assert_eq!(unsafe { VirtioHal::dma_dealloc(self.phys, self.ptr, 1) }, 0);
     }
 }
@@ -125,20 +151,64 @@ pub struct Counts {
 /// A single-descriptor-per-frame device with 16 RX and 16 TX buffers.
 /// No operation allocates or waits for a device completion.
 pub struct VirtioNetDevice {
-    // Drop order is essential: reset hardware before releasing its buffers.
-    raw: Raw,
+    // Explicit Drop resets hardware and releases live shares before buffers.
+    raw: ManuallyDrop<Raw>,
     rx: [Buffer; QUEUE_SIZE],
     tx: [Buffer; QUEUE_SIZE],
     rx_tokens: [Option<u16>; QUEUE_SIZE],
     // Tokens are descriptor ids, not buffer indices; completion order may vary.
     tx_pending: [Option<(u16, usize)>; QUEUE_SIZE],
     status: StatusHandle,
-    failed: bool,
+    health: Health,
     warned: bool,
-    // A corrupt completion cannot safely be retried or reuse its buffer.
-    broken: bool,
     counts: Counts,
 }
+
+/// Failed recovers on a successful transmit; Broken is permanent because
+/// a corrupt queue cannot safely reuse its buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Health {
+    Up,
+    Failed,
+    Broken,
+}
+
+impl Drop for VirtioNetDevice {
+    fn drop(&mut self) {
+        // SAFETY: raw is dropped exactly once here, resetting the transport
+        // before any buffers are freed. No method uses it after this point.
+        unsafe { ManuallyDrop::drop(&mut self.raw) };
+        // VirtQueue's drop does not unshare posted buffers. After reset no
+        // device can access them; discharge those shares before Buffer::drop.
+        for (buffer, token) in self.rx.iter().zip(self.rx_tokens) {
+            if token.is_some() {
+                // SAFETY: reset ended DMA; this is the exact posted range.
+                unsafe {
+                    VirtioHal::unshare(
+                        buffer.phys,
+                        NonNull::slice_from_raw_parts(buffer.ptr, BUFFER_SIZE),
+                        BufferDirection::DeviceToDriver,
+                    );
+                }
+            }
+        }
+        for (buffer, pending) in self.tx.iter().zip(self.tx_pending) {
+            if let Some((_, size)) = pending {
+                // SAFETY: reset ended DMA; this is the exact posted range.
+                unsafe {
+                    VirtioHal::unshare(
+                        buffer.phys,
+                        NonNull::slice_from_raw_parts(buffer.ptr, size),
+                        BufferDirection::DriverToDevice,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// A completed RX slot and the raw API's header/frame lengths.
+type RxCompletion = (usize, virtio_drivers::Result<(usize, usize)>);
 
 impl VirtioNetDevice {
     pub fn counts(&self) -> Counts {
@@ -150,76 +220,114 @@ impl VirtioNetDevice {
     }
 
     fn fail(&mut self) {
-        self.failed = true;
+        if self.health != Health::Broken {
+            self.health = Health::Failed;
+        }
         if !self.warned {
             self.warned = true;
-            log::warn!(target: "net", "virtio-net device failed; link down (said once)");
+            log::warn!(target: "net", "virtio-net device failed; link down (once per outage)");
         }
     }
 
-    fn post_receive(&mut self, slot: usize) -> virtio_drivers::Result<()> {
-        // SAFETY: this slot is fresh or completed; the allocation stays at
-        // this address until completion or the raw device resets on drop.
-        let token = unsafe { self.raw.receive_begin(self.rx[slot].bytes()) }?;
-        self.rx_tokens[slot] = Some(token);
-        Ok(())
-    }
-}
-
-impl NetDevice for VirtioNetDevice {
-    fn info(&self) -> NetInfo {
-        NetInfo {
-            mac: self.raw.mac_address(),
-            mtu: 1500,
-            link_up: !self.failed && !self.broken && self.status.check_ready().is_ok(),
+    fn break_down(&mut self, reason: core::fmt::Arguments<'_>) {
+        if self.health != Health::Broken {
+            log::error!(target: "net", "virtio-net queue broken: {reason}");
+            self.health = Health::Broken;
+            self.fail();
         }
     }
 
-    fn tx_ready(&self) -> bool {
-        // Raw::can_send requires two descriptors, but we use exactly one.
-        !self.broken && self.status.check_ready().is_ok() && self.tx_free() != 0
+    fn usable(&mut self) -> bool {
+        if self.status.check_ready().is_err() {
+            self.fail();
+            return false;
+        }
+        self.health != Health::Broken
     }
 
-    fn receive(&mut self, out: &mut [u8; ETH_FRAME_MAX]) -> Option<usize> {
-        if self.broken || self.status.check_ready().is_err() {
-            return None;
-        }
+    fn next_receive(&mut self) -> Option<RxCompletion> {
         let token = self.raw.poll_receive()?;
         let Some(slot) = self.rx_tokens.iter().position(|t| *t == Some(token)) else {
             self.counts.rx_drops += 1;
-            self.broken = true;
-            self.fail();
+            self.break_down(format_args!("unknown RX token {token}"));
             return None;
         };
-        // SAFETY: poll_receive returned this slot's posted token. The exact
-        // original range is returned to the raw API, and read only afterwards.
+        // SAFETY: poll_receive returned this slot's posted token. Return the
+        // exact original range; read it only after successful completion.
         let completed = unsafe { self.raw.receive_complete(token, self.rx[slot].bytes()) };
-        self.rx_tokens[slot] = None;
-        let Ok((header, len)) = completed else {
-            self.counts.rx_drops += 1;
-            self.broken = true;
-            self.fail();
-            return None;
-        };
-        let valid = len <= ETH_FRAME_MAX && header <= BUFFER_SIZE && len <= BUFFER_SIZE - header;
-        if valid {
-            // SAFETY: receive_complete returned ownership of this range.
-            out[..len].copy_from_slice(&unsafe { self.rx[slot].bytes() }[header..header + len]);
-            self.counts.received += 1;
-        } else {
-            self.counts.rx_drops += 1;
-        }
-        if self.post_receive(slot).is_err() {
-            self.broken = true;
-            self.fail();
-        }
-        valid.then_some(len)
+        self.finish_receive(slot, completed)
     }
 
-    fn transmit<R>(&mut self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> Result<R, TxError> {
-        if self.broken || self.status.check_ready().is_err() || len > ETH_FRAME_MAX {
+    fn finish_receive(
+        &mut self,
+        slot: usize,
+        completed: virtio_drivers::Result<(usize, usize)>,
+    ) -> Option<RxCompletion> {
+        // virtio-drivers 0.13 dev_raw.rs: receive_complete's IoError is a
+        // short header AFTER pop_used unshares the buffer. Other errors have
+        // not released it, so keep the token for teardown after reset.
+        match &completed {
+            Ok(_) | Err(virtio_drivers::Error::IoError) => {}
+            Err(virtio_drivers::Error::WrongToken) => {
+                self.counts.rx_drops += 1;
+                self.break_down(format_args!("receive_complete slot {slot}: WrongToken"));
+                return None;
+            }
+            // NotReady means the used ring is empty. Keep the posted token.
+            Err(virtio_drivers::Error::NotReady) => return None,
+            Err(_) => {
+                self.fail();
+                return None;
+            }
+        }
+        self.rx_tokens[slot] = None;
+        Some((slot, completed))
+    }
+
+    fn receive_with(
+        &mut self,
+        out: &mut [u8; ETH_FRAME_MAX],
+        mut next: impl FnMut(&mut Self) -> Option<RxCompletion>,
+    ) -> Option<usize> {
+        if !self.usable() {
+            return None;
+        }
+        // A malformed completion must not hide a later valid frame. Bound
+        // the work even if hardware keeps filling the reposted buffers.
+        for _ in 0..QUEUE_SIZE {
+            let (slot, completed) = next(self)?;
+            let valid = completed
+                .ok()
+                .filter(|&(header, len)| len <= ETH_FRAME_MAX && header <= BUFFER_SIZE && len <= BUFFER_SIZE - header);
+            if let Some((header, len)) = valid {
+                // SAFETY: next returned an unshared, completed RX buffer.
+                out[..len].copy_from_slice(&unsafe { self.rx[slot].bytes() }[header..header + len]);
+                self.counts.received += 1;
+            } else {
+                self.counts.rx_drops += 1;
+            }
+            if let Err(error) = self.post_receive(slot) {
+                self.break_down(format_args!("RX repost slot {slot}: {error:?}"));
+                return valid.map(|(_, len)| len);
+            }
+            if let Some((_, len)) = valid {
+                return Some(len);
+            }
+        }
+        None
+    }
+
+    // Separate from the debug assertion so ktests can exercise the release
+    // rejection path without deliberately panicking the kernel.
+    fn transmit_frame<R>(&mut self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> Result<R, TxError> {
+        if len > ETH_FRAME_MAX {
             self.counts.tx_drops += 1;
-            self.fail();
+            // TxError has no caller-error variant. DeviceFailed reports the
+            // rejection, but a bad length must not change health or warnings.
+            return Err(TxError::DeviceFailed);
+        }
+        if !self.usable() {
+            self.counts.tx_drops += 1;
             return Err(TxError::DeviceFailed);
         }
         let Some(slot) = self.tx_pending.iter().position(Option::is_none) else {
@@ -237,12 +345,14 @@ impl NetDevice for VirtioNetDevice {
             Ok(token) => {
                 self.tx_pending[slot] = Some((token, size));
                 self.counts.transmitted += 1;
-                self.failed = false;
+                self.health = Health::Up;
+                self.warned = false;
                 Ok(result)
             }
             Err(virtio_drivers::Error::QueueFull) => {
                 self.counts.tx_drops += 1;
-                Err(TxError::Full)
+                self.break_down(format_args!("transmit_begin QueueFull with free slot {slot}"));
+                Err(TxError::DeviceFailed)
             }
             Err(_) => {
                 self.counts.tx_drops += 1;
@@ -252,26 +362,58 @@ impl NetDevice for VirtioNetDevice {
         }
     }
 
+    fn post_receive(&mut self, slot: usize) -> virtio_drivers::Result<()> {
+        // SAFETY: this slot is fresh or completed; the allocation stays at
+        // this address until completion or the raw device resets on drop.
+        let token = unsafe { self.raw.receive_begin(self.rx[slot].bytes()) }?;
+        self.rx_tokens[slot] = Some(token);
+        Ok(())
+    }
+}
+
+impl NetDevice for VirtioNetDevice {
+    fn info(&self) -> NetInfo {
+        NetInfo {
+            mac: self.raw.mac_address(),
+            mtu: 1500,
+            link_up: self.health == Health::Up && self.status.check_ready().is_ok(),
+        }
+    }
+
+    fn tx_ready(&self) -> bool {
+        // Raw::can_send requires two descriptors, but we use exactly one.
+        self.health != Health::Broken && self.status.check_ready().is_ok() && self.tx_free() != 0
+    }
+
+    fn receive(&mut self, out: &mut [u8; ETH_FRAME_MAX]) -> Option<usize> {
+        self.receive_with(out, Self::next_receive)
+    }
+
+    fn transmit<R>(&mut self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> Result<R, TxError> {
+        debug_assert!(len <= ETH_FRAME_MAX, "oversized Ethernet frame");
+        self.transmit_frame(len, f)
+    }
+
     fn reclaim(&mut self) -> usize {
-        if self.broken || self.status.check_ready().is_err() {
+        if !self.usable() {
             return 0;
         }
         let mut reclaimed = 0;
         // Bounded even if the device misbehaves. No new sends in this call.
+        // Committed frames already count in transmitted. A completion error
+        // cannot tell us whether they reached the wire, so neither error
+        // branch counts them again as drops.
         for _ in 0..QUEUE_SIZE {
             let Some(token) = self.raw.poll_transmit() else { break };
             let Some(slot) = self.tx_pending.iter().position(|p| p.is_some_and(|(t, _)| t == token)) else {
-                self.broken = true;
-                self.fail();
+                self.break_down(format_args!("unknown TX token {token}"));
                 break;
             };
             let (_, size) = self.tx_pending[slot].expect("found token");
             // SAFETY: this completed token owns this exact address and
             // length, unchanged since transmit_begin.
-            if unsafe { self.raw.transmit_complete(token, &self.tx[slot].bytes()[..size]) }.is_err() {
-                self.counts.tx_drops += 1;
-                self.broken = true;
-                self.fail();
+            if let Err(error) = unsafe { self.raw.transmit_complete(token, &self.tx[slot].bytes()[..size]) } {
+                self.break_down(format_args!("transmit_complete token {token}: {error:?}"));
                 break;
             }
             self.tx_pending[slot] = None;
@@ -322,10 +464,18 @@ fn arp_reply(frame: &[u8], mac: [u8; 6]) -> Option<[u8; 6]> {
         .then_some(source_hardware_addr.0)
 }
 
-fn selftest(device: &mut VirtioNetDevice) -> Result<[u8; 6], &'static str> {
+const NO_REPLY: &str = "no ARP reply from 10.0.2.2";
+
+fn mac_text([a, b, c, d, e, f]: [u8; 6]) -> String {
+    alloc::format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+}
+
+fn selftest(device: &mut VirtioNetDevice) -> Result<[u8; 6], String> {
     let mac = device.info().mac;
     device.reclaim();
-    device.transmit(ARP_FRAME_LEN, |out| arp_request(out, mac)).map_err(|_| "transmit failed")?;
+    device
+        .transmit(ARP_FRAME_LEN, |out| arp_request(out, mac))
+        .map_err(|error| alloc::format!("transmit failed: {error:?}"))?;
     let mut reply = None;
     let mut frame = [0; ETH_FRAME_MAX];
     let status = device.status;
@@ -339,10 +489,16 @@ fn selftest(device: &mut VirtioNetDevice) -> Result<[u8; 6], &'static str> {
                     return true;
                 }
             }
-            false
+            !device.info().link_up
         })
-        .map_err(|_| "no ARP reply from 10.0.2.2")?;
-    reply.ok_or("no ARP reply from 10.0.2.2")
+        .map_err(|error| alloc::format!("{NO_REPLY}: {error}"))?;
+    if !device.info().link_up {
+        return Err(match device.status.check_ready() {
+            Err(error) => alloc::format!("{NO_REPLY}: link down ({error})"),
+            Ok(()) => alloc::format!("{NO_REPLY}: link down ({:?})", device.health),
+        });
+    }
+    reply.ok_or_else(|| NO_REPLY.into())
 }
 
 /// B2's device status and direct ARP selftest; shell output is written only
@@ -362,11 +518,8 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
         let result = selftest(device);
         drop(guard);
         match result {
-            Ok([a, b, c, d, e, f]) => {
-                let _ = writeln!(
-                    ctx.out,
-                    "net selftest: ARP reply 10.0.2.2 is {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}"
-                );
+            Ok(mac) => {
+                let _ = writeln!(ctx.out, "net selftest: ARP reply 10.0.2.2 is {}", mac_text(mac));
             }
             Err(why) => ctx.fail(alloc::format!("net selftest: {why}")),
         }
@@ -377,10 +530,9 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
     let counts = device.counts();
     let free = device.tx_free();
     drop(guard);
-    let [a, b, c, d, e, f] = info.mac;
+    let mac = mac_text(info.mac);
     let link = if info.link_up { "up" } else { "down" };
-    let _ =
-        writeln!(ctx.out, "net: mac {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}, link {link}, mtu {}", info.mtu);
+    let _ = writeln!(ctx.out, "net: mac {mac}, link {link}, mtu {}", info.mtu);
     let _ = writeln!(
         ctx.out,
         "net: rx {}, tx {}, rx_drops {}, tx_drops {}, tx_free {free}/{QUEUE_SIZE}, reclaimed {}, irqs {}",
@@ -393,6 +545,17 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
     );
 }
 
+#[cfg(feature = "ktest")]
+fn drain_tx(dev: &mut VirtioNetDevice) -> Result<(), &'static str> {
+    let status = dev.status;
+    status
+        .wait_for(&BELL, SELFTEST_TIMEOUT_NS, || {
+            dev.reclaim();
+            dev.tx_free() == QUEUE_SIZE
+        })
+        .map_err(|_| "TX did not complete")
+}
+
 crate::ktest!(
     fn virtio_net_fills_and_reclaims_all_slots_without_dma_allocation() {
         use crate::{kassert, kassert_eq};
@@ -400,7 +563,6 @@ crate::ktest!(
         let dev = guard.as_mut().ok_or("no net device")?;
         let mac = dev.info().mac;
         let runs = virtio::outstanding_runs();
-        let status = dev.status;
         let start = dev.counts();
         for _ in 0..2 {
             for _ in 0..QUEUE_SIZE {
@@ -413,12 +575,7 @@ crate::ktest!(
             let mut called = false;
             kassert_eq!(dev.transmit(ARP_FRAME_LEN, |_| called = true), Err(TxError::Full));
             kassert!(!called && dev.info().link_up);
-            status
-                .wait_for(&BELL, SELFTEST_TIMEOUT_NS, || {
-                    dev.reclaim();
-                    dev.tx_free() == QUEUE_SIZE
-                })
-                .map_err(|_| "TX did not complete")?;
+            drain_tx(dev)?;
             kassert!(dev.tx_ready());
         }
         kassert_eq!(dev.counts().transmitted - start.transmitted, 32);
@@ -455,17 +612,115 @@ crate::ktest!(
         dev.reclaim();
         dev.transmit(ARP_FRAME_LEN, |out| arp_request(out, mac)).map_err(|_| "recovery send failed")?;
         kassert!(dev.info().link_up);
-        actual
-            .wait_for(&BELL, SELFTEST_TIMEOUT_NS, || {
-                dev.reclaim();
-                dev.tx_free() == QUEUE_SIZE
-            })
-            .map_err(|_| "recovery TX did not complete")?;
+        drain_tx(dev)?;
+        kassert!(!dev.warned);
+        // Each entry point independently detects a new outage. A repeated
+        // call in that outage stays quiet; a successful TX resets the latch.
+        for receive in [true, false] {
+            dev.status = StatusHandle::ktest_reading(&FAILED, None);
+            let mut out = [0; ETH_FRAME_MAX];
+            let no_progress = if receive {
+                dev.receive(&mut out).is_none() && dev.receive(&mut out).is_none()
+            } else {
+                dev.reclaim() == 0 && dev.reclaim() == 0
+            };
+            let failed = dev.health;
+            dev.status = actual;
+            kassert!(no_progress);
+            kassert_eq!(failed, Health::Failed);
+            kassert_eq!(dev.counts().tx_drops - start.tx_drops, 2);
+            dev.transmit(ARP_FRAME_LEN, |out| arp_request(out, mac)).map_err(|_| "recovery send failed")?;
+            kassert!(dev.info().link_up && !dev.warned);
+            drain_tx(dev)?;
+        }
         drop(guard);
         let mut log = alloc::vec![0; crate::klog::RING_BYTES];
         let (len, _) = crate::klog::copy_recent(&mut log);
         let log = core::str::from_utf8(&log[..len]).map_err(|_| "invalid log")?;
-        kassert_eq!(log.matches("WARN  net: virtio-net device failed; link down (said once)\n").count(), 1);
+        kassert_eq!(log.matches("WARN  net: virtio-net device failed; link down (once per outage)\n").count(), 3);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn virtio_net_oversized_transmit_preserves_health() {
+        use crate::{kassert, kassert_eq};
+        let mut guard = DEVICE.lock();
+        let dev = guard.as_mut().ok_or("no net device")?;
+        let start = dev.counts();
+        let health = dev.health;
+        let warned = dev.warned;
+        let free = dev.tx_free();
+        let mut called = false;
+        // Exercise the runtime guard below transmit's debug assertion.
+        kassert_eq!(dev.transmit_frame(ETH_FRAME_MAX + 1, |_| called = true), Err(TxError::DeviceFailed));
+        kassert!(!called);
+        kassert_eq!(dev.health, health);
+        kassert_eq!(dev.warned, warned);
+        kassert_eq!(dev.tx_free(), free);
+        kassert_eq!(dev.counts().transmitted, start.transmitted);
+        kassert_eq!(dev.counts().tx_drops, start.tx_drops + 1);
+        kassert!(dev.info().link_up);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn virtio_net_receive_skips_bad_completions_and_reposts() {
+        use crate::{kassert, kassert_eq};
+        let mut guard = DEVICE.lock();
+        let dev = guard.as_mut().ok_or("no net device")?;
+        drain_tx(dev)?;
+        let mac = dev.info().mac;
+        let mut out = [0; ETH_FRAME_MAX];
+        while dev.receive(&mut out).is_some() {}
+        for bad in [
+            Ok((12, ETH_FRAME_MAX + 1)),
+            Ok((BUFFER_SIZE + 1, 0)),
+            Ok((BUFFER_SIZE - 1, 2)),
+            Err(virtio_drivers::Error::IoError),
+        ] {
+            // Get two real completed, unshared RX buffers. Only the returned
+            // metadata is seamed; no posted DMA or ring contents are modified.
+            for _ in 0..2 {
+                dev.transmit(ARP_FRAME_LEN, |out| arp_request(out, mac)).map_err(|_| "send failed")?;
+            }
+            let mut completed = [None, None];
+            let mut count = 0;
+            let status = dev.status;
+            status
+                .wait_for(&BELL, SELFTEST_TIMEOUT_NS, || {
+                    while count < completed.len() {
+                        let Some(next) = dev.next_receive() else { break };
+                        completed[count] = Some(next);
+                        count += 1;
+                    }
+                    count == completed.len()
+                })
+                .map_err(|_| "RX did not complete")?;
+            let (first_slot, _) = completed[0].take().ok_or("first RX missing")?;
+            let (second_slot, good) = completed[1].take().ok_or("second RX missing")?;
+            let (header, len) = good.map_err(|_| "good RX failed")?;
+            let mut expected = [0; ETH_FRAME_MAX];
+            // SAFETY: next_receive completed and unshared this RX slot.
+            expected[..len].copy_from_slice(&unsafe { dev.rx[second_slot].bytes() }[header..header + len]);
+            let start = dev.counts();
+            let mut script = [(first_slot, bad), (second_slot, Ok((header, len)))].into_iter();
+            kassert_eq!(
+                dev.receive_with(&mut out, |dev| {
+                    let (slot, result) = script.next()?;
+                    dev.finish_receive(slot, result)
+                }),
+                Some(len)
+            );
+            kassert!(script.next().is_none());
+            kassert_eq!(&out[..len], &expected[..len]);
+            kassert_eq!(dev.counts().rx_drops, start.rx_drops + 1);
+            kassert_eq!(dev.counts().received, start.received + 1);
+            kassert!(dev.rx_tokens[first_slot].is_some() && dev.rx_tokens[second_slot].is_some());
+            kassert!(dev.info().link_up);
+            drain_tx(dev)?;
+        }
         Ok(())
     }
 );

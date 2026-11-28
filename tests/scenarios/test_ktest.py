@@ -177,7 +177,8 @@ def test_in_kernel_tests_pass(boot):
     # (Counted, in any order: after `ktest::FIRST`, the ktests' order is the
     # linker's.)
     refusals = {
-        r"dma_dealloc\(0x[0-9a-f]+, 0x[0-9a-f]+, 2 pages\) refused: the run there is Dma \{ pages: 3 \}": 1,
+        r"dma_dealloc\(0x[0-9a-f]+, 0x[0-9a-f]+, 2 pages\) refused: the run there is Dma \{ pages: 2, shares: 2 \}": 2,
+        r"dma_dealloc\(0x[0-9a-f]+, 0x[0-9a-f]+, 2 pages\) refused: the run there is Dma \{ pages: 3, shares: 0 \}": 1,
         # Another address inside the run, and the second free.
         r"dma_dealloc\(0x[0-9a-f]+, 0x[0-9a-f]+, 3 pages\) refused: no run is outstanding there": 2,
         r"dma_dealloc\(0x[0-9a-f]+, 0x1, 3 pages\) refused: dma_alloc returned 0x[0-9a-f]+ for it": 1,
