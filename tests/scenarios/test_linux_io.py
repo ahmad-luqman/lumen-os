@@ -358,3 +358,80 @@ def test_eventfd_and_timerfd(boot, tmp_path):
     assert CRASH_BEGIN not in m.output[start:]
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_epoll_edge_and_level_triggered(boot, tmp_path):
+    """M9 B5 ring-3 check of `epoll`: LT, ET and `EPOLLONESHOT`; `epoll_ctl`
+    errors in Linux's order and `EPOLLEXCLUSIVE`; `dup`, `fork` and
+    `/proc/self/fd`'s `anon_inode:[eventpoll]`; nested epoll (five accepted,
+    sixth and cycles `-ELOOP`) and `poll` on an epoll fd; `epoll_wait` and
+    `epoll_pwait2` timeout floors; and `epoll_pwait`'s signal mask both for a
+    signal pending before the call and one sent once the caller is seen
+    blocked."""
+    from lumen_harness.gui import confirmed_keys, type_confirmed
+    from lumen_harness.screen import expect_screen, read_screen
+
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+    start = len(m.output)
+    program = "/usr/local/bin/m9_io"
+
+    # Keep serial at its shell so ps can confirm each infinite waiter is
+    # blocked before its producer is released on the VT.
+    confirmed_keys(m, ["alt", "f2"])
+    type_confirmed(m, "clear\n")
+    expect_screen(m, r"\Alumen>\s*\Z")
+    type_confirmed(m, f"linux {program} epoll\n")
+
+    def blocked(pid):
+        for _ in range(ATTEMPTS):
+            ps_out = run(m, "ps")
+            if re.search(rf"^\s*{pid}\s+\d+\s+{pid}\s+blocked\s", ps_out, re.MULTILINE):
+                return
+        raise AssertionError(f"epoll waiter {pid} never blocked: {ps_out}")
+
+    for check in (
+        "lt_et_and_oneshot",
+        "epoll_ctl_errors_and_exclusive",
+        "dup_fork_and_proc_fd",
+        "nested_epoll_and_poll",
+        "timeouts_and_pwait_pending",
+        "pwait_restores_mask_on_success",
+    ):
+        tag = {"dup_fork_and_proc_fd": "fork", "nested_epoll_and_poll": "nested"}.get(check)
+        if tag:
+            ready = expect_screen(
+                m, rf"^(?:epoll-wake: pid=(\d+) {tag}-ready|(FAIL {check}[^\n]*))$", 60
+            )
+            assert ready.group(1), ready.group(2)
+            blocked(int(ready.group(1)))
+            type_confirmed(m, "w\n")
+        result = expect_screen(m, rf"^(ok|FAIL) {check}[^\n]*$", 60)
+        assert result.group(1) == "ok", result.group(0)
+    expect_screen(m, rf"linux: {re.escape(program)} exit=0", 30)
+
+    # Confirm a signal sent ONCE the caller is observed blocked in `epoll_pwait`
+    # interrupts it with `-EINTR` (even with `SA_RESTART`), delivers the
+    # handler under the temporary mask, and restores the original mask.
+    confirmed_keys(m, ["alt", "f2"])
+    type_confirmed(m, "clear\n")
+    expect_screen(m, r"\Alumen>\s*\Z")
+    type_confirmed(m, f"linux {program} epoll-pwait-blocked\n")
+    ready = expect_screen(m, r"^epoll-pwait: pid=(\d+) ready$", 30)
+    pid = int(ready.group(1))
+
+    blocked(pid)
+
+    # The waiter is already confirmed blocked. Send once, then wait for the
+    # handler and return on the VT; do not substitute repeated signals for a wake.
+    sent = run(m, f"linux {program} send-sig {pid} 10", 30)
+    assert "ok send_sig" in sent, sent
+    result = expect_screen(m, r"^(ok|FAIL) epoll_pwait_blocked_signal[^\n]*$", 30)
+    assert result.group(1) == "ok", result.group(0)
+    screen = read_screen(m).text
+    assert "FAIL" not in screen, screen
+    expect_screen(m, rf"linux: {re.escape(program)} exit=0", 30)
+
+    assert CRASH_BEGIN not in m.output[start:]
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

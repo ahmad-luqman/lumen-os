@@ -16,7 +16,7 @@ use alloc::collections::LinkedList;
 use alloc::sync::{Arc, Weak};
 use core::fmt;
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::fd::{LockFamily, VfsLock};
 use crate::types::AccessMode;
@@ -141,12 +141,145 @@ impl Not for PollMask {
     }
 }
 
-/// Callback invoked by [`PollHead::notify`] when a source's readiness may have changed.
+/// Callback invoked by [`PollHead::notify`] when a source's readiness may have
+/// changed.
 pub trait PollWaker: Send + Sync {
     /// Called under the source's `PollHead` lock with the bits that may have
-    /// turned on. May only set atomics and wake a thread (or, M9, queue an
-    /// epoll entry under a leaf lock); never allocates or blocks.
-    fn wake(&self, ready: PollMask);
+    /// turned on. May only set atomics, wake a thread, queue an epoll entry
+    /// under a leaf lock, and push onto `defer`; never allocates, blocks, or
+    /// takes another `PollHead`'s lock.
+    fn wake(&self, ready: PollMask, defer: &mut PollDefer);
+}
+
+/// Work left by a [`PollWaker`] to run after the notifying source's
+/// [`PollHead`] subscriber lock is released (ARCHITECTURE section 10).
+///
+/// Each entry owns its intrusive link (typically via an embedded
+/// [`DeferSlot`]) so queuing onto a [`PollDefer`] never allocates and never
+/// queues the same entry twice.
+pub trait PollDeferred: Send + Sync {
+    /// The entry's stable, dedicated link. Only [`DeferSlot`] implements
+    /// [`DeferLink`]; callers cannot implement their own link operations.
+    /// Every call must return the same slot, owned exclusively by this entry;
+    /// distinct entries must never share a slot.
+    fn link(&self) -> &dyn DeferLink;
+
+    /// Run after the source's subscriber lock is released and the link's
+    /// queued flag is cleared, permitting another wake to queue this entry.
+    fn run(&self);
+}
+
+mod sealed {
+    use super::*;
+
+    pub trait LinkOps: Send + Sync {
+        fn queued(&self) -> &AtomicBool;
+        fn swap_next(&self, next: Option<Arc<dyn PollDeferred>>) -> Option<Arc<dyn PollDeferred>>;
+    }
+}
+
+/// Sealed intrusive link for deferred notifications, implemented only by
+/// [`DeferSlot`]. Link mutation belongs to [`PollDefer`].
+pub trait DeferLink: sealed::LinkOps {}
+
+/// Reusable intrusive link embedded by a [`PollDeferred`] implementation.
+///
+/// Guards the next pointer behind `F`'s level-10e leaf lock (never held
+/// alongside an epoll `ReadyQueue` lock).
+pub struct DeferSlot<F: LockFamily> {
+    queued: AtomicBool,
+    next: F::LeafLock<Option<Arc<dyn PollDeferred>>>,
+}
+
+impl<F: LockFamily> DeferSlot<F> {
+    /// Create an unqueued, unlinked deferred slot.
+    pub fn new() -> Self {
+        Self { queued: AtomicBool::new(false), next: F::LeafLock::new(None) }
+    }
+}
+
+impl<F: LockFamily> sealed::LinkOps for DeferSlot<F> {
+    fn queued(&self) -> &AtomicBool {
+        &self.queued
+    }
+
+    fn swap_next(&self, next: Option<Arc<dyn PollDeferred>>) -> Option<Arc<dyn PollDeferred>> {
+        core::mem::replace(&mut *self.next.lock(), next)
+    }
+}
+
+impl<F: LockFamily> DeferLink for DeferSlot<F> {}
+
+impl<F: LockFamily> Default for DeferSlot<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: LockFamily> fmt::Debug for DeferSlot<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeferSlot").field("queued", &self.queued.load(Ordering::Relaxed)).finish()
+    }
+}
+
+/// Stack-local intrusive queue of [`PollDeferred`] entries built during
+/// [`PollHead::notify`] under the source's subscriber lock and drained after
+/// that lock is released (ARCHITECTURE section 10). On drop, any undrained
+/// entries are unlinked and their queued flags cleared without running
+/// callbacks: unwinding may still hold the source lock. Normal notify drains
+/// explicitly after unlocking.
+pub struct PollDefer {
+    head: Option<Arc<dyn PollDeferred>>,
+}
+
+impl PollDefer {
+    /// Create an empty deferred queue.
+    pub(crate) const fn new() -> Self {
+        Self { head: None }
+    }
+
+    /// Push `entry` onto this deferred queue if it is not already queued on any
+    /// [`PollDefer`]. Performs zero heap allocations and never drops an `Arc`
+    /// under the caller's lock.
+    ///
+    /// Callers must update any state that [`PollDeferred::run`] observes (such
+    /// as an epoll `ReadyQueue`) before calling `push`, and release that lock
+    /// before calling `push`.
+    pub fn push<T: PollDeferred + 'static>(&mut self, entry: &Arc<T>) {
+        if entry.link().queued().compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            let arc: Arc<dyn PollDeferred> = Arc::clone(entry) as Arc<dyn PollDeferred>;
+            let prev = self.head.take();
+            let old = entry.link().swap_next(prev);
+            debug_assert!(old.is_none(), "PollDeferred entry linked while queued was false");
+            self.head = Some(arc);
+        }
+    }
+
+    /// Unlink each queued entry, clear its `queued` flag, and invoke
+    /// [`PollDeferred::run`] in order. Must be called only after the source's
+    /// [`PollHead`] subscriber lock is released.
+    pub(crate) fn drain(&mut self) {
+        while let Some(entry) = self.head.take() {
+            self.head = entry.link().swap_next(None);
+            // Clear `queued` with SeqCst before `run()` so any concurrent wake
+            // that observed `queued == true` happened-before this clear and is
+            // covered by `run()`, while any wake after this clear re-queues.
+            entry.link().queued().store(false, Ordering::SeqCst);
+            entry.run();
+        }
+    }
+}
+
+// An unwinding notify discards pending work: unlink and clear flags without
+// running callbacks under a possibly still-held source lock. Normal notify
+// always drains explicitly after unlocking; Drop is cleanup, not delivery.
+impl Drop for PollDefer {
+    fn drop(&mut self) {
+        while let Some(entry) = self.head.take() {
+            self.head = entry.link().swap_next(None);
+            entry.link().queued().store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Readiness source implemented by pipes, FIFOs, terminals, and future async
@@ -262,20 +395,33 @@ impl<F: LockFamily> PollHead<F> {
     }
 
     /// Notify every current subscriber that the bits in `ready` may have
-    /// turned on. Does nothing if `ready` is empty.
+    /// turned on, then drain any deferred notifications after releasing the
+    /// subscriber lock. Does nothing if `ready` is empty.
     pub fn notify(&self, ready: PollMask) {
         if ready.is_empty() {
             return;
         }
-        let list = self.inner.subscribers.lock();
-        for sub in list.iter() {
-            sub.waker.wake(ready);
+        let mut defer = PollDefer::new();
+        {
+            let list = self.inner.subscribers.lock();
+            for sub in list.iter() {
+                sub.waker.wake(ready, &mut defer);
+            }
         }
+        defer.drain();
     }
 
     /// Number of active subscribers currently registered on this head.
     pub fn subscriber_count(&self) -> usize {
         self.inner.subscribers.lock().len()
+    }
+
+    /// Try-lock the subscriber list without blocking, returning its current
+    /// length if the lock was free or `None` if it is currently held.
+    /// Diagnostic/test-only: production must never treat `None` as permission
+    /// to skip a required notification or readiness check.
+    pub fn try_subscriber_count(&self) -> Option<usize> {
+        self.inner.subscribers.try_lock().map(|list| list.len())
     }
 }
 
@@ -290,8 +436,8 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize};
-    use std::sync::{Condvar, Mutex};
+    use core::sync::atomic::{AtomicU16, AtomicUsize};
+    use std::sync::{Barrier, Condvar, Mutex};
     use std::thread;
 
     struct HostMutex<T>(Mutex<T>);
@@ -308,6 +454,10 @@ mod tests {
 
         fn lock(&self) -> Self::Guard<'_> {
             self.0.lock().unwrap()
+        }
+
+        fn try_lock(&self) -> Option<Self::Guard<'_>> {
+            self.0.try_lock().ok()
         }
 
         fn get_mut(&mut self) -> &mut T {
@@ -334,7 +484,7 @@ mod tests {
     }
 
     impl PollWaker for RecordingWaker {
-        fn wake(&self, ready: PollMask) {
+        fn wake(&self, ready: PollMask, _defer: &mut PollDefer) {
             self.last_mask.store(ready.bits(), Ordering::SeqCst);
             self.wakes.fetch_add(1, Ordering::SeqCst);
         }
@@ -497,7 +647,7 @@ mod tests {
         }
 
         impl PollWaker for CondWaker {
-            fn wake(&self, _ready: PollMask) {
+            fn wake(&self, _ready: PollMask, _defer: &mut PollDefer) {
                 let _g = self.lock.lock().unwrap();
                 self.fired.store(true, Ordering::SeqCst);
                 self.cv.notify_one();
@@ -548,5 +698,221 @@ mod tests {
 
         producer.join().unwrap();
         assert_eq!(src.head.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn poll_defer_runs_once_after_subscriber_lock_is_released() {
+        struct Entry {
+            slot: DeferSlot<HostLocks>,
+            source_head: PollHead<HostLocks>,
+            runs: AtomicUsize,
+            lock_was_free: AtomicBool,
+            downstream: Option<PollHead<HostLocks>>,
+        }
+
+        impl PollDeferred for Entry {
+            fn link(&self) -> &dyn DeferLink {
+                &self.slot
+            }
+
+            fn run(&self) {
+                // Source's subscriber lock must already be released when `run()` executes.
+                let free = self.source_head.try_subscriber_count().is_some();
+                self.lock_was_free.store(free, Ordering::SeqCst);
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                if let Some(ds) = &self.downstream {
+                    ds.notify(PollMask::IN);
+                }
+            }
+        }
+
+        struct DeferWaker {
+            entry: Arc<Entry>,
+            wakes: AtomicUsize,
+        }
+
+        impl PollWaker for DeferWaker {
+            fn wake(&self, _ready: PollMask, defer: &mut PollDefer) {
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+                defer.push(&self.entry);
+            }
+        }
+
+        let head: PollHead<HostLocks> = PollHead::new();
+        let outer_head: PollHead<HostLocks> = PollHead::new();
+        let outer_entry = Arc::new(Entry {
+            slot: DeferSlot::new(),
+            source_head: outer_head.clone(),
+            runs: AtomicUsize::new(0),
+            lock_was_free: AtomicBool::new(false),
+            downstream: None,
+        });
+        let inner_entry = Arc::new(Entry {
+            slot: DeferSlot::new(),
+            source_head: head.clone(),
+            runs: AtomicUsize::new(0),
+            lock_was_free: AtomicBool::new(false),
+            downstream: Some(outer_head.clone()),
+        });
+
+        let w1 = Arc::new(DeferWaker { entry: Arc::clone(&inner_entry), wakes: AtomicUsize::new(0) });
+        let w2 = Arc::new(DeferWaker { entry: Arc::clone(&inner_entry), wakes: AtomicUsize::new(0) });
+        let w_outer = Arc::new(DeferWaker { entry: Arc::clone(&outer_entry), wakes: AtomicUsize::new(0) });
+
+        // Two subscribers on the same source push the same deferred entry:
+        // it must run exactly once, after the subscriber lock is released,
+        // and its nested notify must unwind outer_entry after outer_head unlocks.
+        let _g1 = head.subscribe(Arc::clone(&w1) as Arc<dyn PollWaker>);
+        let _g2 = head.subscribe(Arc::clone(&w2) as Arc<dyn PollWaker>);
+        let _g_outer = outer_head.subscribe(Arc::clone(&w_outer) as Arc<dyn PollWaker>);
+
+        head.notify(PollMask::IN);
+        assert_eq!(w1.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(w2.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(inner_entry.runs.load(Ordering::SeqCst), 1);
+        assert!(inner_entry.lock_was_free.load(Ordering::SeqCst));
+        assert_eq!(w_outer.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(outer_entry.runs.load(Ordering::SeqCst), 1);
+        assert!(outer_entry.lock_was_free.load(Ordering::SeqCst));
+
+        // `queued` must be cleared so a subsequent notify runs again.
+        head.notify(PollMask::OUT);
+        assert_eq!(inner_entry.runs.load(Ordering::SeqCst), 2);
+        assert_eq!(outer_entry.runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn poll_defer_racing_notifies_run_after_both_wakes() {
+        // Two independent sources concurrently notify wakers that update their
+        // own state counters and race to queue the same PollDeferred entry.
+        // After both `notify` calls return in every round, `run()` must have
+        // observed both updates (at least one run strictly after both wakes).
+        struct SharedEntry {
+            slot: DeferSlot<HostLocks>,
+            state_a: AtomicUsize,
+            state_b: AtomicUsize,
+            seen_a: AtomicUsize,
+            seen_b: AtomicUsize,
+            runs: AtomicUsize,
+        }
+
+        impl PollDeferred for SharedEntry {
+            fn link(&self) -> &dyn DeferLink {
+                &self.slot
+            }
+
+            fn run(&self) {
+                let a = self.state_a.load(Ordering::SeqCst);
+                let b = self.state_b.load(Ordering::SeqCst);
+                self.seen_a.fetch_max(a, Ordering::SeqCst);
+                self.seen_b.fetch_max(b, Ordering::SeqCst);
+                self.runs.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct SideWaker {
+            entry: Arc<SharedEntry>,
+            is_a: bool,
+            round: Arc<AtomicUsize>,
+        }
+
+        impl PollWaker for SideWaker {
+            fn wake(&self, _ready: PollMask, defer: &mut PollDefer) {
+                let r = self.round.load(Ordering::SeqCst);
+                if self.is_a {
+                    self.entry.state_a.store(r, Ordering::SeqCst);
+                } else {
+                    self.entry.state_b.store(r, Ordering::SeqCst);
+                }
+                defer.push(&self.entry);
+            }
+        }
+
+        const ROUNDS: usize = 4000;
+        let head_a: PollHead<HostLocks> = PollHead::new();
+        let head_b: PollHead<HostLocks> = PollHead::new();
+        let entry = Arc::new(SharedEntry {
+            slot: DeferSlot::new(),
+            state_a: AtomicUsize::new(0),
+            state_b: AtomicUsize::new(0),
+            seen_a: AtomicUsize::new(0),
+            seen_b: AtomicUsize::new(0),
+            runs: AtomicUsize::new(0),
+        });
+        let round = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+
+        let wa = Arc::new(SideWaker { entry: Arc::clone(&entry), is_a: true, round: Arc::clone(&round) });
+        let wb = Arc::new(SideWaker { entry: Arc::clone(&entry), is_a: false, round: Arc::clone(&round) });
+        let _ga = head_a.subscribe(wa as Arc<dyn PollWaker>);
+        let _gb = head_b.subscribe(wb as Arc<dyn PollWaker>);
+
+        let head_b_t = head_b.clone();
+        let start_t = Arc::clone(&start);
+        let done_t = Arc::clone(&done);
+        let worker = thread::spawn(move || {
+            for _ in 1..=ROUNDS {
+                start_t.wait();
+                head_b_t.notify(PollMask::IN);
+                done_t.wait();
+            }
+        });
+
+        for r in 1..=ROUNDS {
+            round.store(r, Ordering::SeqCst);
+            start.wait();
+            head_a.notify(PollMask::IN);
+            done.wait();
+            assert_eq!(entry.seen_a.load(Ordering::SeqCst), r, "round {r}: missed wake A");
+            assert_eq!(entry.seen_b.load(Ordering::SeqCst), r, "round {r}: missed wake B");
+        }
+
+        worker.join().unwrap();
+        assert!(entry.runs.load(Ordering::SeqCst) >= ROUNDS);
+        assert!(!entry.slot.queued.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn poll_defer_requeues_during_run_after_clear() {
+        struct Entry {
+            slot: DeferSlot<HostLocks>,
+            second: PollHead<HostLocks>,
+            updates: AtomicUsize,
+            seen: Mutex<std::vec::Vec<usize>>,
+        }
+        impl PollDeferred for Entry {
+            fn link(&self) -> &dyn DeferLink {
+                &self.slot
+            }
+            fn run(&self) {
+                let update = self.updates.load(Ordering::SeqCst);
+                self.seen.lock().unwrap().push(update);
+                if update == 1 {
+                    self.second.notify(PollMask::IN);
+                }
+            }
+        }
+        struct Waker(Arc<Entry>);
+        impl PollWaker for Waker {
+            fn wake(&self, _: PollMask, defer: &mut PollDefer) {
+                self.0.updates.fetch_add(1, Ordering::SeqCst);
+                defer.push(&self.0);
+            }
+        }
+        let first = PollHead::<HostLocks>::new();
+        let second = PollHead::<HostLocks>::new();
+        let entry = Arc::new(Entry {
+            slot: DeferSlot::new(),
+            second: second.clone(),
+            updates: AtomicUsize::new(0),
+            seen: Mutex::new(std::vec::Vec::new()),
+        });
+        let waker: Arc<dyn PollWaker> = Arc::new(Waker(entry.clone()));
+        let _a = first.subscribe(waker.clone());
+        let _b = second.subscribe(waker);
+        first.notify(PollMask::IN);
+        assert_eq!(entry.updates.load(Ordering::SeqCst), 2);
+        assert_eq!(*entry.seen.lock().unwrap(), [1, 2]);
+        assert!(!entry.slot.queued.load(Ordering::SeqCst));
     }
 }

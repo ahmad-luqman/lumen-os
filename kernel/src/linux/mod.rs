@@ -6,6 +6,7 @@
 //! Re-exports the UAPI modules so ring-3 syscall and ELF loader modules share
 //! one canonical ABI surface.
 
+pub mod epoll;
 pub mod evfd;
 pub mod exec;
 pub mod futex;

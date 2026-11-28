@@ -126,7 +126,7 @@
 //!    `wake_up(&ep->wq)` — **never** notify `PollHead` subscribers); return
 //!    `Ok(done.reported)`.
 //!
-//! ### Nested-epoll readiness (`__ep_eventpoll_poll` / `ep_read_events_proc`)
+//! ### Nested-epoll readiness (`__ep_eventpoll_poll`)
 //!
 //! When an outer epoll polls an inner epoll file, the inner epoll locks its
 //! `ep->mtx`, sizes its handle buffer to `set.len()`, calls

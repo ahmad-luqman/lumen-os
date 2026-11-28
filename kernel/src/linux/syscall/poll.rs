@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "ktest")]
 use lumen_signal::restart::RestartCode;
 use lumen_signal::{Blocked, SigSet};
-use lumen_vfs::{MAX_FDS, PollGuard, PollMask, PollWaker};
+use lumen_vfs::{MAX_FDS, PollDefer, PollGuard, PollMask, PollWaker};
 
 use super::at::{FromReg, UserPtr, reg};
 use super::fd::current_io;
@@ -86,7 +86,7 @@ const _: () = {
 
 /// How long a readiness syscall may wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WaitTimeout {
+pub(crate) enum WaitTimeout {
     /// Non-blocking single pass (do not subscribe; do not write back remaining time).
     Zero,
     /// Block until monotonic `time::now_ns() >= dl`.
@@ -96,7 +96,7 @@ enum WaitTimeout {
 }
 
 impl WaitTimeout {
-    fn after_ns(dur: u64) -> Self {
+    pub(crate) fn after_ns(dur: u64) -> Self {
         if dur == 0 { Self::Zero } else { Self::Deadline(crate::time::now_ns().saturating_add(dur)) }
     }
 
@@ -129,7 +129,7 @@ impl PollWait {
 }
 
 impl PollWaker for PollWait {
-    fn wake(&self, _ready: PollMask) {
+    fn wake(&self, _ready: PollMask, _defer: &mut PollDefer) {
         self.fired.store(true, Ordering::SeqCst);
         let _ = self.queue.wake_one();
     }
@@ -138,14 +138,72 @@ impl PollWaker for PollWait {
 /// Optional console recheck step for [`wait_ready`]: caps each sleep at
 /// `step_ns` and flags IRQ 4's 100 ms safety-net step.
 #[derive(Clone, Copy)]
-struct ConsoleStep {
+pub(crate) struct ConsoleStep {
     step_ns: u64,
     serial_irq_safety: bool,
 }
 
+impl ConsoleStep {
+    pub(crate) fn for_console(io: ConsoleIo, by_interrupt: bool) -> Option<Self> {
+        match io {
+            ConsoleIo::Capture => None,
+            ConsoleIo::Serial if by_interrupt => Some(Self { step_ns: SERIAL_SAFETY_STEP_NS, serial_irq_safety: true }),
+            ConsoleIo::Serial | ConsoleIo::Vt(_) => Some(Self::REPOLL),
+        }
+    }
+
+    pub(crate) const REPOLL: Self = Self { step_ns: CONSOLE_POLL_STEP_NS, serial_irq_safety: false };
+
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_interval(self) -> (u64, bool) {
+        (self.step_ns, self.serial_irq_safety)
+    }
+
+    /// Choose the shortest required recheck.
+    pub(crate) fn merge(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if a.step_ns <= b.step_ns { a } else { b }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    pub(crate) fn for_file(file: &KernelFile) -> Option<Self> {
+        if file.is_path() {
+            return None;
+        }
+        if let Some(ep) = file.epoll() {
+            return ep.recheck_step();
+        }
+        console_step(file.is_readable() && file.inode().is_tty() && file.tty().is_none())
+    }
+
+    fn for_files<'a>(files: impl Iterator<Item = &'a KernelFile>) -> Option<Self> {
+        files.filter_map(Self::for_file).min_by_key(|step| step.step_ns)
+    }
+
+    pub(crate) fn deadline(step: Option<Self>, deadline: Option<u64>) -> (Option<u64>, bool) {
+        match (deadline, step) {
+            (Some(dl), Some(cs)) => {
+                let cap = crate::time::now_ns().saturating_add(cs.step_ns);
+                (Some(dl.min(cap)), cs.serial_irq_safety && cap < dl)
+            }
+            (None, Some(cs)) => (Some(crate::time::now_ns().saturating_add(cs.step_ns)), cs.serial_irq_safety),
+            (dl, None) => (dl, false),
+        }
+    }
+
+    pub(crate) fn note_ready(step: Option<Self>, last_wait: LastWait, fired: impl Fn() -> bool) {
+        match last_wait {
+            LastWait::SafetyStep => crate::serial_in::note_poll_safety_step(fired),
+            LastWait::Woken if step.is_some_and(|cs| cs.serial_irq_safety) => crate::serial_in::note_poll_woken(),
+            _ => {}
+        }
+    }
+}
+
 /// How the previous `wait_interruptible` in [`wait_ready`] ended.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LastWait {
+pub(crate) enum LastWait {
     None,
     Woken,
     TimedOut,
@@ -162,7 +220,7 @@ enum LastWait {
 /// held, and all guards drop on every exit path.
 fn wait_ready(
     timeout: WaitTimeout,
-    console_step: Option<ConsoleStep>,
+    mut recheck_step: impl FnMut() -> Option<ConsoleStep>,
     mut pass: impl FnMut(Option<&Arc<dyn PollWaker>>, &mut Vec<PollGuard>) -> u64,
 ) -> WaitResult {
     let mut guards = Vec::new();
@@ -178,20 +236,15 @@ fn wait_ready(
     let waiter = PollWait::new();
     let mut subscribe: Option<Arc<dyn PollWaker>> = Some(Arc::clone(&waiter) as Arc<dyn PollWaker>);
     let mut last_wait = LastWait::None;
+    // Subscriptions remain held; recompute timers after every pass so nested
+    // sets can gain or lose guardless targets, and failed peeks can recover.
 
     loop {
         let sub = subscribe.take();
         let ready = pass(sub.as_ref(), &mut guards);
+        let step = recheck_step();
         if ready > 0 {
-            match last_wait {
-                LastWait::SafetyStep => {
-                    crate::serial_in::note_poll_safety_step(|| waiter.fired.load(Ordering::SeqCst));
-                }
-                LastWait::Woken if console_step.is_some_and(|cs| cs.serial_irq_safety) => {
-                    crate::serial_in::note_poll_woken();
-                }
-                _ => {}
-            }
+            ConsoleStep::note_ready(step, last_wait, || waiter.fired.load(Ordering::SeqCst));
             return WaitResult::Ready(ready);
         }
 
@@ -200,14 +253,7 @@ fn wait_ready(
         {
             return WaitResult::TimedOut;
         }
-        let (step_dl, is_safety_step) = match (deadline, console_step) {
-            (Some(dl), Some(cs)) => {
-                let cap = crate::time::now_ns().saturating_add(cs.step_ns);
-                (Some(dl.min(cap)), cs.serial_irq_safety && cap < dl)
-            }
-            (None, Some(cs)) => (Some(crate::time::now_ns().saturating_add(cs.step_ns)), cs.serial_irq_safety),
-            (dl, None) => (dl, false),
-        };
+        let (step_dl, is_safety_step) = ConsoleStep::deadline(step, deadline);
         match waiter.queue.wait_interruptible(step_dl, || waiter.fired.load(Ordering::SeqCst)) {
             sched::Wake::Woken => {
                 // Clear `fired` BEFORE re-polling at the top of the loop so any
@@ -271,20 +317,10 @@ fn console_step(has_readable_tty: bool) -> Option<ConsoleStep> {
     if !has_readable_tty {
         return None;
     }
-    match current_io() {
-        ConsoleIo::Capture => None,
-        ConsoleIo::Serial => {
-            if crate::serial_in::by_interrupt() {
-                Some(ConsoleStep { step_ns: SERIAL_SAFETY_STEP_NS, serial_irq_safety: true })
-            } else {
-                Some(ConsoleStep { step_ns: CONSOLE_POLL_STEP_NS, serial_irq_safety: false })
-            }
-        }
-        ConsoleIo::Vt(_) => Some(ConsoleStep { step_ns: CONSOLE_POLL_STEP_NS, serial_irq_safety: false }),
-    }
+    ConsoleStep::for_console(current_io(), crate::serial_in::by_interrupt())
 }
 
-fn copy_timespec(ptr: UserPtr) -> Result<WaitTimeout, u32> {
+pub(super) fn copy_timespec(ptr: UserPtr) -> Result<WaitTimeout, u32> {
     if ptr.is_null() {
         return Ok(WaitTimeout::Forever);
     }
@@ -345,7 +381,7 @@ fn finish_timed(result: Result<u64, u32>, write_back: impl FnOnce(bool) -> Resul
     }
 }
 
-fn copy_sigmask(sigmask: UserPtr, sigsetsize: u64) -> Result<Option<SigSet>, u32> {
+pub(super) fn copy_sigmask(sigmask: UserPtr, sigsetsize: u64) -> Result<Option<SigSet>, u32> {
     if sigmask.is_null() {
         return Ok(None);
     }
@@ -411,12 +447,9 @@ fn run_poll(fds_ptr: u64, nfds: u32, timeout: WaitTimeout, restartable: bool) ->
 
     let polled_fds: Vec<i32> = entries.iter().map(|e| e.fd).collect();
     let files = process::current_io_files(&polled_fds);
-    let has_readable_tty = entries.iter().zip(&files).any(|(e, file)| {
-        e.fd >= 0 && file.as_ref().is_some_and(|f| f.is_readable() && f.inode().is_tty() && f.tty().is_none())
-    });
-    let step = console_step(has_readable_tty);
+    let recheck_step = || ConsoleStep::for_files(files.iter().flatten().map(|f| &**f));
 
-    let outcome = wait_ready(timeout, step, |waker, guards| {
+    let outcome = wait_ready(timeout, recheck_step, |waker, guards| {
         let mut ready = 0u64;
         for (entry, file) in entries.iter_mut().zip(&files) {
             let revents: u16 = if entry.fd < 0 {
@@ -582,23 +615,19 @@ fn run_select(
 
     let raw_files = process::current_io_files(&wanted_fds);
     let mut entries = Vec::with_capacity(wanted_fds.len());
-    let mut has_readable_tty = false;
     for ((fd, (want_r, want_w, want_x)), file) in wanted_fds.into_iter().zip(flags).zip(raw_files) {
         let Some(file) = file else {
             return Err(errno::EBADF);
         };
-        if want_r && file.is_readable() && file.inode().is_tty() && file.tty().is_none() {
-            has_readable_tty = true;
-        }
         entries.push(SelectEntry { fd: fd as usize, want_r, want_w, want_x, file });
     }
 
-    let step = console_step(has_readable_tty);
+    let recheck_step = || ConsoleStep::for_files(entries.iter().filter(|e| e.want_r).map(|e| &*e.file));
     let mut read_out = vec![0u64; words];
     let mut write_out = vec![0u64; words];
     let mut except_out = vec![0u64; words];
 
-    let outcome = wait_ready(timeout, step, |waker, guards| {
+    let outcome = wait_ready(timeout, recheck_step, |waker, guards| {
         read_out.fill(0);
         write_out.fill(0);
         except_out.fill(0);
@@ -1144,6 +1173,44 @@ crate::ktest!(
             kassert_eq!(sys_poll(fds_va, 1, 0), 1);
             kassert_eq!(read_revents(fds_va, 1)?[0], out_only | PollMask::ERR.bits());
             kassert_eq!(super::fd::sys_close(at::reg(p2[1] as u64)), 0);
+
+            // B5 (#476): epoll file readiness row (empty -> 0, watching a
+            // readable pipe -> POLLIN | POLLRDNORM, drained -> 0).
+            let ep_fd = super::epoll::sys_epoll_create1(0) as i32;
+            kassert!(ep_fd >= 0);
+            write_pollfds(fds_va, &[(ep_fd, all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 1, 0), 0);
+            kassert_eq!(read_revents(fds_va, 1)?[0], 0);
+            kassert_eq!(super::pipe::sys_pipe(UserPtr::from_reg(pipe_fds_va)), 0);
+            // SAFETY: `[i32; 2]` is 8 bytes with no padding.
+            let ep_pipe = unsafe { copy_pod_from_user::<[i32; 2]>(pipe_fds_va) }.map_err(|_| "read ep pipe")?;
+            let ep_ev_va = base + 1584;
+            let mut ep_ev = [0u8; 12];
+            ep_ev[0..4].copy_from_slice(&lumen_epoll::EPOLLIN.to_le_bytes());
+            copy_to_user(ep_ev_va, &ep_ev).map_err(|_| "write epoll_event")?;
+            kassert_eq!(
+                super::epoll::sys_epoll_ctl(
+                    at::reg(ep_fd as u64),
+                    lumen_epoll::EPOLL_CTL_ADD as i32,
+                    at::reg(ep_pipe[0] as u64),
+                    UserPtr::from_reg(ep_ev_va),
+                ),
+                0
+            );
+            write_pollfds(fds_va, &[(ep_fd, all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 1, 0), 0);
+            copy_to_user(base + 1568, b"x").map_err(|_| "write ep pipe")?;
+            kassert_eq!(super::fd::sys_write(at::reg(ep_pipe[1] as u64), UserPtr::from_reg(base + 1568), 1), 1);
+            write_pollfds(fds_va, &[(ep_fd, all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 1, 0), 1);
+            kassert_eq!(read_revents(fds_va, 1)?[0], in_only);
+            kassert_eq!(super::fd::sys_read(at::reg(ep_pipe[0] as u64), UserPtr::from_reg(base + 1568), 1), 1);
+            write_pollfds(fds_va, &[(ep_fd, all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 1, 0), 0);
+            kassert_eq!(read_revents(fds_va, 1)?[0], 0);
+            kassert_eq!(super::fd::sys_close(at::reg(ep_pipe[0] as u64)), 0);
+            kassert_eq!(super::fd::sys_close(at::reg(ep_pipe[1] as u64)), 0);
+            kassert_eq!(super::fd::sys_close(at::reg(ep_fd as u64)), 0);
 
             // `sys_poll` decodes `nfds` from the low 32 bits (upper bits ignored).
             write_pollfds(fds_va, &[(reg_fd.raw(), PollMask::IN.bits())])?;

@@ -19,3 +19,27 @@ tests = [
     "ktest:lumen_kernel::linux::evfd::eventfd_and_timerfd_syscall_edges_and_faults",
     "scenario:test_linux_io::test_eventfd_and_timerfd",
 ]
+
+[[feature]]
+name = "Deferred poll notifications (`PollDefer`, `PollDeferred`, `DeferSlot`) and kernel `epoll` (`epoll_create*`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, nested epoll, description-release teardown; #476, B5)"
+milestone = "M9"
+tests = [
+    "cargo:lumen-epoll",
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::linux::epoll::interest_outlives_a_closed_dup_and_goes_with_the_last",
+    "ktest:lumen_kernel::linux::epoll::nested_notify_is_deferred_past_the_source_lock",
+    "ktest:lumen_kernel::linux::epoll::epoll_ctl_errors_in_linux_order",
+    "ktest:lumen_kernel::linux::epoll::copy_out_fault_unreports_the_rest",
+    "ktest:lumen_kernel::linux::syscall::poll::poll_masks_of_each_file_kind",
+    "scenario:test_linux_io::test_epoll_edge_and_level_triggered",
+    "ktest:lumen_kernel::linux::epoll::guardless_nested_wait_and_poll_return",
+    "ktest:lumen_kernel::linux::epoll::guardless_edges_require_zero_to_ready",
+    "ktest:lumen_kernel::linux::epoll::blocked_epoll_wait_wakes_from_source",
+    "ktest:lumen_kernel::linux::epoll::empty_expired_wait_ignores_fatal_signal",
+    "ktest:lumen_kernel::linux::epoll::allocation_failures_preserve_interests_and_retry",
+    "ktest:lumen_kernel::linux::epoll::maxevents_one_visits_each_ready_source",
+    "ktest:lumen_kernel::linux::epoll::poll_retries_after_peek_allocation_failure",
+    "ktest:lumen_kernel::linux::epoll::poll_discovers_guardless_source_added_while_blocked",
+    "ktest:lumen_kernel::linux::epoll::serial_safety_step_rechecks_without_notification",
+    "ktest:lumen_kernel::linux::epoll::nested_wait_keeps_guard_after_guardless_removal",
+]

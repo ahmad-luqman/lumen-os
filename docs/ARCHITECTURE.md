@@ -5076,8 +5076,9 @@ Lumen runs two kinds of user code:
   `mem` and `proc`; M8's `task`, `signal`, `futex`, `poll`, `pipe`, `timer`
   and `sys`, the clusters listed under "B0's stubs" below, #371, plus
   and `time.rs` (#383) shared by blocking syscalls). M7's and M8's stubs are
-  gone; M9's 32 new rows live as B0's stubs in `syscall/socket.rs`, `epoll.rs`
-  and `evfd.rs` plus C7's in `io.rs`, `mem.rs` and `sys.rs` (including
+  gone; M9's socket handlers are implemented by B1 (#472), and its epoll
+  handlers by B5 (#476). The remaining B0 stubs live in `evfd.rs`
+  plus C7's in `io.rs`, `mem.rs` and `sys.rs` (including
   `sendfile`, moved from M8's `-ENOSYS` list to an M9 stub until C7). Of the
   M8 and M9 tables' decided refusals, `membarrier`, `sendmmsg`, `recvmmsg`,
   `clone3`, `execveat`, `futex_waitv`, the scheduler-policy calls, `signalfd*`
@@ -10340,14 +10341,16 @@ pub trait PollWaker: Send + Sync {
 /// `PollWaker`, so no signature gains a lock family: the entry owns its
 /// link, and lumen-vfs's `DeferSlot<F>` is the helper it embeds.
 pub trait PollDeferred: Send + Sync {
-    fn queued(&self) -> &AtomicBool;
-    fn swap_next(&self, next: Option<Arc<dyn PollDeferred>>) -> Option<Arc<dyn PollDeferred>>;
+    fn link(&self) -> &dyn DeferLink;
     fn run(&self);
 }
+pub trait DeferLink: sealed::LinkOps {} // only DeferSlot implements it
 pub struct DeferSlot<F: LockFamily> { /* queued: AtomicBool, next: F::LeafLock<Option<Arc<dyn PollDeferred>>> */ }
 pub struct PollDefer { /* head: Option<Arc<dyn PollDeferred>> */ }
 // PollHead::notify(PollMask) keeps its signature: it builds a PollDefer,
 // passes it to each waker under its lock, and drains it after releasing.
+// PollDefer::new/drain are crate-private; there is no Default. Drop unlinks
+// discarded work without running callbacks (unwinding may still hold locks).
 pub trait Pollable: Send + Sync {
     /// The readiness of one open description now (`mode`: its access mode,
     /// since a pipe's two ends share one inode and an O_RDWR FIFO answers
@@ -10822,9 +10825,19 @@ crate docs: `EPOLL_CTL_ADD`, `MOD`, `DEL`, description close, instance
 close, two-phase `epoll_wait`, nested readiness) on the readiness
 interface above.
 
-- **The object:** `Epoll { mtx: SleepMutex<EpState>, rq: SpinLock<ReadyQueue>, wq: WaitQueue, poll: KernelPollHead, id: u64, defer: DeferSlot }`.
-  - `EpState` holds the `EpollSet<Key, Interest>` and the reusable handle
-    buffer.
+- **The object:** `Epoll { mtx: SleepMutex<EpState>, rq: SpinLock<ReadyQueue>, wq: WaitQueue, poll: KernelPollHead, id: u64, defer: DeferSlot, wake_seq: AtomicU64, source_seq: AtomicU64, peek_retry: AtomicBool }`.
+  - `EpState` holds the `EpollSet<Key, Interest>`, live handles for rechecks,
+    and reusable scan, polled-mask and event buffers. `prepare_scan` uses
+    `try_reserve` before detaching the ready list in both send and peek.
+    A failed peek reports not ready and sets `peek_retry`, making callers
+    retry on a timer. A failed send returns `ENOMEM` (a deviation: Linux's
+    `epoll_wait` does not allocate scan buffers and never returns `ENOMEM`,
+    v6.12 `fs/eventpoll.c:1817-1906`). A successful peek or send reservation
+    clears `peek_retry`. ADD reserves the live handle vector fallibly before
+    committing an interest.
+  - `recheck_step` derives guardless requirements directly from live
+    `Subscription::Repoll` entries while examining handles under `mtx`;
+    there is no cached guardless count.
   - `mtx` is Linux's `ep->mtx`, section 9's level 00b. `rq` is Linux's
     `ep->lock`, the 10e leaf nested in a `PollHead`'s subscriber lock.
   - An epoll file is an anonymous inode (B0's `anon_inode:[eventpoll]`)
@@ -10836,9 +10849,12 @@ interface above.
 - **Interests are keyed by (description, fd):** `Key = (u64, i32)`, where
   the `u64` is `KernelFile::id()` (`OpenFile::id`, allocated by
   `lumen_vfs::next_open_file_id`).
-  - **The payload:** an `Interest { target, guard: Option<PollGuard>, mode,
-    nested: Option<u64> }`. `target` is a metadata-only reference to the
-    description, not counted in `end_refs`, so an interest never keeps a
+  - **The payload:** an `Interest { target, subscription, last_polled, mode,
+    nested: Option<u64> }`. `subscription` is `Linking`, `Guard` (owning a
+    `PollGuard`), or `Repoll`; `last_polled` remembers the watched mask for
+    guardless edge detection, reset after a successful ET report so a
+    drain/refill between waits cannot lose an event. `target` is a metadata-only
+    reference to the description, not counted in `end_refs`, so an interest never keeps a
     description open.
   - **The waker:** `EpWaker { ep: Arc<Epoll>, handle: Handle }`.
 - **Removal when the description's last reference goes** (Linux's
@@ -10898,7 +10914,25 @@ interface above.
     under them, a concurrent close's hook would wait on this same epoll.
   - A target that returned no guard (no wake source, as the interim
     console's VT path) makes `epoll_wait` re-poll in 5 ms steps, as
-    `poll`'s `console_step`.
+    `poll`'s `ConsoleStep::REPOLL`. `Epoll::poll` always retains its
+    subscription guard when given a waker (Linux v6.12
+    `fs/eventpoll.c:954-955`). Poll/select and outer epolls
+    inspect nested recheck requirements after every pass, so adding a
+    guardless target starts the timer and deleting or closing the last one
+    removes it. ADD notifies existing subscribers when it introduces a
+    recheck requirement, even if its source is empty, so blocked outer
+    waiters update their policy. Guarded sources continue to wake through
+    the retained subscription, including after a failed peek recovers.
+    Every poll, including the scan after a timer probe, updates the remembered
+    watched mask. Guardless ET queues a zero-to-ready transition and resets
+    its remembered mask after reporting: a drain/refill entirely between waits
+    cannot be observed, so unread data may be reported again once per wait.
+    This fallback preserves events that Linux receives through source wakes
+    (`fs/eventpoll.c:1336-1351`). An unchanged LT mask does not manufacture
+    outer ET edges.
+    Matching transitions notify subscribers only after `mtx` is released.
+    An IRQ-4 serial tty uses poll's shared 100 ms `SERIAL_SAFETY_STEP_NS`
+    policy and `note_poll_safety_step` accounting, including through nesting.
   - Linux's `reverse_path_check` (wake-path fan-out limits) isn't
     modelled (a deviation).
 - **Modes:**
@@ -10911,13 +10945,23 @@ interface above.
     `EPOLLEXCLUSIVE_OK_BITS` rule) and every waiter is woken. Wake-one
     isn't modelled (a deviation; correct, only less efficient).
 - **`epoll_wait`, `epoll_pwait`, `epoll_pwait2`:**
-  - **The wait:** B2's `wait_interruptible` on `wq` with the deadline,
-    ready when `ReadyQueue::events_available` holds; then lumen-epoll's two
+  - **The wait:** snapshot `wake_seq` before inspecting
+    `ReadyQueue::events_available`, then use B2's `wait_interruptible` on
+    `wq` with the deadline and predicate `wake_seq != seen`. Every waiter
+    wake increments the sequence before `wq.wake_all()`. The predicate
+    cannot inspect `rq`: level 10e must never be taken under level 10f's
+    wait-queue lock. `source_seq` counts matching source callbacks separately
+    so timer-repoll and scan wakes cannot hide a missing serial IRQ callback
+    in safety-step diagnostics. A change between inspection and blocking
+    advances the sequence, so it cannot be lost. Ready events use lumen-epoll's two
     phases, with each `Pollable::poll` under `mtx` and never under `rq`.
   - **Copy out** happens under `mtx` (Linux's `ep_send_events`). A fault
     at event `i` runs `unreport` on the rest and returns `i`, or
     `-EFAULT` if none was written.
-  - An interrupt is `-EINTR`.
+  - An interrupt is `-EINTR`. An empty zero/expired timeout returns 0
+    before checking signals (Linux v6.12 `fs/eventpoll.c:2010-2011`,
+    `ep_poll`); fatal signals short-circuit event delivery in `send_events`
+    (`fs/eventpoll.c:1830-1831`, `ep_send_events`).
   - **After a scan:** when `finish_scan`, `finish_peek`, `unreport` or
     `abort_scan` report a non-empty ready list, the caller wakes only this
     epoll's own `wq` waiters, **never** the epoll file's `PollHead`
@@ -10938,7 +10982,9 @@ interface above.
   - **The graph:** `EPOLL_LOOPS: SleepMutex<LoopCheck<u64>>` (level 00a)
     holds the epoll-in-epoll edges; `ELOOP` for a cycle or a path longer
     than `EP_MAX_NESTS`, 4 edges, checked downward and upward as Linux
-    v6.17's `ep_loop_check` (lumen-epoll's `LoopCheck`).
+    v6.17's `ep_loop_check` (lumen-epoll's `LoopCheck`): the v6.17 upward
+    check is a deliberate deviation; v6.12 checks downward only
+    (`fs/eventpoll.c:2151-2154`).
   - **Polling an inner epoll:** an epoll file's `Pollable::poll` is
     lumen-epoll's nested protocol (the inner `mtx`, `begin_scan`, each
     interest polled without a waker, `finish_peek`). It returns `POLLIN |
@@ -10957,8 +11003,9 @@ interface above.
 - **Tested by** `cargo:lumen-epoll` (#461), `cargo:lumen-vfs`
   (`PollDefer`: a deferred entry runs once after the subscriber lock is
   released; two notifies racing to queue one entry run it at least once
-  after both wakes), `poll_masks_of_each_file_kind` (B5 adds an epoll
-  file's row), and these ktests:
+  after both wakes; a deterministic second notification during `run` queues
+  the same entry again and observes the update), `poll_masks_of_each_file_kind`
+  (B5 adds an epoll file's row), and these ktests:
   - `ktest:lumen_kernel::linux::epoll::interest_outlives_a_closed_dup_and_goes_with_the_last`;
   - `ktest:lumen_kernel::linux::epoll::nested_notify_is_deferred_past_the_source_lock`
     (a waker that try-locks the source's `PollHead` from the deferred run
@@ -10966,6 +11013,16 @@ interface above.
     and the ktest's assertion fails, with no hang);
   - `ktest:lumen_kernel::linux::epoll::epoll_ctl_errors_in_linux_order`;
   - `ktest:lumen_kernel::linux::epoll::copy_out_fault_unreports_the_rest`;
+  - `ktest:lumen_kernel::linux::epoll::guardless_nested_wait_and_poll_return`;
+  - `ktest:lumen_kernel::linux::epoll::nested_wait_keeps_guard_after_guardless_removal` (DEL and last-close remove rechecks without losing guarded wakes);
+  - `ktest:lumen_kernel::linux::epoll::guardless_edges_require_zero_to_ready`;
+  - `ktest:lumen_kernel::linux::epoll::blocked_epoll_wait_wakes_from_source`;
+  - `ktest:lumen_kernel::linux::epoll::empty_expired_wait_ignores_fatal_signal`;
+  - `ktest:lumen_kernel::linux::epoll::allocation_failures_preserve_interests_and_retry`;
+  - `ktest:lumen_kernel::linux::epoll::maxevents_one_visits_each_ready_source`;
+  - `ktest:lumen_kernel::linux::epoll::poll_retries_after_peek_allocation_failure`;
+  - `ktest:lumen_kernel::linux::epoll::poll_discovers_guardless_source_added_while_blocked`;
+  - `ktest:lumen_kernel::linux::epoll::serial_safety_step_rechecks_without_notification`;
 
   and `scenario:test_linux_io::test_epoll_edge_and_level_triggered`
   (section 15).
@@ -13679,11 +13736,15 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
     `anon_inode:[eventfd]`, `anon_inode:[timerfd]`);
   - a nested epoll reports its inner's readiness; a chain of five
     instances is accepted and a sixth is `-ELOOP`, as is a cycle; `poll`
-    on an epoll fd wakes;
+    on an epoll fd wakes. Blocking waits use timeout -1, with `ps`
+    confirming the waiter blocked before the producer writes;
   - `epoll_wait`'s timeout waits at least its time;
   - `epoll_pwait`'s mask: a signal blocked by the caller, made pending
     before the call and unblocked only by its mask, interrupts it at once
     with `-EINTR`; one sent once the caller is blocked does too;
+    the handler records the temporary mask (plus its own signal). Both
+    `epoll_pwait` and `epoll_pwait2` restore the original mask after empty
+    and ready normal returns, including a second masked call;
     `epoll_pwait2`'s `timespec` waits at least its time;
   - a socket, an eventfd and a timerfd in one set (tagged C8, which
     depends on B5, B6 and C4).

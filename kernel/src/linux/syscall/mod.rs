@@ -77,7 +77,7 @@ mod mem;
 mod meta;
 mod ns;
 mod pipe;
-mod poll;
+pub(crate) mod poll;
 mod proc;
 mod signal;
 mod socket;

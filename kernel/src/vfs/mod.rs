@@ -68,6 +68,10 @@ impl<T> VfsLock<T> for KernelVfsLock<T> {
         self.0.lock()
     }
 
+    fn try_lock(&self) -> Option<Self::Guard<'_>> {
+        self.0.try_lock()
+    }
+
     fn get_mut(&mut self) -> &mut T {
         self.0.get_mut()
     }
@@ -98,6 +102,10 @@ impl<T> VfsLock<T> for KernelLeafLock<T> {
 
     fn lock(&self) -> Self::Guard<'_> {
         self.0.lock()
+    }
+
+    fn try_lock(&self) -> Option<Self::Guard<'_>> {
+        self.0.try_lock()
     }
 
     fn get_mut(&mut self) -> &mut T {

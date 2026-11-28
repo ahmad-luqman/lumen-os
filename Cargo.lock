@@ -506,6 +506,7 @@ dependencies = [
  "lumen-bcache",
  "lumen-demo",
  "lumen-elf",
+ "lumen-epoll",
  "lumen-eventfd",
  "lumen-font",
  "lumen-futex",

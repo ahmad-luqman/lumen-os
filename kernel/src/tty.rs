@@ -13,7 +13,7 @@ use lumen_signal::Signal;
 use lumen_tty::{
     BackgroundWrite, Decision, Flush, Input, LineDiscipline, Output, Read, ReadTimer, Termios, WriterFacts,
 };
-use lumen_vfs::{AccessMode, PollGuard, PollMask, PollWaker};
+use lumen_vfs::{AccessMode, PollDefer, PollGuard, PollMask, PollWaker};
 
 use crate::linux::process::{self, ConsoleIo, Process};
 use crate::linux::signal::ERESTARTSYS;
@@ -805,9 +805,9 @@ pub(crate) fn console(io: ConsoleIo) -> Option<Arc<Tty>> {
 struct ConsolePoll(Arc<dyn PollWaker>);
 
 impl PollWaker for ConsolePoll {
-    fn wake(&self, ready: PollMask) {
+    fn wake(&self, ready: PollMask, defer: &mut PollDefer) {
         crate::serial_in::note_poll_woken();
-        self.0.wake(ready);
+        self.0.wake(ready, defer);
     }
 }
 
@@ -1001,7 +1001,7 @@ crate::ktest!(
             tty.open_slave(false).map_err(|_| "open slave")?;
             struct Spy(AtomicU64);
             impl PollWaker for Spy {
-                fn wake(&self, _: PollMask) {
+                fn wake(&self, _: PollMask, _: &mut PollDefer) {
                     self.0.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1100,7 +1100,7 @@ crate::ktest!(
                 queue: WaitQueue,
             }
             impl PollWaker for PollWait {
-                fn wake(&self, _: PollMask) {
+                fn wake(&self, _: PollMask, _: &mut PollDefer) {
                     self.sequence.fetch_add(1, Ordering::Release);
                     self.queue.wake_all();
                 }

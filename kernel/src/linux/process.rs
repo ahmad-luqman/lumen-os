@@ -83,8 +83,10 @@ use crate::vfs::KernelVfsLock;
 /// Anonymous-inode kernel object held in [`KernelFile`] (`vfs/anon.rs`,
 /// dev `0:9`; ARCHITECTURE sections 8 and 10).
 ///
-/// B5 (`epoll`) appends its variant here.
+/// The objects behind anonymous inodes: B5's epoll and B6's eventfd/timerfd.
 pub enum AnonObj {
+    /// `epoll` instance (`anon_inode:[eventpoll]`, B5 #476).
+    Epoll(Arc<crate::linux::epoll::Epoll>),
     /// `eventfd` counter (`anon_inode:[eventfd]`; B6, #477).
     EventFd(Arc<crate::linux::evfd::EventFd>),
     /// `timerfd` expiry counter (`anon_inode:[timerfd]`; B6, #477).
@@ -95,6 +97,7 @@ impl AnonObj {
     /// The anonymous-inode kind (`eventpoll`, `eventfd`, or `timerfd`).
     pub fn kind(&self) -> crate::vfs::anon::AnonKind {
         match self {
+            Self::Epoll(_) => crate::vfs::anon::AnonKind::EventPoll,
             Self::EventFd(_) => crate::vfs::anon::AnonKind::EventFd,
             Self::TimerFd(_) => crate::vfs::anon::AnonKind::TimerFd,
         }
@@ -103,6 +106,7 @@ impl AnonObj {
     /// Readiness source for this anonymous object.
     pub fn pollable(&self) -> &dyn Pollable {
         match self {
+            Self::Epoll(ep) => &**ep,
             Self::EventFd(ev) => &**ev,
             Self::TimerFd(tf) => &**tf,
         }
@@ -110,8 +114,11 @@ impl AnonObj {
 
     /// Consume one 8-byte counter value (`eventfd_read` / `timerfd_read_iter`),
     /// blocking interruptibly (`-ERESTARTSYS`) unless `nonblock` (`-EAGAIN`).
+    /// An epoll file has no read (Linux v6.12 `eventpoll_fops` sets no
+    /// `.read`/`.read_iter`, so `vfs_read` gives `-EINVAL`).
     pub fn read_u64(&self, nonblock: bool) -> Result<u64, u32> {
         match self {
+            Self::Epoll(_) => Err(errno::EINVAL),
             Self::EventFd(ev) => ev.read_u64(nonblock),
             Self::TimerFd(tf) => tf.read_u64(nonblock),
         }
@@ -119,9 +126,10 @@ impl AnonObj {
 
     /// Whether `write(2)` / `writev(2)` are supported (`FMODE_CAN_WRITE` in
     /// Linux v6.12 `fs/read_write.c` `vfs_writev`). Exhaustive so any new
-    /// variant (B5's `EventPoll`) must decide at compile time.
+    /// variant must decide at compile time.
     pub fn can_write(&self) -> bool {
         match self {
+            Self::Epoll(_) => false,
             Self::EventFd(_) => true,
             Self::TimerFd(_) => false,
         }
@@ -139,6 +147,7 @@ impl AnonObj {
     /// it in [`KernelFile::release_end`] before matching `self.obj`, not here.
     pub fn release(&self) {
         match self {
+            Self::Epoll(ep) => ep.close(),
             Self::EventFd(_) => {}
             Self::TimerFd(tf) => tf.disarm(),
         }
@@ -198,6 +207,9 @@ pub struct KernelFile {
     /// Exclusive kernel-side object (pipe/FIFO, terminal, anonymous object,
     /// or socket in B1).
     obj: Option<FileObj>,
+    /// Epoll instances currently watching this description (level-10c leaf,
+    /// B5 #476; ARCHITECTURE sections 9 and 10).
+    epitems: SpinLock<crate::linux::epoll::EpWatchers>,
 }
 
 impl KernelFile {
@@ -208,6 +220,7 @@ impl KernelFile {
             io_refs: AtomicU32::new(0),
             end_refs: AtomicU32::new(1),
             obj: None,
+            epitems: SpinLock::new(crate::linux::epoll::EpWatchers::new()),
         }
     }
 
@@ -318,6 +331,20 @@ impl KernelFile {
         }
     }
 
+    /// Borrow the underlying [`crate::linux::epoll::Epoll`] if this is an epoll
+    /// instance.
+    pub(crate) fn epoll(&self) -> Option<&Arc<crate::linux::epoll::Epoll>> {
+        match &self.obj {
+            Some(FileObj::Anon(AnonObj::Epoll(ep))) => Some(ep),
+            _ => None,
+        }
+    }
+
+    /// Epoll watcher registry for this open file description (level-10c leaf).
+    pub(crate) fn epitems(&self) -> &SpinLock<crate::linux::epoll::EpWatchers> {
+        &self.epitems
+    }
+
     /// Readiness source for this open file description, used by both
     /// `poll_file` (`syscall/poll.rs`) and `epoll_ctl` (B5).
     ///
@@ -382,10 +409,11 @@ impl KernelFile {
     }
 
     fn release_end(&self) {
-        // B5 hooks target-side `epoll::release_file` here, before matching
+        // Target-side `epoll::release_file` runs first, before matching
         // `self.obj`, so every watched description kind (pipes, ttys, sockets,
         // anonymous objects and inode-pollable files) detaches from watching
-        // epoll instances.
+        // epoll instances (B5 #476; ARCHITECTURE section 10).
+        crate::linux::epoll::release_file(self);
         match &self.obj {
             Some(FileObj::Pipe(pipe)) => {
                 let end = pipe.end.lock().take();
@@ -458,6 +486,13 @@ impl IoFile {
     fn new(file: &FileRef) -> Self {
         file.inc_io_ref();
         Self(Arc::clone(file))
+    }
+
+    /// Metadata-only clone of the underlying `Arc<KernelFile>` that does not
+    /// raise `end_refs`, so holding it does not keep the description open
+    /// (used by `epoll` interests; ARCHITECTURE section 10).
+    pub(crate) fn file_ref(&self) -> FileRef {
+        Arc::clone(&self.0)
     }
 }
 
@@ -2590,7 +2625,7 @@ struct ConsoleReadWait {
     fired: core::sync::atomic::AtomicBool,
 }
 impl lumen_vfs::PollWaker for ConsoleReadWait {
-    fn wake(&self, _: lumen_vfs::PollMask) {
+    fn wake(&self, _: lumen_vfs::PollMask, _: &mut lumen_vfs::PollDefer) {
         self.fired.store(true, Ordering::SeqCst);
         self.queue.wake_all();
     }
