@@ -412,6 +412,13 @@ pub static COMMANDS: Table<Run> = Table(&[
     Command { name: "reboot", args: &[], usage: "", about: "restart the machine", run: reboot },
     Command { name: "shutdown", args: &[], usage: "", about: "power off (ACPI S5)", run: shutdown },
     Command { name: "exit", args: &[], usage: "", about: "end QEMU (only with lumen.qemu_exit)", run: exit },
+    Command {
+        name: "net",
+        args: &[&["selftest"]],
+        usage: "[selftest]",
+        about: "network device, frame counts and drops; selftest: ARP to 10.0.2.2",
+        run: crate::net::virtio_net::command,
+    },
 ]);
 
 /// Split `line` into words and run the command the first names (one line

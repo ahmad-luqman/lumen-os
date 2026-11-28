@@ -32,6 +32,7 @@ lumen-gfx.workspace = true
 lumen-heap.workspace = true
 lumen-input.workspace = true
 lumen-mm.workspace = true
+lumen-net = { path = "../crates/lumen-net" }
 lumen-pci.workspace = true
 lumen-perf.workspace = true
 lumen-pipe.workspace = true

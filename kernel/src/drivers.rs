@@ -43,6 +43,7 @@ pub static DRIVERS: &[Driver] = &[
     crate::mouse::DRIVER,
     crate::sound::DRIVER,
     crate::blk::DRIVER,
+    crate::net::virtio_net::DRIVER,
 ];
 
 static PROBED: AtomicBool = AtomicBool::new(false);

@@ -130,6 +130,8 @@ use crate::sync::SpinLock;
 /// `Dma` runs + up to 3 transient `Bounce` runs, max 20 for `MAX_BLK_DEVICES = 4`)
 /// is about 99 at boot; with sound's 96 buffers in flight and 3 for a
 /// control request, about 198 worst-case while sound streams.
+// #473: add 32 packet buffers + 4 queue runs for virtio-net: 234 worst
+// case, leaving 22 spare entries (at least the required margin of 16).
 const RUNS: usize = 256;
 
 /// What a run in the table was handed out as: `dma_dealloc` frees only a
@@ -442,7 +444,8 @@ pub struct VirtioHal;
 // common configuration is aliased once more, by `VirtioTransport`, a
 // deliberate and benign exception: see the module doc); `share` returns a
 // fresh run holding the buffer's contents (or zeros) that nothing else uses
-// until `unshare`.
+// until `unshare`. A range wholly inside an owned DMA run instead shares
+// that run directly; its caller retains ownership through completion/reset.
 unsafe impl Hal for VirtioHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (u64, NonNull<u8>) {
         let mut table = TABLE.lock();
@@ -503,6 +506,9 @@ unsafe impl Hal for VirtioHal {
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> u64 {
         let len = buffer.len();
         let mut table = TABLE.lock();
+        if let Some(paddr) = dma_address(&table, buffer) {
+            return paddr;
+        }
         let outstanding = count(&table);
         if outstanding == RUNS {
             panic!("virtio: sharing a {len}-byte buffer: the run table is full ({RUNS} outstanding)");
@@ -529,6 +535,10 @@ unsafe impl Hal for VirtioHal {
     unsafe fn unshare(paddr: u64, buffer: NonNull<[u8]>, direction: BufferDirection) {
         let len = buffer.len();
         let mut table = TABLE.lock();
+        if let Some(direct) = dma_address(&table, buffer) {
+            assert_eq!(paddr, direct, "virtio: unshare of a DMA buffer at the wrong address");
+            return; // Its owner frees the DMA run after the device is reset.
+        }
         let run = take(&mut table, paddr, Kind::Bounce { len }).unwrap_or_else(|miss| {
             let outstanding = count(&table);
             panic!("virtio: unshare of {paddr:#x} ({len} bytes): {miss:?} ({outstanding} runs outstanding)")
@@ -1530,7 +1540,10 @@ crate::ktest!(
 
         use crate::pci::{self, Binding, ClaimError, Probed, ktest_command};
         use crate::{kassert, kassert_eq};
-        let d = ktest_device(1)?;
+        // #473: virtio-net is bound at boot now. The unused q35 SATA
+        // controller also has both I/O and memory BARs for this claim test.
+        let d =
+            pci::devices().iter().find(|d| (d.vendor, d.device) == (0x8086, 0x2922)).ok_or("no q35 SATA controller")?;
         let nowhere = lumen_pci::PciAddr::new(0, 0x80, 31, 7).ok_or("addr")?;
         kassert_eq!(pci::claim(nowhere, "ktest").map(|_| ()), Err(ClaimError::NoSuchFunction));
         let bits = MEMORY_SPACE | BUS_MASTER | IO_SPACE;
@@ -1782,6 +1795,60 @@ crate::ktest!(
             "WARN  virtio: {addr}: the device answered but its MSI-X interrupt never came (said once)\n"
         );
         kassert_eq!(log.matches(line.as_str()).count(), 1);
+        Ok(())
+    }
+);
+
+/// The physical address only for a range wholly inside a recorded DMA run.
+/// Heap/stack buffers and even HHDM bounce runs retain the bounce path.
+/// The caller keeps the owning DMA allocation alive through `unshare`, and
+/// resets the device before freeing any still-posted buffer. No copying,
+/// zeroing or allocation is needed on cache-coherent x86-64.
+fn dma_address(table: &Runs, buffer: NonNull<[u8]>) -> Option<u64> {
+    let start = buffer.as_ptr().cast::<u8>() as usize;
+    table.iter().flatten().find_map(|entry| {
+        if !matches!(entry.kind, Kind::Dma { .. }) {
+            return None;
+        }
+        let offset = start.checked_sub(entry.run.ptr() as usize)?;
+        (offset < entry.run.len() && buffer.len() <= entry.run.len() - offset).then(|| entry.run.phys() + offset as u64)
+    })
+}
+
+crate::ktest!(
+    fn dma_subranges_share_without_bouncing_or_freeing_the_owner() {
+        use crate::{kassert, kassert_eq};
+        let before = outstanding_runs();
+        let (phys, ptr) = VirtioHal::dma_alloc(2, BufferDirection::Both);
+        kassert!(phys != 0);
+        // SAFETY: this test owns the two-page run until the final dealloc.
+        let sub = unsafe { NonNull::slice_from_raw_parts(ptr.add(4000), 600) };
+        for direction in [BufferDirection::DriverToDevice, BufferDirection::DeviceToDriver] {
+            // SAFETY: no device uses this test buffer; it stays allocated.
+            unsafe { sub.as_ptr().cast::<u8>().write_bytes(0x5a, sub.len()) };
+            // SAFETY: the allocated subrange stays alive until unshare.
+            let shared = unsafe { VirtioHal::share(sub, direction) };
+            kassert_eq!(shared, phys + 4000);
+            kassert_eq!(outstanding_runs(), before + 1);
+            // Sharing RX must not zero or copy the existing DMA contents.
+            // SAFETY: the test owns the range and no device is accessing it.
+            unsafe {
+                kassert_eq!(sub.as_ptr().cast::<u8>().read(), 0x5a);
+                hhdm(shared).write(0xa7);
+                VirtioHal::unshare(shared, sub, direction);
+                kassert_eq!(sub.as_ptr().cast::<u8>().read(), 0xa7);
+            }
+            kassert!(all_allocated(phys, 2, true));
+            kassert_eq!(outstanding_runs(), before + 1);
+        }
+        // These pointers are lookup inputs only: never dereferenced.
+        let outside = NonNull::slice_from_raw_parts(ptr, 8193);
+        kassert_eq!(dma_address(&TABLE.lock(), outside), None);
+        let overflow = NonNull::slice_from_raw_parts(ptr, usize::MAX);
+        kassert_eq!(dma_address(&TABLE.lock(), overflow), None);
+        // SAFETY: both pages remain allocated, with no outstanding device access.
+        kassert_eq!(unsafe { VirtioHal::dma_dealloc(phys, ptr, 2) }, 0);
+        kassert_eq!(outstanding_runs(), before);
         Ok(())
     }
 );

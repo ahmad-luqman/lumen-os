@@ -178,7 +178,9 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   vector (`DeviceResources::msix`, `MsiVector`). `drivers.rs`: the driver table (`DRIVERS`) and
   `probe_all` (declines, the MSI-X vector and readiness checks). `virtio.rs`: the adapter for
   `virtio-drivers` (the `Hal`: DMA runs from the frame allocator, bounce
-  buffers, probe attempts; `transport`, `VirtioTransport` and its MSI-X
+  buffers, probe attempts; #473 adds allocation-free sharing/unsharing of
+  subranges in recorded DMA runs (234 worst-case runs, 22 spare);
+  `transport`, `VirtioTransport` and its MSI-X
   vectors, the device status handle, the `Doorbell` a driver's interrupt
   rings, or the driver itself to wake its thread: `mouse::hold`). `blk/` (M7): `virtio_blk.rs` the
   virtio-blk driver (`DRIVER`, `VirtioBlkDevice`: a `lumen_bcache::BlockDevice` over one queue and its
@@ -520,7 +522,11 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   ARCHITECTURE section 8, "Handlers".
   `net/` (M9; ARCHITECTURE sections 7, 8 and 10): `net/mod.rs` (`net::init`,
   called at boot after `linux::init` and populated by B3/B4, #472) and
-  `net/sock.rs` (#472: the generic socket file object: `SockKind`,
+  `net/virtio_net.rs` (#473: `VirtioNetDevice` implements lumen-net's
+  `NetDevice` with 16 RX and 16 TX DMA buffers, single-descriptor frames,
+  nonblocking receive/transmit/reclaim, MSI-X `BELL`, frame/drop counters,
+  and the `net`/`net selftest` commands; `take_device` transfers ownership
+  to B3's stack) and `net/sock.rs` (#472: the generic socket file object: `SockKind`,
   `ShutdownHow`, `UserSpan`/`UserIovec`, `InFlightFile`, `SendIo` (with
   `named`), `RecvIo`, `RecvDone`, `SockOps` (with required `disconnect`),
   `block_on`, `sockfs` on `SOCK_DEV` `0:8` with `SockInode` reporting

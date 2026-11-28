@@ -39,3 +39,17 @@ tests = [
 name = "TCP and UDP socket semantics over smoltcp (logic)"
 milestone = "M9"
 tests = ["cargo:lumen-net"]
+
+[[feature]]
+name = "virtio-net: fixed DMA frame buffers, ARP to slirp, RX repost and TX reclamation"
+milestone = "M9"
+tests = [
+    "scenario:test_net::test_virtio_net_frames",
+    "ktest:lumen_kernel::net::virtio_net::virtio_net_fills_and_reclaims_all_slots_without_dma_allocation",
+    "ktest:lumen_kernel::virtio::dma_subranges_share_without_bouncing_or_freeing_the_owner",
+]
+
+[[feature]]
+name = "virtio-net failed status: counted drops, one warning, link recovery after successful transmit (status seam)"
+milestone = "M9"
+tests = ["ktest:lumen_kernel::net::virtio_net::virtio_net_failure_counts_drops_and_recovers_on_transmit"]

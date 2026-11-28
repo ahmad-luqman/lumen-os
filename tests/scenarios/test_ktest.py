@@ -19,10 +19,10 @@ def boot_ktests(boot, cmdline=None):
     """The ktest machine: with other CPUs online (idle), so the per-CPU
     state, the heap, the stack registry and the frame allocator are tested
     with their stacks and state in place, as on any multi-CPU machine. With
-    virtio devices no driver takes (network, 9p, a memory balloon, a console,
+    virtio devices no driver takes (9p, a memory balloon, a console,
     SCSI, GPU, four keyboards and a mouse), for the virtio adapter's and
-    MSI-X's ktests to claim and probe, plus virtio-blk and virtio-rng, bound
-    at boot, for the blk and rng ktests."""
+    MSI-X's ktests to claim and probe, plus virtio-blk, virtio-rng and virtio-net, bound
+    at boot, for the blk, rng and net ktests."""
     extra = ["-smp", "4"]
     for device in (
         "virtio-balloon-pci",
@@ -95,14 +95,14 @@ def test_in_kernel_tests_pass(boot):
     storm = re.findall(r"unexpected interrupt on vector 0x31 \(rip 0x[0-9a-f]+, #(\d+)\)", out)
     assert storm == ["1", "1024", "2048"], f"0x31 storm reports: {storm}"
     # `probing_records_each_outcome` (#95): boot's own pass binds
-    # virtio-rng (#97) and virtio-blk (#249; the tablet's and sound's rows,
+    # virtio-rng (#97), virtio-net (#473) and virtio-blk (#249; the tablet's and sound's rows,
     # #98 and #99, find no device on the ktest machine); the ktest's table
     # declines the 9p device once alone, then declines it (leaving a run) and
     # fails it (leaving one of its own), finds the balloon not ready, binds
     # the console, and refuses the SCSI device's decline (its probe kept the
     # resources); offered again, the 9p device isn't probed.
     assert re.search(
-        r"INFO  drivers: 2 bound, 0 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n", out
+        r"INFO  drivers: 3 bound, 0 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n", out
     )
     assert "INFO  rng: sources: virtio-rng\n" in out
     p9 = re.search(r"INFO  drivers: probing ktest-9p on (\S+)\n", out)
