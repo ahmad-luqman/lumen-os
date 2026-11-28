@@ -879,7 +879,7 @@ def _slirp_probe(devices):
 
 
 def test_restricted_slirp_drops_outbound_tcp_and_udp(packages):
-    """UDP is dropped; TCP outside guestfwd is reset.
+    """UDP is dropped; TCP outside guestfwd is not forwarded.
 
     Check installed QEMU: Homebrew locally, Ubuntu QEMU 8.2.2 in CI.
     """

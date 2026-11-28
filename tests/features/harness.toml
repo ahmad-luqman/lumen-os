@@ -295,7 +295,7 @@ tests = [
 ]
 
 [[feature]]
-name = "M9 offline network fixture (#453): restricted IPv4 slirp, per-run Unix-socket TCP services, HTTP/HTTPS with a per-run CA and signed pinned apk index, image-copy configuration replacement with inherited apk keys replaced by only the run key, local hosts and run-only CAfile/hashed-CApath trust; verified packages shared without copying; composable services, no idle deadlines, half-closes, guest-safe relay diagnostics and preserved service logs; packet injection checks DHCP and TCP guestfwd: UDP is dropped; TCP outside guestfwd is reset"
+name = "M9 offline network fixture (#453): restricted IPv4 slirp, per-run Unix-socket TCP services, HTTP/HTTPS with a per-run CA and signed pinned apk index, image-copy configuration replacement with inherited apk keys replaced by only the run key, local hosts and run-only CAfile/hashed-CApath trust; verified packages shared without copying; composable services, no idle deadlines, half-closes, guest-safe relay diagnostics and preserved service logs; packet injection checks DHCP and TCP guestfwd: UDP is dropped; TCP outside guestfwd is not forwarded"
 milestone = "M9"
 tests = [
     "harness:test_netfix::test_https_server_trusts_only_the_run_ca",
