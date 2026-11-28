@@ -13448,14 +13448,15 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `gvisor-reference.yml` gates on it.
   - **The native reference is measured as D4 runs on Lumen:** one case per
     process (`--gtest_filter=<case>`), each in a fresh network namespace
-    with `lo` up (as gVisor's runner does, and as a Lumen boot starts
-    clean: gVisor's root stress tests shrink `ip_local_port_range` to 50
-    ports and never restore it (`socket_util.cc`
-    `MaybeLimitEphemeralPorts`), and a shared namespace then failed 1,028
-    later TCP cases with `EADDRINUSE`), as root. Its report records the
-    uid, euid and capability masks, the mode, the zig version and the
-    kernel, and `gvisor record` refuses a run that isn't complete,
-    per-case and root.
+    with `lo` up, as root (as gVisor's runner does, and as a Lumen boot
+    starts clean). A shared namespace isn't enough: gVisor's stress tests,
+    run as root, shrink `ip_local_port_range` to about 50 ports and never
+    restore it (`socket_util.cc`'s `MaybeLimitEphemeralPorts`), and in run
+    46084838419 that failed 1,028 later TCP cases' `bind` with
+    `EADDRINUSE`. The report records the uid, euid and capability masks,
+    the mode, the netns, the zig version and the kernel, and `gvisor
+    record` refuses a run that isn't complete, per-case (a process and a
+    network namespace each) and root.
   - **The image:** D4 runs on its own small image, `make rootfs-gvisor`
     (`build/alpine-gvisor.ext4`: the minirootfs and the binaries). The
     binaries would fit the developer image's 65.6 MiB free space with
