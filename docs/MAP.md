@@ -17,7 +17,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
 - `crates/lumen-net` (#459 PR 2, M9): Linux TCP/UDP semantics over the
   pinned smoltcp, with separate loopback and Ethernet interfaces/socket sets.
   `device.rs`: `NetDevice`, `NetInfo`, `TxError`, the Ethernet `Adapter` and
-  the preallocated `Loopback` ring. `memory.rs`: atomic `Budget`/`Charge`,
+  the preallocated `Loopback` ring and bound ICMP source adapter.
+  `memory.rs`: atomic `Budget`/`Charge`,
   fallible `prepare_tcp`/`prepare_udp`/`prepare_icmp` buffers. `port.rs`:
   `PortTable`, protocol/family bind conflicts, next-fit ephemeral ports and
   TIME-WAIT reservations. `packet.rs`: checksum-checked TCP/UDP tuples for
@@ -27,7 +28,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   event-based `changed` (including packet metadata capacity), per-state
   timers, orphan cleanup, shutdown readiness, datagram tickets, wildcard
   receive fairness, UDP recipient specificity, connected-interface send
-  readiness, ICMP hop limits and listener option inheritance. Caller-timed deadlines
+  readiness, ICMP local/peer filtering, first-send raw identifiers, hop limits
+  and listener option inheritance. Caller-timed deadlines
   count transmitted keepalive probes and reap unreachable orphans; retired
   TCP transports preserve unread data without duplicate receive buffers.
   Seeded interfaces, typed preparations, explicit `Family`/`V6Only`, ICMP

@@ -4704,6 +4704,17 @@ queued payloads are zero length.
 interfaces.
 - Ping and raw transports apply the saved TTL at creation; later `Ttl`
   option changes update every existing handle's hop limit.
+- Receive filtering checks the queued packet's destination against a specific
+  local bind before caching it (Linux **v6.12**, `net/ipv4/ping.c`,
+  `ping_lookup`, lines 194–218, for IPv4 and IPv6). Raw sockets also check
+  a connected peer's address (`net/ipv4/raw.c`, `raw_v4_match`, lines 119–129;
+  `net/ipv6/raw.c`, `raw_v6_match`, lines 67–84).
+- smoltcp's ICMP send metadata has no source address. For a bound 127/8
+  alias, egress isolates that socket and corrects the emitted request's source
+  and dependent checksums. A boot-reserved vector holds at most `NET_SOCKETS`
+  ICMP transports during this pass; polling and sending do not allocate.
+  The configured Ethernet address and ::1 already match smoltcp's selection;
+  those transports stay in their sets, preserving neighbor retry metadata.
 - **Ping sockets** (`SOCK_DGRAM` with `IPPROTO_ICMP` or `IPPROTO_ICMPV6`):
   a smoltcp ICMP socket bound to the socket's identifier (its "port":
   from `bind`, or a free one in 1–65535). It sends
@@ -4718,9 +4729,14 @@ interfaces.
 - **`SOCK_RAW` with `IPPROTO_ICMP` or `IPPROTO_ICMPV6`, echo only**
   (busybox `ping` as root opens `SOCK_RAW` protocol 1: the census). The
   socket binds its ICMP socket to the identifier of the first echo
-  request it sends and keeps both requests and replies for it, as a raw
+  request it successfully queues, even if `bind` or `connect` preceded that
+  request. Prepared raw transports remain unbound until then; handles added
+  later inherit that identifier. It keeps both requests and replies for it, as a raw
   socket sees both. Raw sockets do not reserve identifiers: every matching
-  socket receives the message, including alongside a ping socket. IPv4
+  socket receives the message, including alongside a ping socket. Matching
+  only the first request's identifier remains an echo-transport deviation:
+  Linux raw sockets match protocol and addresses without restricting identifiers.
+  IPv4
   messages come with a synthesized 20-byte header whose destination is
   the **received packet's destination**, including loopback aliases and
   packets queued before an address was removed. A fixed eight-slot

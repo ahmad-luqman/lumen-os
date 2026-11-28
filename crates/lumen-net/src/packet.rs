@@ -103,3 +103,38 @@ fn transport_packet(data: &[u8], ethernet: bool, protocol: IpProtocol) -> Option
         _ => None,
     }
 }
+
+/// Correct only emitted ICMP source addresses and dependent checksums.
+/// Neighbor discovery/ARP and other protocols keep their original headers.
+pub(crate) fn icmp_source(frame: &mut [u8], ethernet: bool, source: IpAddress) {
+    let data = if ethernet {
+        let Ok(eth) = EthernetFrame::new_checked(&*frame) else { return };
+        if !matches!(eth.ethertype(), EthernetProtocol::Ipv4 | EthernetProtocol::Ipv6) {
+            return;
+        }
+        &mut frame[14..]
+    } else {
+        frame
+    };
+    match source {
+        IpAddress::Ipv4(source) => {
+            let Ok(mut ip) = Ipv4Packet::new_checked(data) else { return };
+            if ip.version() != 4 || ip.next_header() != IpProtocol::Icmp || ip.payload_mut().first() != Some(&8) {
+                return;
+            }
+            ip.set_src_addr(source);
+            ip.fill_checksum();
+        }
+        IpAddress::Ipv6(source) => {
+            let Ok(mut ip) = Ipv6Packet::new_checked(data) else { return };
+            if ip.version() != 6 || ip.next_header() != IpProtocol::Icmpv6 || ip.payload_mut().first() != Some(&128) {
+                return;
+            }
+            let destination = ip.dst_addr();
+            ip.set_src_addr(source);
+            if let Ok(mut icmp) = smoltcp::wire::Icmpv6Packet::new_checked(ip.payload_mut()) {
+                icmp.fill_checksum(&source, &destination);
+            }
+        }
+    }
+}

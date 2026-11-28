@@ -297,6 +297,47 @@ pub(crate) struct OneFrame<'a, D> {
     pub device: &'a mut D,
     pub frame: Option<&'a [u8]>,
 }
+
+/// Supplies the bound source missing from smoltcp's ICMP send metadata.
+/// Used only for one socket's egress, never automatic echo replies or ingress.
+pub(crate) struct IcmpSource<'a, D> {
+    pub device: &'a mut D,
+    pub source: crate::IpAddress,
+}
+pub(crate) struct IcmpSourceTx<T> {
+    inner: T,
+    source: crate::IpAddress,
+    ethernet: bool,
+}
+impl<T: phy::TxToken> phy::TxToken for IcmpSourceTx<T> {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        self.inner.consume(len, |frame| {
+            let result = f(frame);
+            crate::packet::icmp_source(frame, self.ethernet, self.source);
+            result
+        })
+    }
+}
+impl<D: Device> Device for IcmpSource<'_, D> {
+    type RxToken<'a>
+        = D::RxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = IcmpSourceTx<D::TxToken<'a>>
+    where
+        Self: 'a;
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.device.capabilities()
+    }
+    fn receive(&mut self, _: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        None
+    }
+    fn transmit(&mut self, now: Instant) -> Option<Self::TxToken<'_>> {
+        let ethernet = self.capabilities().medium == Medium::Ethernet;
+        self.device.transmit(now).map(|inner| IcmpSourceTx { inner, source: self.source, ethernet })
+    }
+}
 impl<D: Device> Device for OneFrame<'_, D> {
     type RxToken<'a>
         = Rx<'a>

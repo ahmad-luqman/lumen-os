@@ -757,3 +757,172 @@ fn connected_udp_writability_ignores_unused_interface() {
     assert!(s.changed().contains(&id), "selected eth0 transmit space wakes the sender");
     assert_eq!(peer.recv(receiver, &mut [], false).unwrap().full_len, 0);
 }
+
+#[test]
+fn raw_icmp_connect_or_bind_before_send_selects_request_identifier() {
+    // Linux v6.12 net/ipv4/raw.c, raw_v4_match:119-129 demultiplexes
+    // protocol/addresses, not an echo identifier claimed during connect.
+    // raw_sendmsg:651-654 preserves the caller's ICMP payload. Lumen's
+    // echo-only transport learns its identifier from the first send.
+    for v6 in [false, true] {
+        for bind_first in [false, true] {
+            let mut s = stack();
+            let b = budget();
+            let id = s.open(if v6 { Family::V6 } else { Family::V4 }, Proto::IcmpEcho { raw: true }).unwrap();
+            if bind_first {
+                s.bind(
+                    id,
+                    BindReq { addr: Some(addr(v6)), ..BindReq::default() },
+                    Preps::Icmp(&mut [prepare_icmp(b).unwrap()].into_iter()),
+                    at(0),
+                )
+                .unwrap();
+            }
+            let prep = (!bind_first).then(|| ConnectPrep::Icmp(prepare_icmp(b).unwrap()));
+            s.connect(id, IpEndpoint::new(addr(v6), 0), prep, at(0)).unwrap();
+            assert_eq!(s.port_count(), 0);
+            // A rejected send must not latch an identifier.
+            assert_eq!(s.send(id, &[8; 4097], None, Preps::None, at(0)), Err(NetError::MsgSize));
+            let mut request = echo(0x459);
+            if v6 {
+                request[0] = 128;
+                smoltcp::wire::Icmpv6Packet::new_unchecked(&mut request[..])
+                    .fill_checksum(&Ipv6Address::LOCALHOST, &Ipv6Address::LOCALHOST);
+            }
+            s.send(id, &request, None, Preps::None, at(0)).unwrap();
+            assert_eq!(s.local_endpoint(id).unwrap().port, 0x459);
+            assert_eq!(s.port_count(), 0);
+            steps(&mut s, &mut 0, 12);
+            let mut data = [0; 64];
+            let mut replies = 0;
+            while let Ok(r) = s.recv(id, &mut data, false) {
+                let offset = if v6 { 0 } else { 20 };
+                assert_eq!(r.full_len, offset + request.len());
+                assert_eq!(u16::from_be_bytes([data[offset + 4], data[offset + 5]]), 0x459);
+                replies += usize::from(data[offset] == if v6 { 129 } else { 0 });
+            }
+            assert_eq!(replies, 1);
+        }
+    }
+}
+
+#[test]
+fn icmp_bound_loopback_alias_is_used_as_the_request_source() {
+    // Linux v6.12 net/ipv4/ping.c, ping_v4_sendmsg:737,761-762 uses
+    // inet_saddr via include/net/ip.h, ipcm_init_sk:101; raw_sendmsg in
+    // net/ipv4/raw.c:540 uses the same bound source. Test wire-visible
+    // round trips, including two same-identifier sockets and queued sends.
+    for raw in [false, true] {
+        let mut s = stack();
+        let b = budget();
+        let mut sockets = Vec::new();
+        for last in [1, 2] {
+            let local = IpAddress::v4(127, 0, 0, last);
+            let id = s.open(Family::V4, Proto::IcmpEcho { raw }).unwrap();
+            s.bind(
+                id,
+                BindReq { addr: Some(local), port: 0x459, ..BindReq::default() },
+                Preps::Icmp(&mut [prepare_icmp(b).unwrap()].into_iter()),
+                at(0),
+            )
+            .unwrap();
+            for sequence in [last, last + 2] {
+                let mut data = echo(0x459);
+                data[7] = sequence;
+                smoltcp::wire::Icmpv4Packet::new_unchecked(&mut data[..]).fill_checksum();
+                s.send(id, &data, Some(IpEndpoint::new(IpAddress::v4(127, 0, 0, 9), 0)), Preps::None, at(0)).unwrap();
+            }
+            sockets.push((last, local, id));
+        }
+        steps(&mut s, &mut 0, 16);
+        for (last, local, id) in sockets {
+            for sequence in [last, last + 2] {
+                let mut data = [0; 64];
+                let r = s.recv(id, &mut data, false).unwrap();
+                let offset = if raw { 20 } else { 0 };
+                assert_eq!(r.from.unwrap().addr, IpAddress::v4(127, 0, 0, 9));
+                assert_eq!(data[offset], 0);
+                assert_eq!(data[offset + 7], sequence);
+                if raw {
+                    let ip = smoltcp::wire::Ipv4Packet::new_checked(&data[..r.full_len]).unwrap();
+                    assert_eq!(IpAddress::Ipv4(ip.dst_addr()), local);
+                }
+            }
+            assert_eq!(s.recv(id, &mut [0; 64], false), Err(NetError::WouldBlock));
+        }
+    }
+}
+
+#[test]
+fn raw_icmp_late_interface_inherits_first_identifier() {
+    // Linux v6.12 net/ipv4/raw.c, raw_v4_match:119-129 has no ping-port
+    // reservation. Lumen's first-request identifier must follow every
+    // transport, including one installed after the original send.
+    for ident in [0, 0x459] {
+        let mut s = stack();
+        let b = budget();
+        let id = s.open(Family::V4, Proto::IcmpEcho { raw: true }).unwrap();
+        let request = echo(ident);
+        s.send(
+            id,
+            &request,
+            Some(IpEndpoint::new(addr(false), 0)),
+            Preps::Icmp(&mut [prepare_icmp(b).unwrap()].into_iter()),
+            at(0),
+        )
+        .unwrap();
+        let mut now = 0;
+        steps(&mut s, &mut now, 8);
+        while s.recv(id, &mut [0; 64], false).is_ok() {}
+        let (wire, other) = Wire::pair();
+        let mut peer = stack();
+        s.attach_eth(
+            wire,
+            EthConfig::Static { addr: Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24), router: None },
+            at(now),
+            459,
+        )
+        .unwrap();
+        peer.attach_eth(
+            other,
+            EthConfig::Static { addr: Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 2), 24), router: None },
+            at(now),
+            460,
+        )
+        .unwrap();
+        s.connect(
+            id,
+            IpEndpoint::new(IpAddress::v4(10, 0, 0, 2), 0),
+            Some(ConnectPrep::Icmp(prepare_icmp(b).unwrap())),
+            at(now),
+        )
+        .unwrap();
+        s.send(id, &request, None, Preps::None, at(now)).unwrap();
+        wire_steps(&mut s, &mut peer, &mut now, 16);
+        let mut data = [0; 64];
+        assert_eq!(s.recv(id, &mut data, false).unwrap().full_len, 32);
+        assert_eq!(data[20], 0);
+        assert_eq!(u16::from_be_bytes([data[24], data[25]]), ident);
+        assert_eq!(s.port_count(), 0);
+    }
+}
+
+#[test]
+fn bound_icmp_unresolved_neighbor_keeps_poll_deadline() {
+    // Source selection must preserve smoltcp's neighbor retry metadata:
+    // a missing ARP response must not turn poll_at into a busy loop.
+    let (mut s, _unpolled_peer, _, _) = wire_stacks();
+    let id = s.open(Family::V4, Proto::IcmpEcho { raw: true }).unwrap();
+    s.connect(
+        id,
+        IpEndpoint::new(IpAddress::v4(10, 0, 0, 2), 0),
+        Some(ConnectPrep::Icmp(prepare_icmp(budget()).unwrap())),
+        at(0),
+    )
+    .unwrap();
+    s.send(id, &echo(0x459), None, Preps::None, at(0)).unwrap();
+    for now in [0, 1] {
+        s.poll_round(at(now));
+        assert!(s.poll_at(at(now)).is_some_and(|deadline| deadline > at(now)));
+    }
+}

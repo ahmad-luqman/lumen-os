@@ -1,4 +1,4 @@
-use crate::device::{Adapter, LoopDevice, OneFrame};
+use crate::device::{Adapter, IcmpSource, LoopDevice, OneFrame};
 use crate::memory::{filled, reserved};
 use crate::packet::{Tuple, TxTrace, packet_destination, tcp_packet, udp_packet};
 use crate::port::Bound;
@@ -104,6 +104,7 @@ struct Entry {
     keep_armed: Option<Instant>,
     keep_probes: u32,
     icmp_destinations: [Destinations; 2],
+    raw_ident: Option<u16>,
 }
 // ICMP metadata in smoltcp contains only the source. Keep one destination
 // alongside each of its eight receive slots, including queued alias traffic.
@@ -179,6 +180,7 @@ impl Entry {
             keep_armed: None,
             keep_probes: 0,
             icmp_destinations: [Destinations::default(); 2],
+            raw_ident: None,
         }
     }
 }
@@ -222,6 +224,8 @@ pub struct Stack<D: NetDevice> {
     shortages: Vec<(SockId, IfaceId, usize)>,
     frame: Vec<u8>,
     empty: SocketSet<'static>,
+    // Loopback alias ICMP sockets need a source override during egress.
+    held_icmp: Vec<(usize, icmp::Socket<'static>)>,
     now: Instant,
     next_poll: Option<Instant>,
     needs_poll: bool,
@@ -262,6 +266,7 @@ impl<D: NetDevice> Stack<D> {
             shortages: reserved(2 * NET_ENTRIES)?,
             frame: filled(65535, || 0)?,
             empty: SocketSet::new(filled(1, || SocketStorage::EMPTY)?),
+            held_icmp: reserved(NET_SOCKETS)?,
             now,
             next_poll: None,
             needs_poll: false,
@@ -550,7 +555,14 @@ impl<D: NetDevice> Stack<D> {
         if self.interfaces[i].as_ref().is_none_or(|s| s.count == NET_SOCKETS) {
             return Err(NetError::NoBufs);
         }
-        let head = if let ConnectPrep::Icmp(ref mut p) = prep { Some(core::mem::take(&mut p.head)) } else { None };
+        let head = if let ConnectPrep::Icmp(ref mut p) = prep {
+            if let Some(ident) = self.entry(id)?.raw_ident {
+                p.socket.bind(icmp::Endpoint::Ident(ident)).map_err(|_| NetError::Inval)?;
+            }
+            Some(core::mem::take(&mut p.head))
+        } else {
+            None
+        };
         let (h, c) = self.interfaces[i].as_mut().unwrap().add(prep)?;
         let e = self.entry_mut(id)?;
         e.handles[i] = Some(h);
@@ -1178,12 +1190,7 @@ impl<D: NetDevice> Stack<D> {
             }
             self.retain_rx(i, true);
             self.snapshot(i);
-            let state = self.interfaces[i].as_mut().unwrap();
-            if i == 0 {
-                state.iface.poll_egress(now, &mut self.lo, &mut state.sockets);
-            } else {
-                state.iface.poll_egress(now, self.eth.as_mut().unwrap(), &mut state.sockets);
-            }
+            self.poll_egress(i, now);
             self.observe(i, None, None, false);
             self.note_sent(i);
             self.reap_orphans(i, now);
@@ -1204,6 +1211,34 @@ impl<D: NetDevice> Stack<D> {
         // Work queued by inline calls is now represented in smoltcp's deadline.
         self.needs_poll = false;
         Round { more }
+    }
+    fn poll_egress(&mut self, i: usize, now: Instant) {
+        let state = self.interfaces[i].as_mut().unwrap();
+        // eth0 has one configured IPv4 address, already selected by smoltcp.
+        // Keep its sockets in place so neighbor-discovery retry metadata stays
+        // intact. Only loopback's AnyIP aliases need the source override.
+        if i == 1 {
+            state.iface.poll_egress(now, self.eth.as_mut().unwrap(), &mut state.sockets);
+            return;
+        }
+        for &idx in &self.live {
+            let e = self.entries[idx].as_ref().unwrap();
+            if matches!(e.proto, Proto::IcmpEcho { .. })
+                && e.bound.and_then(|b| b.addr).is_some_and(|a| a != loopback_addr(a.is_ipv6()))
+                && let Some(h) = e.handles[i]
+            {
+                let smoltcp::socket::Socket::Icmp(socket) = state.sockets.remove(h) else { unreachable!() };
+                self.held_icmp.push((idx, socket));
+            }
+        }
+        state.iface.poll_egress(now, &mut self.lo, &mut state.sockets);
+        while let Some((idx, socket)) = self.held_icmp.pop() {
+            let e = self.entries[idx].as_mut().unwrap();
+            let source = e.bound.unwrap().addr.unwrap();
+            let h = self.empty.add(socket);
+            state.iface.poll_egress(now, &mut IcmpSource { device: &mut self.lo, source }, &mut self.empty);
+            e.handles[i] = Some(state.sockets.add(self.empty.remove(h)));
+        }
     }
     fn note_sent(&mut self, i: usize) {
         let sent = if i == 0 { &mut self.lo.sent } else { &mut self.eth.as_mut().unwrap().sent };
@@ -1961,6 +1996,26 @@ impl<D: NetDevice> Stack<D> {
             }
             Proto::Tcp => unreachable!(),
         }
+        if proto == (Proto::IcmpEcho { raw: true }) && self.entry(id)?.raw_ident.is_none() {
+            let ident = u16::from_be_bytes([data[4], data[5]]);
+            let handles = self.entry(id)?.handles;
+            for (i, h) in handles.into_iter().enumerate() {
+                if let Some(h) = h {
+                    // Raw preparations stay unbound until this first successful
+                    // enqueue. All installed handles therefore accept the bind.
+                    self.interfaces[i]
+                        .as_mut()
+                        .unwrap()
+                        .sockets
+                        .get_mut::<icmp::Socket>(h)
+                        .bind(icmp::Endpoint::Ident(ident))
+                        .expect("unbound raw ICMP transport");
+                }
+            }
+            let e = self.entry_mut(id)?;
+            e.raw_ident = Some(ident);
+            e.bound.as_mut().unwrap().port = ident;
+        }
         self.touch(id);
         Ok(data.len())
     }
@@ -2012,6 +2067,8 @@ impl<D: NetDevice> Stack<D> {
                     || !matches!(data.first(), Some(0 | 8 | 128 | 129))
                     || !raw && matches!(data.first(), Some(8 | 128))
                     || !family_ok(e.options.v6, e.options.v6only, from)
+                    || e.bound.and_then(|b| b.addr).is_some_and(|addr| local != Some(addr))
+                    || raw && e.peer.is_some_and(|p| p.addr != from)
                 {
                     continue;
                 }
@@ -2218,9 +2275,9 @@ fn configure_datagram(prep: &mut ConnectPrep, proto: Proto, req: Bound, i: usize
             p.socket.set_hop_limit(Some(ttl));
             p.socket.bind(listen_endpoint(req, i)).map_err(|_| NetError::Inval)
         }
-        (ConnectPrep::Icmp(p), Proto::IcmpEcho { .. }) => {
+        (ConnectPrep::Icmp(p), Proto::IcmpEcho { raw }) => {
             p.socket.set_hop_limit(Some(ttl));
-            p.socket.bind(icmp::Endpoint::Ident(req.port)).map_err(|_| NetError::Inval)
+            if raw { Ok(()) } else { p.socket.bind(icmp::Endpoint::Ident(req.port)).map_err(|_| NetError::Inval) }
         }
         _ => Err(NetError::Inval),
     }

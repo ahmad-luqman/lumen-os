@@ -280,3 +280,50 @@ fn retired_tcp_queues_need_no_backup_allocation_and_refund_exactly_once() {
         0
     );
 }
+
+#[test]
+fn bound_icmp_egress_and_identifier_selection_allocate_nothing() {
+    // The per-socket ICMP egress path must retain the stack's no-allocation
+    // guarantee, including Ethernet neighbor discovery before the echo.
+    for (raw, alias) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut s, mut peer, _, _) = wire_stacks();
+        let b = budget();
+        let prep = prepare_icmp(b).unwrap();
+        assert_eq!(
+            counted(|| {
+                let id = s.open(Family::V4, Proto::IcmpEcho { raw }).unwrap();
+                if alias {
+                    s.bind(
+                        id,
+                        BindReq { addr: Some(IpAddress::v4(127, 0, 0, 2)), ..BindReq::default() },
+                        Preps::Icmp(&mut [prep].into_iter()),
+                        Instant::ZERO,
+                    )
+                    .unwrap();
+                    s.connect(id, IpEndpoint::new(IpAddress::v4(127, 0, 0, 9), 0), None, Instant::ZERO).unwrap();
+                } else {
+                    s.connect(
+                        id,
+                        IpEndpoint::new(IpAddress::v4(10, 0, 0, 2), 0),
+                        Some(ConnectPrep::Icmp(prep)),
+                        Instant::ZERO,
+                    )
+                    .unwrap();
+                }
+                let mut request = [8, 0, 0, 0, 4, 89, 0, 1];
+                smoltcp::wire::Icmpv4Packet::new_unchecked(&mut request[..]).fill_checksum();
+                s.send(id, &request, None, Preps::None, Instant::ZERO).unwrap();
+                let mut now = 0;
+                wire_steps(&mut s, &mut peer, &mut now, 16);
+                let mut data = [0; 32];
+                let received = s.recv(id, &mut data, false).unwrap();
+                let offset = if raw { 20 } else { 0 };
+                assert_eq!(received.full_len, offset + 8);
+                assert_eq!(data[offset], 0);
+                s.close(id, false, Instant::from_millis(now));
+            }),
+            0
+        );
+        assert_eq!(b.used(), 0);
+    }
+}

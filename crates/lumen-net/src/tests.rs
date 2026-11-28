@@ -677,3 +677,179 @@ fn icmp_ttl_before_and_after_bind_reaches_all_transports_and_wire() {
         }
     }
 }
+
+fn icmp_reply_frame(src: IpAddress, dst: IpAddress, ident: u16, sequence: u16, ethernet: bool) -> Vec<u8> {
+    use smoltcp::wire::{Icmpv4Packet, Icmpv6Packet, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr};
+    let offset = if ethernet { 14 } else { 0 };
+    let header = if src.is_ipv4() { 20 } else { 40 };
+    let mut frame = alloc::vec![0; offset + header + 8];
+    if ethernet {
+        frame[..6].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 9]);
+        frame[12..14].copy_from_slice(if src.is_ipv4() { &[8, 0] } else { &[0x86, 0xdd] });
+    }
+    let data = &mut frame[offset + header..];
+    data[4..6].copy_from_slice(&ident.to_be_bytes());
+    data[6..8].copy_from_slice(&sequence.to_be_bytes());
+    match (src, dst) {
+        (IpAddress::Ipv4(src_addr), IpAddress::Ipv4(dst_addr)) => {
+            Icmpv4Packet::new_unchecked(data).fill_checksum();
+            Ipv4Repr { src_addr, dst_addr, next_header: IpProtocol::Icmp, payload_len: 8, hop_limit: 64 }
+                .emit(&mut Ipv4Packet::new_unchecked(&mut frame[offset..]), &Default::default());
+        }
+        (IpAddress::Ipv6(src_addr), IpAddress::Ipv6(dst_addr)) => {
+            data[0] = 129;
+            Icmpv6Packet::new_unchecked(data).fill_checksum(&src_addr, &dst_addr);
+            Ipv6Repr { src_addr, dst_addr, next_header: IpProtocol::Icmpv6, payload_len: 8, hop_limit: 64 }
+                .emit(&mut Ipv6Packet::new_unchecked(&mut frame[offset..]));
+        }
+        _ => unreachable!(),
+    }
+    frame
+}
+
+#[test]
+fn ping_same_identifier_filters_each_bound_local_address_v4_and_v6() {
+    // Linux v6.12 net/ipv4/ping.c, ping_lookup:194-218 checks the
+    // identifier and inet_rcv_saddr / sk_v6_rcv_saddr against destination.
+    for v6 in [false, true] {
+        let mut s = stack();
+        let b = budget();
+        let addresses = if v6 {
+            [
+                IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+            ]
+        } else {
+            [IpAddress::v4(127, 0, 0, 1), IpAddress::v4(127, 0, 0, 2)]
+        };
+        if v6 {
+            eth(&mut s, 0);
+            // Production eth0 has IPv4 configuration only. Install two test
+            // IPv6 addresses so real ingress can exercise the same filter.
+            s.interfaces[1].as_mut().unwrap().iface.update_ip_addrs(|a| {
+                a.clear();
+                for addr in addresses {
+                    a.push(IpCidr::new(addr, 64)).unwrap();
+                }
+            });
+        }
+        let mut ids = Vec::new();
+        for addr in addresses {
+            let id = s.open(Family::of(addr), Proto::IcmpEcho { raw: false }).unwrap();
+            s.bind(
+                id,
+                BindReq { addr: Some(addr), port: 0x459, ..BindReq::default() },
+                Preps::Icmp(&mut [prepare_icmp(b).unwrap()].into_iter()),
+                Instant::ZERO,
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        s.changed();
+        // Keep the first result cached while alternating later arrivals;
+        // this exercises destination FIFO alignment behind the cached head.
+        for sequence in 0..6 {
+            let dst = addresses[sequence % 2];
+            let p = icmp_reply_frame(addresses[0], dst, 0x459, sequence as u16, v6);
+            s.frame[..p.len()].copy_from_slice(&p);
+            s.ingress_frame(usize::from(v6), p.len(), Instant::ZERO);
+            if sequence == 0 {
+                assert!(s.changed().contains(&ids[0]));
+                assert!(!s.readiness(ids[1]).readable);
+            }
+        }
+        for (index, id) in ids.into_iter().enumerate() {
+            for sequence in (index..6).step_by(2) {
+                let mut data = [0; 8];
+                assert_eq!(s.recv(id, &mut data, false).unwrap().full_len, 8);
+                assert_eq!(u16::from_be_bytes([data[6], data[7]]), sequence as u16);
+            }
+            assert_eq!(s.recv(id, &mut [0; 8], false), Err(NetError::WouldBlock));
+        }
+    }
+}
+
+#[test]
+fn connected_raw_icmp_rejects_replies_from_other_peers() {
+    // Linux v6.12 net/ipv4/raw.c, raw_v4_match:125-128 and
+    // net/ipv6/raw.c, raw_v6_match:72-80 check remote and local addresses.
+    for v6 in [false, true] {
+        let mut s = stack();
+        let b = budget();
+        let local = loopback_addr(v6);
+        let id = s.open(Family::of(local), Proto::IcmpEcho { raw: true }).unwrap();
+        s.connect(id, IpEndpoint::new(local, 0), Some(ConnectPrep::Icmp(prepare_icmp(b).unwrap())), Instant::ZERO)
+            .unwrap();
+        let mut request = [8, 0, 0, 0, 4, 89, 0, 0];
+        if v6 {
+            request[0] = 128;
+        }
+        s.send(id, &request, None, Preps::None, Instant::ZERO).unwrap();
+        // Do not poll egress yet; only the deliberately injected replies
+        // reach the receive queue in this fixture.
+        let other = if v6 {
+            IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9))
+        } else {
+            IpAddress::v4(127, 0, 0, 9)
+        };
+        for (src, sequence) in [(other, 1), (local, 2)] {
+            let p = icmp_reply_frame(src, local, 0x459, sequence, false);
+            s.frame[..p.len()].copy_from_slice(&p);
+            s.ingress_frame(0, p.len(), Instant::ZERO);
+        }
+        let mut data = [0; 64];
+        let r = s.recv(id, &mut data, false).unwrap();
+        let offset = if v6 { 0 } else { 20 };
+        assert_eq!(r.from.unwrap().addr, local);
+        assert_eq!(data[offset + 7], 2);
+        assert_eq!(s.recv(id, &mut data, false), Err(NetError::WouldBlock));
+    }
+}
+
+#[test]
+fn icmp_source_override_preserves_checksums_and_neighbor_discovery() {
+    // Linux v6.12 net/ipv4/ping.c, ping_v4_sendmsg:761-762 selects the
+    // bound source. The adapter must keep IPv6's pseudo-header checksum
+    // consistent, without changing neighbor discovery or other protocols.
+    use smoltcp::wire::{Icmpv6Packet, Ipv4Packet, Ipv6Packet};
+    for ethernet in [false, true] {
+        for v6 in [false, true] {
+            let original = loopback_addr(v6);
+            let replacement = if v6 {
+                IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+            } else {
+                IpAddress::v4(127, 0, 0, 2)
+            };
+            let mut frame = icmp_reply_frame(original, original, 1234, 1, ethernet);
+            let offset = if ethernet { 14 } else { 0 };
+            let header = if v6 { 40 } else { 20 };
+            frame[offset + header] = if v6 { 128 } else { 8 };
+            crate::packet::icmp_source(&mut frame, ethernet, replacement);
+            if v6 {
+                let ip = Ipv6Packet::new_checked(&frame[offset..]).unwrap();
+                assert_eq!(IpAddress::Ipv6(ip.src_addr()), replacement);
+                assert!(
+                    Icmpv6Packet::new_checked(ip.payload()).unwrap().verify_checksum(&ip.src_addr(), &ip.dst_addr())
+                );
+                // A neighbor solicitation is generated while resolving an
+                // echo's route; its source must stay as smoltcp selected it.
+                frame[offset + header] = 135;
+            } else {
+                let ip = Ipv4Packet::new_checked(&frame[offset..]).unwrap();
+                assert_eq!(IpAddress::Ipv4(ip.src_addr()), replacement);
+                assert!(ip.verify_checksum());
+                frame[offset + 9] = 17; // UDP is not this adapter's traffic.
+            }
+            let before = frame.clone();
+            crate::packet::icmp_source(&mut frame, ethernet, original);
+            assert_eq!(frame, before);
+            if ethernet {
+                frame[12..14].copy_from_slice(&[8, 6]); // ARP
+                let before = frame.clone();
+                crate::packet::icmp_source(&mut frame, true, original);
+                assert_eq!(frame, before);
+            }
+        }
+    }
+}
