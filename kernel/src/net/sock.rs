@@ -33,10 +33,6 @@ pub const SOCK_DEV: DevId = DevId::makedev(0, 8);
 /// (Linux v6.12 `include/linux/fs.h` `MAX_RW_COUNT`).
 pub const MAX_RW_COUNT: usize = 0x7fff_f000;
 
-/// Fallback polling step when a buggy [`Pollable`] returns no [`PollGuard`]
-/// in [`block_on`] (10 ms).
-const NO_GUARD_FALLBACK_NS: u64 = 10_000_000;
-
 /// Monotonic inode allocator for `sockfs` (`socket:[ino]`).
 static NEXT_SOCK_INO: AtomicU64 = AtomicU64::new(1);
 
@@ -274,11 +270,12 @@ impl Drop for InFlightFile {
 /// One send's user side, decoded by the handler: spans checked
 /// (`UIO_MAXIOV`), any non-null destination copied and length-checked
 /// (`named == true` when `msg_namelen != 0`; decoded into `to` for datagram
-/// and raw sockets only), and the control buffer (at most 131072 bytes,
-/// Linux's `optmem_max` since 6.8; `-ENOBUFS` past it) walked with `CmsgIter`:
-/// `SCM_RIGHTS` resolved to `InFlightFile`s, `SCM_CREDENTIALS` decoded,
-/// messages at levels other than `SOL_SOCKET` skipped, an unknown `SOL_SOCKET`
-/// type `-EINVAL`.
+/// and raw sockets only), and the control buffer (strictly below 131072 bytes,
+/// Linux's `optmem_max` / `sock_kmalloc`; `-ENOBUFS` at or past it) walked
+/// with `CmsgIter`: for `AF_UNIX`, `SCM_RIGHTS` resolved to `InFlightFile`s
+/// and `SCM_CREDENTIALS` decoded; for inet, `SCM_RIGHTS`/`SCM_CREDENTIALS`
+/// skipped (`__sock_cmsg_send`); messages at levels other than `SOL_SOCKET`
+/// skipped, an unknown or unimplemented `SOL_SOCKET` type `-EINVAL`.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // read by family SockOps implementations (C1/C3/C4/C6)
 pub struct SendIo<'a> {
     pub iov: UserIovec<'a>,
@@ -318,11 +315,15 @@ pub struct RecvDone {
 ///
 /// Rules for every implementor:
 /// - Errors are positive Linux errnos.
+/// - `Pollable::poll` called with `Some(waker)` MUST return `Some(guard)`
+///   (`PollGuard`), as required by [`block_on`].
 /// - User copies through `SendIo::iov` / `RecvIo::iov` happen only under the
 ///   socket's own Lock 0 I/O lock, never under `NetStack::inner` or a spinlock,
 ///   and that lock is released around [`block_on`].
 /// - Readiness changes notify after the family's locks are released.
-/// - No family touches an FD table.
+/// - No family touches an FD table. On `Err` from `send` or `recv`, any
+///   [`InFlightFile`] the family already took or dequeued must be dropped only
+///   after releasing its locks (ARCHITECTURE section 9's end-release rule).
 pub trait SockOps: Pollable + Send + Sync {
     fn family(&self) -> Family;
     fn kind(&self) -> SockKind;
@@ -421,9 +422,9 @@ pub fn block_on(src: &dyn Pollable, deadline: Option<u64>, mut ready: impl FnMut
     let waiter = SockPollWait::new();
     let waker: Arc<dyn PollWaker> = waiter.clone();
     // Subscribe before re-checking `ready()` so no wakeup between the check
-    // and the sleep can be missed; `guard` stays held until `block_on` exits.
-    let (_mask, guard) = src.poll(AccessMode::ReadWrite, Some(&waker));
-    debug_assert!(guard.is_some(), "block_on source returned no PollGuard");
+    // and the sleep can be missed; `_guard` stays held until `block_on` exits.
+    let (_mask, _guard) = src.poll(AccessMode::ReadWrite, Some(&waker));
+    debug_assert!(_guard.is_some(), "block_on source returned no PollGuard");
 
     loop {
         // Clear `fired` BEFORE checking `ready()` so any notification arriving
@@ -434,28 +435,11 @@ pub fn block_on(src: &dyn Pollable, deadline: Option<u64>, mut ready: impl FnMut
         }
         #[cfg(feature = "ktest")]
         block_on_window::fire_if_armed();
-        let now = time::now_ns();
-        if let Some(dl) = deadline
-            && now >= dl
-        {
+        if deadline.is_some_and(|dl| time::now_ns() >= dl) {
             return Err(errno::EAGAIN);
         }
-        let step = if guard.is_none() {
-            let cap = now.saturating_add(NO_GUARD_FALLBACK_NS);
-            Some(deadline.map_or(cap, |dl| dl.min(cap)))
-        } else {
-            deadline
-        };
-        match waiter.queue.wait_interruptible(step, || waiter.fired.load(Ordering::SeqCst)) {
-            sched::Wake::Woken => {}
-            sched::Wake::TimedOut => {
-                if ready() {
-                    return Ok(());
-                }
-                if deadline.is_some_and(|dl| time::now_ns() >= dl) {
-                    return Err(errno::EAGAIN);
-                }
-            }
+        match waiter.queue.wait_interruptible(deadline, || waiter.fired.load(Ordering::SeqCst)) {
+            sched::Wake::Woken | sched::Wake::TimedOut => {}
             sched::Wake::Interrupted => {
                 return Err(if deadline.is_some() { errno::EINTR } else { ERESTARTSYS });
             }
@@ -754,6 +738,29 @@ mod ktest_support {
         -(code as i64) as u64
     }
 
+    pub fn put_msghdr(va: u64, hdr: &lumen_sockabi::abi::Msghdr) -> Result<(), &'static str> {
+        crate::user::copy_to_user(va, &hdr.to_bytes()).map_err(|_| "copy msghdr")
+    }
+
+    pub fn get_msghdr(va: u64) -> Result<lumen_sockabi::abi::Msghdr, &'static str> {
+        let mut raw = [0u8; lumen_sockabi::MSGHDR_LEN];
+        copy_from_user(&mut raw, va).map_err(|_| "read msghdr")?;
+        Ok(lumen_sockabi::abi::Msghdr::from_bytes(&raw))
+    }
+
+    pub fn install_mock(
+        family: Family,
+        kind: SockKind,
+        protocol: i32,
+    ) -> Result<(Arc<MockSock>, u64, u64), &'static str> {
+        let sock = MockSock::new(family, kind, protocol);
+        let file = new_socket_file(Arc::clone(&sock) as Arc<dyn SockOps>, false).map_err(|_| "new_socket_file")?;
+        let id = file.id();
+        let fd = process::install_current_fd(file, false).map_err(|_| "install mock fd")? as u64;
+        Ok((sock, fd, id))
+    }
+
+    #[derive(Default)]
     pub struct MockState {
         pub buf: VecDeque<u8>,
         pub queued_rights: Vec<InFlightFile>,
@@ -766,20 +773,23 @@ mod ktest_support {
         pub last_bind: Option<SockAddr>,
         pub last_listen: Option<i32>,
         pub last_connect: Option<(SockAddr, bool)>,
+        pub last_accept_nonblock: Option<bool>,
         pub disconnects: usize,
         pub last_send_flags: Option<u32>,
         pub last_send_nonblock: Option<bool>,
         pub last_send_to: Option<SockAddr>,
         pub last_send_named: Option<bool>,
         pub last_send_creds: Option<Ucred>,
+        pub last_send_iov_len: Option<usize>,
         pub fail_next_send: Option<u32>,
         pub last_recv_flags: Option<u32>,
         pub last_recv_nonblock: Option<bool>,
+        pub next_recv_flags: u32,
         pub last_shutdown: Option<ShutdownHow>,
         pub last_opt_set: Option<(SockOpt, OptVal)>,
         pub opt_reuseaddr: i32,
         pub opt_linger: lumen_sockabi::Linger,
-        pub opt_rcvtimeo: lumen_sockabi::Timeout,
+        pub opt_rcvtimeo: Option<lumen_sockabi::Timeout>,
         pub send_calls: usize,
         pub recv_calls: usize,
         pub accept_calls: usize,
@@ -788,37 +798,7 @@ mod ktest_support {
 
     impl MockState {
         fn new() -> Self {
-            Self {
-                buf: VecDeque::new(),
-                queued_rights: Vec::new(),
-                queued_creds: None,
-                queued_from: None,
-                pending_accept: None,
-                local: None,
-                peer: None,
-                mask: PollMask::OUT | PollMask::WRNORM,
-                last_bind: None,
-                last_listen: None,
-                last_connect: None,
-                disconnects: 0,
-                last_send_flags: None,
-                last_send_nonblock: None,
-                last_send_to: None,
-                last_send_named: None,
-                last_send_creds: None,
-                fail_next_send: None,
-                last_recv_flags: None,
-                last_recv_nonblock: None,
-                last_shutdown: None,
-                last_opt_set: None,
-                opt_reuseaddr: 0,
-                opt_linger: lumen_sockabi::Linger::default(),
-                opt_rcvtimeo: lumen_sockabi::Timeout::Infinite,
-                send_calls: 0,
-                recv_calls: 0,
-                accept_calls: 0,
-                fionread_calls: 0,
-            }
+            Self { mask: PollMask::OUT | PollMask::WRNORM, ..Self::default() }
         }
     }
 
@@ -878,9 +858,10 @@ mod ktest_support {
             Ok(())
         }
 
-        fn accept(&self, _nonblock: bool) -> Result<(Arc<dyn SockOps>, Option<SockAddr>), u32> {
+        fn accept(&self, nonblock: bool) -> Result<(Arc<dyn SockOps>, Option<SockAddr>), u32> {
             let mut st = self.state.lock();
             st.accept_calls += 1;
+            st.last_accept_nonblock = Some(nonblock);
             st.pending_accept.take().ok_or(errno::EAGAIN)
         }
 
@@ -899,13 +880,8 @@ mod ktest_support {
         }
 
         fn send(&self, io: &mut SendIo<'_>) -> Result<usize, u32> {
-            // Copy from user space outside the spinlock (SockOps contract).
             let total = io.iov.total_len();
-            let mut data = alloc::vec![0u8; total];
-            let n = io.iov.copy_from_user(0, &mut data)?;
-            data.truncate(n);
-
-            let old_rights = {
+            {
                 let mut st = self.state.lock();
                 st.send_calls += 1;
                 st.last_send_flags = Some(io.flags);
@@ -913,9 +889,18 @@ mod ktest_support {
                 st.last_send_to = io.to;
                 st.last_send_named = Some(io.named);
                 st.last_send_creds = io.creds;
+                st.last_send_iov_len = Some(total);
                 if let Some(err) = st.fail_next_send.take() {
                     return Err(err);
                 }
+            }
+            // Copy from user space outside the spinlock (SockOps contract).
+            let mut data = alloc::vec![0u8; total];
+            let n = io.iov.copy_from_user(0, &mut data)?;
+            data.truncate(n);
+
+            let old_rights = {
+                let mut st = self.state.lock();
                 st.buf.extend(&data);
                 if io.creds.is_some() {
                     st.queued_creds = io.creds;
@@ -935,21 +920,22 @@ mod ktest_support {
 
         fn recv(&self, io: &mut RecvIo<'_>) -> Result<RecvDone, u32> {
             let want = io.iov.total_len();
-            let (chunk, rights, creds, from) = {
+            let (chunk, rights, creds, from, msg_flags) = {
                 let mut st = self.state.lock();
                 st.recv_calls += 1;
                 st.last_recv_flags = Some(io.flags);
                 st.last_recv_nonblock = Some(io.nonblock);
+                let msg_flags = core::mem::take(&mut st.next_recv_flags);
                 let take = want.min(st.buf.len());
                 let chunk: Vec<u8> = st.buf.drain(..take).collect();
                 let rights = core::mem::take(&mut st.queued_rights);
                 let creds = st.queued_creds.take();
                 let from = st.queued_from.or(st.peer);
-                (chunk, rights, creds, from)
+                (chunk, rights, creds, from, msg_flags)
             };
             // Copy to user space outside the spinlock (SockOps contract).
             let copied = io.iov.copy_to_user(0, &chunk)?;
-            Ok(RecvDone { bytes: copied, msg_flags: 0, from, rights, creds })
+            Ok(RecvDone { bytes: copied, msg_flags, from, rights, creds })
         }
 
         fn shutdown(&self, how: ShutdownHow) -> Result<(), u32> {
@@ -971,7 +957,7 @@ mod ktest_support {
             match (opt, *val) {
                 (SockOpt::ReuseAddr, OptVal::Int(v)) => st.opt_reuseaddr = i32::from(v != 0),
                 (SockOpt::Linger, OptVal::Linger(l)) => st.opt_linger = l,
-                (SockOpt::RcvTimeo, OptVal::Timeout(t)) => st.opt_rcvtimeo = t,
+                (SockOpt::RcvTimeo, OptVal::Timeout(t)) => st.opt_rcvtimeo = Some(t),
                 _ => return Err(errno::ENOPROTOOPT),
             }
             Ok(())
@@ -982,7 +968,7 @@ mod ktest_support {
             match opt {
                 SockOpt::ReuseAddr => Ok(OptVal::Int(st.opt_reuseaddr)),
                 SockOpt::Linger => Ok(OptVal::Linger(st.opt_linger)),
-                SockOpt::RcvTimeo => Ok(OptVal::Timeout(st.opt_rcvtimeo)),
+                SockOpt::RcvTimeo => Ok(OptVal::Timeout(st.opt_rcvtimeo.unwrap_or(lumen_sockabi::Timeout::Infinite))),
                 SockOpt::Type => Ok(OptVal::Int(self.kind.to_raw())),
                 SockOpt::Domain => Ok(OptVal::Int(i32::from(self.family.to_raw()))),
                 SockOpt::Protocol => Ok(OptVal::Int(self.protocol)),
@@ -1179,7 +1165,7 @@ crate::ktest!(
                 syscall(general::__NR_socket, [u64::from(net::AF_UNIX), 4, 0, 0, 0, 0]),
                 neg(errno::ESOCKTNOSUPPORT)
             );
-            // Protocol checked before type in `unix_create` (af_unix.c:1068): bad protocol wins over bad type 4.
+            // Protocol checked before type in `unix_create` (af_unix.c:1068 before 1073): bad protocol wins over bad type 4.
             kassert_eq!(
                 syscall(general::__NR_socket, [u64::from(net::AF_UNIX), 4, 99, 0, 0, 0]),
                 neg(errno::EPROTONOSUPPORT)
@@ -1210,8 +1196,14 @@ crate::ktest!(
                 ),
                 neg(errno::EPROTONOSUPPORT)
             );
+            // Linux v6.12 `include/uapi/linux/in.h:84-88`: `IPPROTO_SMC` = 256 -> -EPROTONOSUPPORT,
+            // `IPPROTO_MAX` = 263 -> -EINVAL (`net/ipv4/af_inet.c:263`).
             kassert_eq!(
                 syscall(general::__NR_socket, [u64::from(net::AF_INET), u64::from(net::SOCK_STREAM), 256, 0, 0, 0]),
+                neg(errno::EPROTONOSUPPORT)
+            );
+            kassert_eq!(
+                syscall(general::__NR_socket, [u64::from(net::AF_INET), u64::from(net::SOCK_STREAM), 263, 0, 0, 0]),
                 neg(errno::EINVAL)
             );
             // Linux v6.12 `__sys_socketpair` (net/socket.c:1779 before 1796): type/protocol errors before inet -EOPNOTSUPP.
@@ -1301,7 +1293,7 @@ crate::ktest!(
             kassert_eq!(st_mode & general::S_IFMT, general::S_IFSOCK);
 
             // /proc/<pid>/fd/<fd> reports `socket:[<st_ino>]` and refuses reopen with -ENXIO
-            // unless O_PATH (Linux v6.12 `sock_no_open`, net/socket.c:1303).
+            // unless O_PATH (Linux v6.12 `inode_init_always` leaves `i_fop = &no_open_fops` via `sock_alloc`).
             let expected_target = format!("socket:[{st_ino}]");
             let proc_path = format!("/proc/{pid}/fd/{fd}\0");
             copy_to_user(path_va, proc_path.as_bytes()).map_err(|_| "copy proc path")?;
@@ -1321,6 +1313,27 @@ crate::ktest!(
                 syscall(general::__NR_openat, [general::AT_FDCWD as u64, path_va, u64::from(general::O_PATH), 0, 0, 0]);
             kassert!((opath_fd as i64) >= 0);
             kassert_eq!(syscall(general::__NR_close, [opath_fd, 0, 0, 0, 0, 0]), 0);
+
+            // Family errors pass straight through (`CountingSock` returns `Err(EOPNOTSUPP)`).
+            let mut unix_enc = [0u8; 32];
+            let u_addr = SockAddr::Unix(lumen_sockabi::UnixName::abstract_name(b"err").map_err(|_| "unix name")?);
+            let u_len = u_addr.encode(&mut unix_enc);
+            copy_to_user(link_va, &unix_enc[..u_len]).map_err(|_| "copy u_addr")?;
+            kassert_eq!(syscall(general::__NR_bind, [fd, link_va, u_len as u64, 0, 0, 0]), neg(errno::EOPNOTSUPP));
+            kassert_eq!(syscall(general::__NR_listen, [fd, 8, 0, 0, 0, 0]), neg(errno::EOPNOTSUPP));
+            kassert_eq!(syscall(general::__NR_connect, [fd, link_va, u_len as u64, 0, 0, 0]), neg(errno::EOPNOTSUPP));
+            kassert_eq!(
+                syscall(general::__NR_shutdown, [fd, u64::from(net::SHUT_WR), 0, 0, 0, 0]),
+                neg(errno::EOPNOTSUPP)
+            );
+            copy_to_user(int_va, &1i32.to_le_bytes()).map_err(|_| "copy opt 1")?;
+            kassert_eq!(
+                syscall(
+                    general::__NR_setsockopt,
+                    [fd, u64::from(net::SOL_SOCKET), u64::from(net::SO_REUSEADDR), int_va, 4, 0]
+                ),
+                neg(errno::EOPNOTSUPP)
+            );
 
             // lseek / pread64 / pwrite64 -> -ESPIPE; mmap -> -ENODEV.
             kassert_eq!(
@@ -1500,53 +1513,30 @@ crate::ktest!(
 
 crate::ktest!(
     fn socket_io_and_poll_reach_sockops() {
-        use core::sync::atomic::{AtomicBool, Ordering};
-        use core::time::Duration;
+        use core::sync::atomic::Ordering;
 
-        use crate::linux::process::{KernelSigaction, Rlimit, RlimitKind};
-        use crate::linux::signal::raise_for_test;
         use crate::linux::{errno, general, ioctl, net};
         use crate::user::{copy_from_user, copy_to_user};
         use crate::{kassert, kassert_eq};
-        use ktest_support::{MockSock, neg, syscall};
-        use lumen_signal::Signal;
+        use ktest_support::{install_mock, neg, put_msghdr, syscall};
         use lumen_sockabi::abi::Msghdr;
-        use lumen_sockabi::{
-            AF_UNIX, AF_UNSPEC, CmsgIter, CmsgWriter, Ipv4Addr, Linger, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT,
-            MSG_EOR, MSG_ERRQUEUE, MSG_OOB, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, SocketAddrV4, Timeout, Timeval,
-            UnixName, cmsg_len, cmsg_space,
-        };
+        use lumen_sockabi::{MSG_DONTWAIT, MSG_EOR};
 
-        process::in_test_process(|pid| -> crate::ktest::TestResult {
+        process::in_test_process(|_pid| -> crate::ktest::TestResult {
             let base = process::KTEST_USER_VA;
             let buf_va = base + 64;
             let out_va = base + 256;
             let iov_va = base + 512;
-            let addr_va = base + 768;
             let len_va = base + 900;
             let poll_va = base + 960;
             let msg_va = base + 1024;
-            let ctl_va = base + 1280;
-            let opt_va = base + 1792;
-            let path_va = base + 1920;
 
-            // Install stream, datagram, and seqpacket MockSocks.
-            let stream = MockSock::new(Family::Inet, SockKind::Stream, net::IPPROTO_TCP as i32);
-            let stream_file = new_socket_file(Arc::clone(&stream) as Arc<dyn SockOps>, false).map_err(|_| "stream")?;
-            let sfd_id = stream_file.id();
-            let sfd = process::install_current_fd(stream_file, false).map_err(|_| "install sfd")? as u64;
-
-            let dgram = MockSock::new(Family::Unix, SockKind::Dgram, 0);
-            let dgram_file = new_socket_file(Arc::clone(&dgram) as Arc<dyn SockOps>, false).map_err(|_| "dgram")?;
-            let dfd = process::install_current_fd(dgram_file, false).map_err(|_| "install dfd")? as u64;
-
-            let seq = MockSock::new(Family::Unix, SockKind::Seqpacket, 0);
-            let seq_file = new_socket_file(Arc::clone(&seq) as Arc<dyn SockOps>, false).map_err(|_| "seq")?;
-            let qfd = process::install_current_fd(seq_file, false).map_err(|_| "install qfd")? as u64;
+            let (stream, sfd, _) = install_mock(Family::Inet, SockKind::Stream, net::IPPROTO_TCP as i32)?;
+            let (seq, qfd, _) = install_mock(Family::Unix, SockKind::Seqpacket, 0)?;
 
             // 1. write -> SockOps::send(flags=0), FIONREAD -> SockOps::fionread, read -> SockOps::recv(flags=0),
             //    zero-length read/readv bypass recv (Linux v6.12 net/socket.c:1140 `sock_read_iter`),
-            //    seqpacket write/writev set MSG_EOR (net/socket.c:1162 `sock_write_iter`), and nonblock propagation.
+            //    seqpacket write/writev set MSG_EOR (net/socket.c:1162 `sock_write_iter`).
             copy_to_user(buf_va, b"hello").map_err(|_| "copy hello")?;
             kassert_eq!(syscall(general::__NR_write, [sfd, buf_va, 5, 0, 0, 0]), 5);
             kassert_eq!(stream.state.lock().send_calls, 1);
@@ -1558,16 +1548,13 @@ crate::ktest!(
             copy_from_user(&mut n_raw, len_va).map_err(|_| "read fionread")?;
             kassert_eq!(i32::from_le_bytes(n_raw), 5);
             kassert_eq!(stream.state.lock().fionread_calls, 1);
-            // Unknown ioctl on a socket returns -ENOTTY.
             kassert_eq!(
                 syscall(general::__NR_ioctl, [sfd, u64::from(ioctl::TCGETS), len_va, 0, 0, 0]),
                 neg(errno::ENOTTY)
             );
 
-            // Zero-length read returns 0 without calling SockOps::recv (sock_read_iter, net/socket.c:1140).
             kassert_eq!(syscall(general::__NR_read, [sfd, out_va, 0, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().recv_calls, 0);
-            // Faulting non-zero read still gives -EFAULT before recv.
             kassert_eq!(syscall(general::__NR_read, [sfd, 0xffff_8000_0000_0000u64, 4, 0, 0, 0]), neg(errno::EFAULT));
             kassert_eq!(stream.state.lock().recv_calls, 0);
 
@@ -1579,7 +1566,6 @@ crate::ktest!(
             kassert_eq!(stream.state.lock().last_recv_flags, Some(0));
             kassert_eq!(stream.state.lock().last_recv_nonblock, Some(false));
 
-            // Zero-length readv returns 0 without calling SockOps::recv (sock_read_iter, net/socket.c:1140).
             let mut zero_iovs = [0u8; 32];
             zero_iovs[0..8].copy_from_slice(&out_va.to_le_bytes());
             zero_iovs[16..24].copy_from_slice(&out_va.to_le_bytes());
@@ -1587,7 +1573,6 @@ crate::ktest!(
             kassert_eq!(syscall(general::__NR_readv, [sfd, iov_va, 2, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().recv_calls, 1);
 
-            // Seqpacket write/writev set MSG_EOR (Linux v6.12 net/socket.c:1162 `sock_write_iter`).
             kassert_eq!(syscall(general::__NR_write, [qfd, buf_va, 2, 0, 0, 0]), 2);
             kassert_eq!(seq.state.lock().last_send_flags, Some(MSG_EOR));
 
@@ -1622,7 +1607,23 @@ crate::ktest!(
             kassert_eq!(&p1, b"ab");
             kassert_eq!(&p2, b"cde");
 
-            // Nonblock propagation on read, write, sendmsg, recvmsg (O_NONBLOCK) and recvfrom(MSG_DONTWAIT).
+            // 3. single_span and UserIovec::new cap transfers at MAX_RW_COUNT (Linux v6.12 `import_ubuf`/`import_iovec`).
+            let big_spans = [UserSpan { base: 0x1000, len: MAX_RW_COUNT }, UserSpan { base: 0x2000, len: 4096 }];
+            kassert_eq!(UserIovec::new(&big_spans).total_len(), MAX_RW_COUNT);
+            stream.state.lock().fail_next_send = Some(errno::EAGAIN);
+            kassert_eq!(
+                syscall(general::__NR_write, [sfd, buf_va, MAX_RW_COUNT as u64 + 4096, 0, 0, 0]),
+                neg(errno::EAGAIN)
+            );
+            kassert_eq!(stream.state.lock().last_send_iov_len, Some(MAX_RW_COUNT));
+            stream.state.lock().fail_next_send = Some(errno::EAGAIN);
+            kassert_eq!(
+                syscall(general::__NR_sendto, [sfd, buf_va, MAX_RW_COUNT as u64 + 4096, 0, 0, 0]),
+                neg(errno::EAGAIN)
+            );
+            kassert_eq!(stream.state.lock().last_send_iov_len, Some(MAX_RW_COUNT));
+
+            // 4. Nonblock propagation on read, write, sendmsg, recvmsg (O_NONBLOCK) and recvfrom(MSG_DONTWAIT).
             kassert_eq!(
                 syscall(
                     general::__NR_fcntl,
@@ -1638,8 +1639,7 @@ crate::ktest!(
             one_iov[0..8].copy_from_slice(&buf_va.to_le_bytes());
             one_iov[8..16].copy_from_slice(&2u64.to_le_bytes());
             copy_to_user(iov_va, &one_iov).map_err(|_| "copy nb iov")?;
-            let nb_hdr = Msghdr { msg_iov: iov_va, msg_iovlen: 1, ..Default::default() };
-            copy_to_user(msg_va, &nb_hdr.to_bytes()).map_err(|_| "copy nb hdr")?;
+            put_msghdr(msg_va, &Msghdr { msg_iov: iov_va, msg_iovlen: 1, ..Default::default() })?;
             kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), 2);
             kassert_eq!(stream.state.lock().last_send_nonblock, Some(true));
             kassert_eq!(syscall(general::__NR_recvmsg, [sfd, msg_va, 0, 0, 0, 0]), 2);
@@ -1650,7 +1650,7 @@ crate::ktest!(
             kassert_eq!(syscall(general::__NR_recvfrom, [sfd, out_va, 1, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().last_recv_nonblock, Some(false));
 
-            // 3. poll reaches SockOps::poll both immediately and via blocking wakeup (KtestThread::settle).
+            // 5. poll reaches SockOps::poll both immediately and via blocking wakeup (KtestThread::settle).
             stream.set_mask_and_notify(PollMask::EMPTY);
             let mut pfd = [0u8; 8];
             pfd[0..4].copy_from_slice(&(sfd as i32).to_le_bytes());
@@ -1668,8 +1668,43 @@ crate::ktest!(
             copy_from_user(&mut pfd, poll_va).map_err(|_| "read revents")?;
             kassert_eq!(u16::from_le_bytes([pfd[6], pfd[7]]), PollMask::IN.bits());
 
-            // 4. bind, listen (with SOMAXCONN clamp + seqpacket), accept/accept4, connect (and AF_UNSPEC),
-            //    Call::Bind vs Call::Connect (unix autobind), shutdown, getsockname, getpeername (with canary).
+            kassert_eq!(syscall(general::__NR_close, [sfd, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [qfd, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(stream.releases.load(Ordering::SeqCst), 1);
+            kassert_eq!(seq.releases.load(Ordering::SeqCst), 1);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn socket_names_accept_and_options() {
+        use core::sync::atomic::Ordering;
+        use core::time::Duration;
+
+        use crate::linux::process::{Rlimit, RlimitKind};
+        use crate::linux::{errno, general, net};
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        use ktest_support::{MockSock, install_mock, neg, put_msghdr, syscall};
+        use lumen_sockabi::abi::Msghdr;
+        use lumen_sockabi::{AF_UNIX, AF_UNSPEC, Ipv4Addr, Linger, SocketAddrV4, Timeout, Timeval, UnixName};
+
+        process::in_test_process(|pid| -> crate::ktest::TestResult {
+            let base = process::KTEST_USER_VA;
+            let buf_va = base + 64;
+            let out_va = base + 256;
+            let iov_va = base + 512;
+            let addr_va = base + 768;
+            let len_va = base + 900;
+            let msg_va = base + 1024;
+            let opt_va = base + 1792;
+
+            let (stream, sfd, _) = install_mock(Family::Inet, SockKind::Stream, net::IPPROTO_TCP as i32)?;
+            let (dgram, dfd, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let (seq, qfd, _) = install_mock(Family::Unix, SockKind::Seqpacket, 0)?;
+
+            // 1. bind, Call::Bind vs Call::Connect (unix autobind, Linux v6.12 `unix_mkname_bsd` af_unix.c:358).
             let inet_addr = SockAddr::Inet(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
             let mut enc = [0u8; 128];
             let enc_len = inet_addr.encode(&mut enc);
@@ -1677,41 +1712,50 @@ crate::ktest!(
             kassert_eq!(syscall(general::__NR_bind, [sfd, addr_va, enc_len as u64, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().last_bind, Some(inet_addr));
 
-            // Call::Bind vs Call::Connect: AF_UNIX with addrlen == 2 autobinds (UnixName::Unnamed) on bind,
-            // but fails -EINVAL on connect (lumen-sockabi / Linux v6.12 `unix_mkname`).
             copy_to_user(addr_va, &AF_UNIX.to_le_bytes()).map_err(|_| "copy AF_UNIX")?;
             kassert_eq!(syscall(general::__NR_bind, [dfd, addr_va, 2, 0, 0, 0]), 0);
             kassert_eq!(dgram.state.lock().last_bind, Some(SockAddr::Unix(UnixName::Unnamed)));
             kassert_eq!(syscall(general::__NR_connect, [dfd, addr_va, 2, 0, 0, 0]), neg(errno::EINVAL));
 
-            // listen clamps negative / > SOMAXCONN backlogs to 4096 (Linux v6.12 `__sys_listen_socket`, net/socket.c:1888).
+            // 2. listen backlog clamp (Linux v6.12 `__sys_listen_socket`, net/socket.c:1888) and seqpacket/dgram.
             kassert_eq!(syscall(general::__NR_listen, [sfd, 16, 0, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().last_listen, Some(16));
             kassert_eq!(syscall(general::__NR_listen, [sfd, (-1i32) as u32 as u64, 0, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().last_listen, Some(4096));
             kassert_eq!(syscall(general::__NR_listen, [sfd, 100_000, 0, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().last_listen, Some(4096));
-            // listen succeeds on seqpacket, -EOPNOTSUPP on datagram.
             kassert_eq!(syscall(general::__NR_listen, [qfd, 8, 0, 0, 0, 0]), 0);
             kassert_eq!(seq.state.lock().last_listen, Some(8));
             kassert_eq!(syscall(general::__NR_listen, [dfd, 16, 0, 0, 0, 0]), neg(errno::EOPNOTSUPP));
 
-            // getsockname: truncated copy-out writes full length back without clobbering canary byte past *addrlen.
+            // 3. getsockname / getpeername truncated copy-out with canary, connect nonblock, AF_UNSPEC disconnect.
+            let mut n_raw = [0u8; 4];
+            let mut got_addr = [0u8; 16];
             copy_to_user(out_va, &[0xA5u8; 16]).map_err(|_| "fill canary")?;
             copy_to_user(len_va, &4i32.to_le_bytes()).map_err(|_| "copy len 4")?;
             kassert_eq!(syscall(general::__NR_getsockname, [sfd, out_va, len_va, 0, 0, 0]), 0);
             copy_from_user(&mut n_raw, len_va).map_err(|_| "read out len")?;
             kassert_eq!(i32::from_le_bytes(n_raw), enc_len as i32);
-            let mut got_addr = [0u8; 16];
             copy_from_user(&mut got_addr, out_va).map_err(|_| "read trunc sockname")?;
             kassert_eq!(&got_addr[..4], &enc[..4]);
             kassert_eq!(got_addr[4], 0xA5);
 
-            // getpeername before connect -> -ENOTCONN; after connect -> truncated copy-out + canary; AF_UNSPEC -> disconnect.
             copy_to_user(len_va, &16i32.to_le_bytes()).map_err(|_| "copy len 16")?;
             kassert_eq!(syscall(general::__NR_getpeername, [sfd, out_va, len_va, 0, 0, 0]), neg(errno::ENOTCONN));
             copy_to_user(addr_va, &enc[..enc_len]).map_err(|_| "copy inet_addr")?;
             kassert_eq!(syscall(general::__NR_connect, [sfd, addr_va, enc_len as u64, 0, 0, 0]), 0);
+            kassert_eq!(stream.state.lock().last_connect, Some((inet_addr, false)));
+            kassert_eq!(
+                syscall(
+                    general::__NR_fcntl,
+                    [sfd, u64::from(general::F_SETFL), u64::from(general::O_NONBLOCK), 0, 0, 0]
+                ),
+                0
+            );
+            kassert_eq!(syscall(general::__NR_connect, [sfd, addr_va, enc_len as u64, 0, 0, 0]), 0);
+            kassert_eq!(stream.state.lock().last_connect, Some((inet_addr, true)));
+            kassert_eq!(syscall(general::__NR_fcntl, [sfd, u64::from(general::F_SETFL), 0, 0, 0, 0]), 0);
+
             copy_to_user(out_va, &[0xA5u8; 16]).map_err(|_| "fill peer canary")?;
             copy_to_user(len_va, &4i32.to_le_bytes()).map_err(|_| "copy len 4")?;
             kassert_eq!(syscall(general::__NR_getpeername, [sfd, out_va, len_va, 0, 0, 0]), 0);
@@ -1725,20 +1769,36 @@ crate::ktest!(
             kassert_eq!(syscall(general::__NR_connect, [sfd, addr_va, 2, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().disconnects, 1);
 
-            // accept4 / accept: EMFILE reserves before accept; bad flags; SOCK_NONBLOCK & peer address bytes;
-            // syscall 43 (__NR_accept); faulting addr/addrlen installs no fd and releases child.
+            // 4. accept4 / accept: empty queue -EAGAIN frees reserved slot & passes nonblock;
+            //    EMFILE reserves before accept; bad flags; SOCK_NONBLOCK & peer addr; syscall 43; faulting addr/addrlen.
+            let open_before_accept = process::process_open_fds(pid).len();
+            kassert_eq!(syscall(general::__NR_accept4, [sfd, 0, 0, 0, 0, 0]), neg(errno::EAGAIN));
+            kassert_eq!(stream.state.lock().last_accept_nonblock, Some(false));
+            kassert_eq!(process::process_open_fds(pid).len(), open_before_accept);
+            kassert_eq!(
+                syscall(
+                    general::__NR_fcntl,
+                    [sfd, u64::from(general::F_SETFL), u64::from(general::O_NONBLOCK), 0, 0, 0]
+                ),
+                0
+            );
+            kassert_eq!(syscall(general::__NR_accept4, [sfd, 0, 0, 0, 0, 0]), neg(errno::EAGAIN));
+            kassert_eq!(stream.state.lock().last_accept_nonblock, Some(true));
+            kassert_eq!(syscall(general::__NR_fcntl, [sfd, u64::from(general::F_SETFL), 0, 0, 0, 0]), 0);
+
             let peer_sock = MockSock::new(Family::Inet, SockKind::Stream, net::IPPROTO_TCP as i32);
             stream.state.lock().pending_accept = Some((Arc::clone(&peer_sock) as Arc<dyn SockOps>, Some(inet_addr)));
+            let calls_before = stream.state.lock().accept_calls;
             let proc = process::current_process();
             let open_now = process::process_open_fds(pid).len() as u64;
             let orig_rlim = proc
                 .rlimit(RlimitKind::Nofile, Some(Rlimit::new(open_now, 1024).ok_or("rlim")?))
                 .map_err(|_| "set rlim")?;
             kassert_eq!(syscall(general::__NR_accept4, [sfd, 0, 0, 0, 0, 0]), neg(errno::EMFILE));
-            kassert_eq!(stream.state.lock().accept_calls, 0);
+            kassert_eq!(stream.state.lock().accept_calls, calls_before);
             let _ = proc.rlimit(RlimitKind::Nofile, Some(orig_rlim));
             kassert_eq!(syscall(general::__NR_accept4, [sfd, 0, 0, 0x100, 0, 0]), neg(errno::EINVAL));
-            kassert_eq!(stream.state.lock().accept_calls, 0);
+            kassert_eq!(stream.state.lock().accept_calls, calls_before);
 
             copy_to_user(len_va, &16i32.to_le_bytes()).map_err(|_| "copy len 16")?;
             let afd = syscall(
@@ -1759,7 +1819,6 @@ crate::ktest!(
             kassert_eq!(syscall(general::__NR_close, [afd, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(peer_sock.releases.load(Ordering::SeqCst), 1);
 
-            // Syscall 43 (__NR_accept): neither FD_CLOEXEC nor O_NONBLOCK.
             let peer_sock2 = MockSock::new(Family::Inet, SockKind::Stream, net::IPPROTO_TCP as i32);
             stream.state.lock().pending_accept = Some((Arc::clone(&peer_sock2) as Arc<dyn SockOps>, Some(inet_addr)));
             copy_to_user(len_va, &16i32.to_le_bytes()).map_err(|_| "copy len 16")?;
@@ -1771,8 +1830,6 @@ crate::ktest!(
             kassert_eq!(syscall(general::__NR_close, [afd2, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(peer_sock2.releases.load(Ordering::SeqCst), 1);
 
-            // accept4 with faulting addr or faulting addrlen installs no fd and releases the accepted child.
-            let open_before_accept = process::process_open_fds(pid).len();
             let fault_child1 = MockSock::new(Family::Inet, SockKind::Stream, net::IPPROTO_TCP as i32);
             stream.state.lock().pending_accept = Some((Arc::clone(&fault_child1) as Arc<dyn SockOps>, Some(inet_addr)));
             copy_to_user(len_va, &16i32.to_le_bytes()).map_err(|_| "copy len 16")?;
@@ -1786,12 +1843,16 @@ crate::ktest!(
             kassert_eq!(process::process_open_fds(pid).len(), open_before_accept);
             kassert_eq!(fault_child2.releases.load(Ordering::SeqCst), 1);
 
-            // shutdown valid and invalid.
+            // 5. shutdown: SHUT_RD, SHUT_WR, SHUT_RDWR, invalid.
+            kassert_eq!(syscall(general::__NR_shutdown, [sfd, u64::from(net::SHUT_RD), 0, 0, 0, 0]), 0);
+            kassert_eq!(stream.state.lock().last_shutdown, Some(ShutdownHow::Read));
             kassert_eq!(syscall(general::__NR_shutdown, [sfd, u64::from(net::SHUT_WR), 0, 0, 0, 0]), 0);
             kassert_eq!(stream.state.lock().last_shutdown, Some(ShutdownHow::Write));
+            kassert_eq!(syscall(general::__NR_shutdown, [sfd, u64::from(net::SHUT_RDWR), 0, 0, 0, 0]), 0);
+            kassert_eq!(stream.state.lock().last_shutdown, Some(ShutdownHow::Both));
             kassert_eq!(syscall(general::__NR_shutdown, [sfd, 3, 0, 0, 0, 0]), neg(errno::EINVAL));
 
-            // 5. setsockopt / getsockopt (including SO_RCVTIMEO round-trip and unix non-SOL_SOCKET getsockopt).
+            // 6. setsockopt / getsockopt (including SO_RCVTIMEO finite round-trip and AF_UNIX non-SOL_SOCKET).
             copy_to_user(opt_va, &1i32.to_le_bytes()).map_err(|_| "copy opt 1")?;
             kassert_eq!(
                 syscall(
@@ -1810,7 +1871,6 @@ crate::ktest!(
             );
             copy_from_user(&mut n_raw, out_va).map_err(|_| "read reuseaddr")?;
             kassert_eq!(i32::from_le_bytes(n_raw), 1);
-            // Get-only SO_TYPE fails on setsockopt (-ENOPROTOOPT), succeeds on getsockopt.
             kassert_eq!(
                 syscall(
                     general::__NR_setsockopt,
@@ -1833,7 +1893,6 @@ crate::ktest!(
                 ),
                 neg(errno::EINVAL)
             );
-            // Linger, SO_RCVTIMEO finite round-trip, and non-SOL_SOCKET on AF_UNIX (-EOPNOTSUPP for both set and get).
             let linger = Linger { onoff: 1, linger: 5 };
             copy_to_user(opt_va, &linger.to_bytes()).map_err(|_| "copy linger")?;
             kassert_eq!(
@@ -1854,7 +1913,7 @@ crate::ktest!(
                 ),
                 0
             );
-            kassert_eq!(stream.state.lock().opt_rcvtimeo, Timeout::Duration(Duration::from_millis(2_500)));
+            kassert_eq!(stream.state.lock().opt_rcvtimeo, Some(Timeout::Duration(Duration::from_millis(2_500))));
             copy_to_user(len_va, &16i32.to_le_bytes()).map_err(|_| "copy len 16")?;
             kassert_eq!(
                 syscall(
@@ -1883,68 +1942,40 @@ crate::ktest!(
                 neg(errno::EOPNOTSUPP)
             );
 
-            // 6. Destination names on stream/seqpacket (`move_addr_to_kernel`, Linux v6.12 net/socket.c:2203, 2510):
-            //    always copied and length-checked; `named` set; `to` decoded for datagram/raw only.
-            kassert_eq!(syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, 0x1000, 16]), neg(errno::EFAULT));
-            kassert_eq!(
-                syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, addr_va, (-1i32) as u32 as u64]),
-                neg(errno::EINVAL)
-            );
-            copy_to_user(addr_va, &enc[..enc_len]).map_err(|_| "copy inet_addr")?;
-            kassert_eq!(syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, addr_va, enc_len as u64]), 2);
-            kassert_eq!(stream.state.lock().last_send_named, Some(true));
-            kassert_eq!(stream.state.lock().last_send_to, None);
-            kassert_eq!(syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, 0, 0]), 2);
-            kassert_eq!(stream.state.lock().last_send_named, Some(false));
-            kassert_eq!(stream.state.lock().last_send_to, None);
-            kassert_eq!(syscall(general::__NR_sendto, [qfd, buf_va, 2, 0, addr_va, enc_len as u64]), 2);
-            kassert_eq!(seq.state.lock().last_send_named, Some(true));
-            kassert_eq!(seq.state.lock().last_send_to, None);
+            // 7. Plain AF_INET on AF_INET6:
+            //    - Call::Bind excludes v4-on-v6;
+            //    - UDP routes connect/sendto/sendmsg (`__ip6_datagram_connect` datagram.c:154, `udpv6_sendmsg`);
+            //    - TCP connect is length-first: 16B -> -EINVAL, 28B -> -EAFNOSUPPORT (`tcp_v6_connect` tcp_ipv6.c:152);
+            //    - Raw & ping connect give -EAFNOSUPPORT before length check (`ip6_datagram_connect_v6_only` datagram.c:285-292);
+            //    - Raw & ping sendto stay length-first: 16B -> -EINVAL, 28B -> -EAFNOSUPPORT (`rawv6_sendmsg`).
+            let (v6_udp, v6_udp_fd, _) = install_mock(Family::Inet6, SockKind::Dgram, net::IPPROTO_UDP as i32)?;
+            let (_v6_tcp, v6_tcp_fd, _) = install_mock(Family::Inet6, SockKind::Stream, net::IPPROTO_TCP as i32)?;
+            let (_v6_raw, v6_raw_fd, _) = install_mock(Family::Inet6, SockKind::Raw, net::IPPROTO_ICMPV6 as i32)?;
+            let (_v6_ping, v6_ping_fd, _) = install_mock(Family::Inet6, SockKind::Dgram, net::IPPROTO_ICMPV6 as i32)?;
 
-            let stream_bad_name_hdr =
-                Msghdr { msg_name: 0x1000, msg_namelen: 16, msg_iov: iov_va, msg_iovlen: 1, ..Default::default() };
-            copy_to_user(msg_va, &stream_bad_name_hdr.to_bytes()).map_err(|_| "copy bad name hdr")?;
-            kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), neg(errno::EFAULT));
-            let stream_named_hdr = Msghdr {
-                msg_name: addr_va,
-                msg_namelen: enc_len as i32,
-                msg_iov: iov_va,
-                msg_iovlen: 1,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &stream_named_hdr.to_bytes()).map_err(|_| "copy stream named hdr")?;
-            kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), 2);
-            kassert_eq!(stream.state.lock().last_send_named, Some(true));
-            kassert_eq!(stream.state.lock().last_send_to, None);
-
-            // 7. Plain AF_INET on AF_INET6 routed for UDP/dgram only (Linux v6.12
-            //    `__ip6_datagram_connect` net/ipv6/datagram.c:154, `tcp_v6_connect` net/ipv6/tcp_ipv6.c:152-156).
-            let v6_udp = MockSock::new(Family::Inet6, SockKind::Dgram, net::IPPROTO_UDP as i32);
-            let v6_udp_fd = process::install_current_fd(
-                new_socket_file(Arc::clone(&v6_udp) as Arc<dyn SockOps>, false).map_err(|_| "v6udp")?,
-                false,
-            )
-            .map_err(|_| "v6udp fd")? as u64;
-            let v6_tcp = MockSock::new(Family::Inet6, SockKind::Stream, net::IPPROTO_TCP as i32);
-            let v6_tcp_fd = process::install_current_fd(
-                new_socket_file(Arc::clone(&v6_tcp) as Arc<dyn SockOps>, false).map_err(|_| "v6tcp")?,
-                false,
-            )
-            .map_err(|_| "v6tcp fd")? as u64;
-            let v6_raw = MockSock::new(Family::Inet6, SockKind::Raw, net::IPPROTO_ICMPV6 as i32);
-            let v6_raw_fd = process::install_current_fd(
-                new_socket_file(Arc::clone(&v6_raw) as Arc<dyn SockOps>, false).map_err(|_| "v6raw")?,
-                false,
-            )
-            .map_err(|_| "v6raw fd")? as u64;
-            let v6_ping = MockSock::new(Family::Inet6, SockKind::Dgram, net::IPPROTO_ICMPV6 as i32);
-            let v6_ping_fd = process::install_current_fd(
-                new_socket_file(Arc::clone(&v6_ping) as Arc<dyn SockOps>, false).map_err(|_| "v6ping")?,
-                false,
-            )
-            .map_err(|_| "v6ping fd")? as u64;
-
+            let mut v4_padded = [0u8; 28];
+            v4_padded[..enc_len].copy_from_slice(&enc[..enc_len]);
             copy_to_user(addr_va, &enc[..enc_len]).map_err(|_| "copy v4 addr")?;
+            kassert_eq!(syscall(general::__NR_bind, [v6_udp_fd, addr_va, 16, 0, 0, 0]), neg(errno::EINVAL));
+            copy_to_user(addr_va, &v4_padded).map_err(|_| "copy 28B v4")?;
+            kassert_eq!(syscall(general::__NR_bind, [v6_udp_fd, addr_va, 28, 0, 0, 0]), neg(errno::EAFNOSUPPORT));
+
+            copy_to_user(buf_va, b"ok").map_err(|_| "copy ok")?;
+            let mut one_iov = [0u8; 16];
+            one_iov[0..8].copy_from_slice(&buf_va.to_le_bytes());
+            one_iov[8..16].copy_from_slice(&2u64.to_le_bytes());
+            copy_to_user(iov_va, &one_iov).map_err(|_| "copy one_iov")?;
+            copy_to_user(addr_va, &enc[..enc_len]).map_err(|_| "copy v4 addr")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_name: addr_va,
+                    msg_namelen: enc_len as i32,
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_connect, [v6_udp_fd, addr_va, enc_len as u64, 0, 0, 0]), 0);
             kassert_eq!(v6_udp.state.lock().last_connect, Some((inet_addr, false)));
             kassert_eq!(syscall(general::__NR_sendto, [v6_udp_fd, buf_va, 2, 0, addr_va, enc_len as u64]), 2);
@@ -1952,102 +1983,168 @@ crate::ktest!(
             kassert_eq!(syscall(general::__NR_sendmsg, [v6_udp_fd, msg_va, 0, 0, 0, 0]), 2);
             kassert_eq!(v6_udp.state.lock().last_send_to, Some(inet_addr));
 
-            // 16-byte AF_INET on TCP/raw/ping -> -EINVAL; 28-byte AF_INET -> -EAFNOSUPPORT.
-            let mut v4_padded = [0u8; 28];
-            v4_padded[..enc_len].copy_from_slice(&enc[..enc_len]);
-            for bad_v6 in [v6_tcp_fd, v6_raw_fd, v6_ping_fd] {
+            // TCP connect: length-first.
+            copy_to_user(addr_va, &enc[..enc_len]).map_err(|_| "copy 16B v4")?;
+            kassert_eq!(syscall(general::__NR_connect, [v6_tcp_fd, addr_va, 16, 0, 0, 0]), neg(errno::EINVAL));
+            copy_to_user(addr_va, &v4_padded).map_err(|_| "copy 28B v4")?;
+            kassert_eq!(syscall(general::__NR_connect, [v6_tcp_fd, addr_va, 28, 0, 0, 0]), neg(errno::EAFNOSUPPORT));
+
+            // Raw & ping connect: -EAFNOSUPPORT before length check (`ip6_datagram_connect_v6_only`).
+            for v6_only in [v6_raw_fd, v6_ping_fd] {
                 copy_to_user(addr_va, &enc[..enc_len]).map_err(|_| "copy 16B v4")?;
-                kassert_eq!(syscall(general::__NR_connect, [bad_v6, addr_va, 16, 0, 0, 0]), neg(errno::EINVAL));
+                kassert_eq!(syscall(general::__NR_connect, [v6_only, addr_va, 16, 0, 0, 0]), neg(errno::EAFNOSUPPORT));
                 copy_to_user(addr_va, &v4_padded).map_err(|_| "copy 28B v4")?;
-                kassert_eq!(syscall(general::__NR_connect, [bad_v6, addr_va, 28, 0, 0, 0]), neg(errno::EAFNOSUPPORT));
-            }
-            for non_udp_v6 in [v6_raw_fd, v6_ping_fd] {
+                kassert_eq!(syscall(general::__NR_connect, [v6_only, addr_va, 28, 0, 0, 0]), neg(errno::EAFNOSUPPORT));
+                // Send side stays length-first (`rawv6_sendmsg`).
                 copy_to_user(addr_va, &enc[..enc_len]).map_err(|_| "copy 16B v4")?;
-                kassert_eq!(syscall(general::__NR_sendto, [non_udp_v6, buf_va, 2, 0, addr_va, 16]), neg(errno::EINVAL));
+                kassert_eq!(syscall(general::__NR_sendto, [v6_only, buf_va, 2, 0, addr_va, 16]), neg(errno::EINVAL));
                 copy_to_user(addr_va, &v4_padded).map_err(|_| "copy 28B v4")?;
                 kassert_eq!(
-                    syscall(general::__NR_sendto, [non_udp_v6, buf_va, 2, 0, addr_va, 28]),
+                    syscall(general::__NR_sendto, [v6_only, buf_va, 2, 0, addr_va, 28]),
                     neg(errno::EAFNOSUPPORT)
                 );
             }
-            for f in [v6_udp_fd, v6_tcp_fd, v6_raw_fd, v6_ping_fd] {
+
+            for f in [v6_udp_fd, v6_tcp_fd, v6_raw_fd, v6_ping_fd, sfd, dfd, qfd] {
                 kassert_eq!(syscall(general::__NR_close, [f, 0, 0, 0, 0, 0]), 0);
             }
+            Ok(())
+        })?
+    }
+);
 
-            // 8. sendto / recvfrom flags, destination decode, and truncated peer address canary on recvfrom & recvmsg.
+crate::ktest!(
+    fn socket_sendmsg_rights_and_flock() {
+        use core::sync::atomic::Ordering;
+
+        use crate::linux::{errno, general, net};
+        use crate::user::copy_to_user;
+        use crate::{kassert, kassert_eq};
+        use ktest_support::{install_mock, neg, put_msghdr, syscall};
+        use lumen_sockabi::abi::Msghdr;
+        use lumen_sockabi::{
+            CmsgWriter, Ipv4Addr, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, SOL_SOCKET, SocketAddrV4, UnixName, cmsg_space,
+        };
+
+        process::in_test_process(|_pid| -> crate::ktest::TestResult {
+            let base = process::KTEST_USER_VA;
+            let buf_va = base + 64;
+            let out_va = base + 256;
+            let iov_va = base + 512;
+            let addr_va = base + 768;
+            let msg_va = base + 1024;
+            let ctl_va = base + 1280;
+            let path_va = base + 1920;
+            let big_ctl_va = base + 2048;
+
+            let (stream, sfd, sfd_id) = install_mock(Family::Inet, SockKind::Stream, net::IPPROTO_TCP as i32)?;
+            let (dgram, dfd, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let (seq, qfd, _) = install_mock(Family::Unix, SockKind::Seqpacket, 0)?;
+
+            copy_to_user(buf_va, b"ab").map_err(|_| "copy ab")?;
+            let mut one_iov = [0u8; 16];
+            one_iov[0..8].copy_from_slice(&buf_va.to_le_bytes());
+            one_iov[8..16].copy_from_slice(&2u64.to_le_bytes());
+            copy_to_user(iov_va, &one_iov).map_err(|_| "copy one_iov")?;
+
+            // 1. Destination names (`move_addr_to_kernel`, Linux v6.12 net/socket.c:2203, 2510):
+            //    always copied/length-checked; `named` true iff non-null & len > 0; non-null zero-length sets `named = false`.
+            let inet_addr = SockAddr::Inet(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
+            let mut enc = [0u8; 128];
+            let enc_len = inet_addr.encode(&mut enc);
+            copy_to_user(addr_va, &enc[..enc_len]).map_err(|_| "copy inet_addr")?;
+
+            kassert_eq!(syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, 0x1000, 16]), neg(errno::EFAULT));
+            kassert_eq!(
+                syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, addr_va, (-1i32) as u32 as u64]),
+                neg(errno::EINVAL)
+            );
+            kassert_eq!(syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, addr_va, enc_len as u64]), 2);
+            kassert_eq!(stream.state.lock().last_send_named, Some(true));
+            kassert_eq!(stream.state.lock().last_send_to, None);
+            kassert_eq!(syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, 0, 0]), 2);
+            kassert_eq!(stream.state.lock().last_send_named, Some(false));
+            kassert_eq!(syscall(general::__NR_sendto, [sfd, buf_va, 2, 0, addr_va, 0]), 2);
+            kassert_eq!(stream.state.lock().last_send_named, Some(false));
+            kassert_eq!(stream.state.lock().last_send_to, None);
+            kassert_eq!(syscall(general::__NR_sendto, [qfd, buf_va, 2, 0, addr_va, enc_len as u64]), 2);
+            kassert_eq!(seq.state.lock().last_send_named, Some(true));
+            kassert_eq!(seq.state.lock().last_send_to, None);
+
+            put_msghdr(
+                msg_va,
+                &Msghdr { msg_name: 0x1000, msg_namelen: 16, msg_iov: iov_va, msg_iovlen: 1, ..Default::default() },
+            )?;
+            kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), neg(errno::EFAULT));
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_name: addr_va,
+                    msg_namelen: enc_len as i32,
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    ..Default::default()
+                },
+            )?;
+            kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), 2);
+            kassert_eq!(stream.state.lock().last_send_named, Some(true));
+            kassert_eq!(stream.state.lock().last_send_to, None);
+            put_msghdr(
+                msg_va,
+                &Msghdr { msg_name: addr_va, msg_namelen: 0, msg_iov: iov_va, msg_iovlen: 1, ..Default::default() },
+            )?;
+            kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), 2);
+            kassert_eq!(stream.state.lock().last_send_named, Some(false));
+            kassert_eq!(stream.state.lock().last_send_to, None);
+
+            // 2. sendto: copy-in before MSG_OOB, and MSG_OOB before decode_addr.
+            kassert_eq!(
+                syscall(general::__NR_sendto, [dfd, buf_va, 2, u64::from(MSG_OOB), 0x1000, 16]),
+                neg(errno::EFAULT)
+            );
+            // 1-byte valid user address would fail decode_addr with -EINVAL, but MSG_OOB wins with -EOPNOTSUPP.
+            kassert_eq!(
+                syscall(general::__NR_sendto, [dfd, buf_va, 2, u64::from(MSG_OOB), addr_va, 1]),
+                neg(errno::EOPNOTSUPP)
+            );
             let unix_dst = SockAddr::Unix(UnixName::abstract_name(b"srv").map_err(|_| "unix name")?);
             let ulen = unix_dst.encode(&mut enc);
             copy_to_user(addr_va, &enc[..ulen]).map_err(|_| "copy unix dst")?;
-            copy_to_user(buf_va, b"ping").map_err(|_| "copy ping")?;
             kassert_eq!(
-                syscall(general::__NR_sendto, [dfd, buf_va, 4, u64::from(MSG_DONTWAIT), addr_va, ulen as u64]),
-                4
+                syscall(general::__NR_sendto, [dfd, buf_va, 2, u64::from(MSG_DONTWAIT), addr_va, ulen as u64]),
+                2
             );
             kassert_eq!(dgram.state.lock().last_send_to, Some(unix_dst));
             kassert_eq!(dgram.state.lock().last_send_named, Some(true));
             kassert_eq!(dgram.state.lock().last_send_nonblock, Some(true));
-            kassert_eq!(
-                syscall(general::__NR_sendto, [dfd, buf_va, 4, u64::from(MSG_OOB), 0, 0]),
-                neg(errno::EOPNOTSUPP)
-            );
-            kassert_eq!(
-                syscall(general::__NR_recvfrom, [dfd, out_va, 4, u64::from(MSG_ERRQUEUE), 0, 0]),
-                neg(errno::EAGAIN)
-            );
-            kassert_eq!(
-                syscall(general::__NR_recvfrom, [dfd, out_va, 4, u64::from(MSG_OOB), 0, 0]),
-                neg(errno::EINVAL)
-            );
-            dgram.state.lock().queued_from = Some(unix_dst);
-            copy_to_user(addr_va, &[0xA5u8; 16]).map_err(|_| "fill recvfrom canary")?;
-            copy_to_user(len_va, &4i32.to_le_bytes()).map_err(|_| "copy 4")?;
-            kassert_eq!(syscall(general::__NR_recvfrom, [dfd, out_va, 4, 0, addr_va, len_va]), 4);
-            copy_from_user(&mut n_raw, len_va).map_err(|_| "read recvfrom len")?;
-            kassert_eq!(i32::from_le_bytes(n_raw), ulen as i32);
-            copy_from_user(&mut got_addr, addr_va).map_err(|_| "read recvfrom trunc")?;
-            kassert_eq!(&got_addr[..4], &enc[..4]);
-            kassert_eq!(got_addr[4], 0xA5);
+            kassert_eq!(syscall(general::__NR_recvfrom, [dfd, out_va, 2, 0, 0, 0]), 2);
 
-            // Truncated `msg_name` canary on recvmsg.
-            kassert_eq!(syscall(general::__NR_sendto, [dfd, buf_va, 4, 0, 0, 0]), 4);
-            copy_to_user(addr_va, &[0xA5u8; 16]).map_err(|_| "fill recvmsg canary")?;
-            let mut rname_iov = [0u8; 16];
-            rname_iov[0..8].copy_from_slice(&out_va.to_le_bytes());
-            rname_iov[8..16].copy_from_slice(&4u64.to_le_bytes());
-            copy_to_user(iov_va, &rname_iov).map_err(|_| "copy rname iov")?;
-            let rname_hdr =
-                Msghdr { msg_name: addr_va, msg_namelen: 4, msg_iov: iov_va, msg_iovlen: 1, ..Default::default() };
-            copy_to_user(msg_va, &rname_hdr.to_bytes()).map_err(|_| "copy rname hdr")?;
-            kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 4);
-            let mut out_hdr_raw = [0u8; 56];
-            copy_from_user(&mut out_hdr_raw, msg_va).map_err(|_| "read rname out hdr")?;
-            let rname_out = Msghdr::from_bytes(&out_hdr_raw);
-            kassert_eq!(rname_out.msg_namelen, ulen as i32);
-            copy_from_user(&mut got_addr, addr_va).map_err(|_| "read recvmsg trunc")?;
-            kassert_eq!(&got_addr[..4], &enc[..4]);
-            kassert_eq!(got_addr[4], 0xA5);
-
-            // 9. sendmsg / recvmsg `__copy_msghdr` errno order (Linux v6.12 net/socket.c:2483-2548):
-            //    bad msg ptr (-EFAULT) before flags; negative msg_namelen (-EINVAL) before UIO_MAXIOV (-EMSGSIZE);
-            //    UIO_MAXIOV (-EMSGSIZE) before MSG_OOB/MSG_ERRQUEUE; optmem_max+1 -> -ENOBUFS.
+            // 3. MSG_CMSG_COMPAT (bit 31) rejected first (Linux v6.12 net/socket.c:2683, 2891),
+            //    then `__copy_msghdr` errno order (net/socket.c:2483-2548), then OPTMEM_MAX (`>= 131072`, sock.c:2784).
+            const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
+            kassert_eq!(syscall(general::__NR_sendmsg, [99, 0, MSG_CMSG_COMPAT, 0, 0, 0]), neg(errno::EINVAL));
+            kassert_eq!(syscall(general::__NR_recvmsg, [99, 0, MSG_CMSG_COMPAT, 0, 0, 0]), neg(errno::EINVAL));
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, 0, u64::from(MSG_OOB), 0, 0, 0]), neg(errno::EFAULT));
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, 0, u64::from(MSG_ERRQUEUE), 0, 0, 0]), neg(errno::EFAULT));
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, 0, u64::from(MSG_OOB), 0, 0, 0]), neg(errno::EFAULT));
 
-            let neg_name_and_big_iov = Msghdr {
-                msg_name: addr_va,
-                msg_namelen: -1,
-                msg_iov: iov_va,
-                msg_iovlen: u64::from(general::UIO_MAXIOV) + 1,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &neg_name_and_big_iov.to_bytes()).map_err(|_| "copy neg_name")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_name: addr_va,
+                    msg_namelen: -1,
+                    msg_iov: iov_va,
+                    msg_iovlen: u64::from(general::UIO_MAXIOV) + 1,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::EINVAL));
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::EINVAL));
 
-            let bad_iov_hdr =
-                Msghdr { msg_iov: iov_va, msg_iovlen: u64::from(general::UIO_MAXIOV) + 1, ..Default::default() };
-            copy_to_user(msg_va, &bad_iov_hdr.to_bytes()).map_err(|_| "copy bad_iov_hdr")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr { msg_iov: iov_va, msg_iovlen: u64::from(general::UIO_MAXIOV) + 1, ..Default::default() },
+            )?;
             kassert_eq!(
                 syscall(general::__NR_sendmsg, [dfd, msg_va, u64::from(MSG_OOB), 0, 0, 0]),
                 neg(errno::EMSGSIZE)
@@ -2061,9 +2158,7 @@ crate::ktest!(
                 neg(errno::EMSGSIZE)
             );
 
-            // Duplicate flag guards on sendmsg/recvmsg with valid msghdr.
-            let empty_hdr = Msghdr::default();
-            copy_to_user(msg_va, &empty_hdr.to_bytes()).map_err(|_| "copy empty_hdr")?;
+            put_msghdr(msg_va, &Msghdr::default())?;
             kassert_eq!(
                 syscall(general::__NR_sendmsg, [dfd, msg_va, u64::from(MSG_OOB), 0, 0, 0]),
                 neg(errno::EOPNOTSUPP)
@@ -2074,83 +2169,114 @@ crate::ktest!(
             );
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, u64::from(MSG_OOB), 0, 0, 0]), neg(errno::EINVAL));
 
-            let bad_ctl_hdr = Msghdr { msg_control: ctl_va, msg_controllen: 131_073, ..Default::default() };
-            copy_to_user(msg_va, &bad_ctl_hdr.to_bytes()).map_err(|_| "copy bad_ctl_hdr")?;
+            // Linux v6.12 `sock_kmalloc` (net/core/sock.c:2784): `>= OPTMEM_MAX` (131072) -> -ENOBUFS.
+            put_msghdr(msg_va, &Msghdr { msg_control: ctl_va, msg_controllen: 131_072, ..Default::default() })?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::ENOBUFS));
 
-            // Bad SCM_CREDENTIALS pid -> -ESRCH.
+            // 4. AF_UNIX cmsg parsing vs inet `__sock_cmsg_send` (Linux v6.12 net/core/sock.c:2937-2939).
             let mut cbuf = [0u8; 64];
             let mut cw = CmsgWriter::new(&mut cbuf);
             kassert!(cw.push_creds(Ucred { pid: 30_000, uid: 0, gid: 0 }));
             let (clen, _) = cw.finish();
             copy_to_user(ctl_va, &cbuf[..clen]).map_err(|_| "copy bad creds")?;
-            let cred_hdr = Msghdr { msg_control: ctl_va, msg_controllen: clen as u64, ..Default::default() };
-            copy_to_user(msg_va, &cred_hdr.to_bytes()).map_err(|_| "copy cred hdr")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: clen as u64,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::ESRCH));
+            // On AF_INET, SCM_CREDENTIALS and SCM_RIGHTS are skipped without error or FD lookup.
+            kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), 2);
+            kassert_eq!(stream.state.lock().last_send_creds, None);
 
-            // sendmsg cmsg edge cases: [good, bad] -> -EBADF with good released; >253 fds -> -EINVAL;
-            // unknown SOL_SOCKET type -> -EINVAL; non-SOL_SOCKET cmsg skipped; send() failing with rights.
-            let good_sock = MockSock::new(Family::Unix, SockKind::Dgram, 0);
-            let good_fd = process::install_current_fd(
-                new_socket_file(Arc::clone(&good_sock) as Arc<dyn SockOps>, false).map_err(|_| "good")?,
-                false,
-            )
-            .map_err(|_| "good fd")?;
-
-            let mut cbuf2 = [0u8; 64];
-            let mut cw2 = CmsgWriter::new(&mut cbuf2);
+            let (good_sock, good_fd_u64, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let good_fd = good_fd_u64 as i32;
+            let mut cw2 = CmsgWriter::new(&mut cbuf);
             kassert_eq!(cw2.push_rights(&[good_fd, 99], 2), 2);
             let (clen2, _) = cw2.finish();
-            copy_to_user(ctl_va, &cbuf2[..clen2]).map_err(|_| "copy [good, 99]")?;
-            let bad_fd_hdr = Msghdr { msg_control: ctl_va, msg_controllen: clen2 as u64, ..Default::default() };
-            copy_to_user(msg_va, &bad_fd_hdr.to_bytes()).map_err(|_| "copy bad_fd_hdr")?;
+            copy_to_user(ctl_va, &cbuf[..clen2]).map_err(|_| "copy [good, 99]")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: clen2 as u64,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::EBADF));
+            kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), 2);
 
-            // >253 fds (254 copies of good_fd) -> -EINVAL.
-            let many_len = cmsg_space(254 * 4).ok_or("cmsg_space 254")?;
-            let mut many_buf = alloc::vec![0u8; many_len];
-            let mut cw_many = CmsgWriter::new(&mut many_buf);
-            let many_fds = alloc::vec![good_fd; 254];
-            kassert_eq!(cw_many.push_rights(&many_fds, 254), 254);
-            let (many_written, _) = cw_many.finish();
-            let big_ctl_va = base + 2048;
-            copy_to_user(big_ctl_va, &many_buf[..many_written]).map_err(|_| "copy 254 fds")?;
-            let many_hdr =
-                Msghdr { msg_control: big_ctl_va, msg_controllen: many_written as u64, ..Default::default() };
-            copy_to_user(msg_va, &many_hdr.to_bytes()).map_err(|_| "copy many_hdr")?;
+            // 253 vs 254 fds across TWO SCM_RIGHTS cmsgs (SCM_MAX_FD = 253).
+            let space_253 = cmsg_space(127 * 4).unwrap() + cmsg_space(126 * 4).unwrap();
+            let mut buf_253 = alloc::vec![0u8; space_253];
+            let mut cw_253 = CmsgWriter::new(&mut buf_253);
+            let fds_127 = alloc::vec![good_fd; 127];
+            let fds_126 = alloc::vec![good_fd; 126];
+            kassert_eq!(cw_253.push_rights(&fds_127, 127), 127);
+            kassert_eq!(cw_253.push_rights(&fds_126, 126), 126);
+            let (w253, _) = cw_253.finish();
+            copy_to_user(big_ctl_va, &buf_253[..w253]).map_err(|_| "copy 253 fds")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: big_ctl_va,
+                    msg_controllen: w253 as u64,
+                    ..Default::default()
+                },
+            )?;
+            kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 2);
+            kassert_eq!(dgram.state.lock().queued_rights.len(), 253);
+            // Drop queued 253 rights outside the spinlock.
+            let drained = core::mem::take(&mut dgram.state.lock().queued_rights);
+            drop(drained);
+            kassert_eq!(syscall(general::__NR_recvfrom, [dfd, out_va, 2, 0, 0, 0]), 2);
+
+            let space_254 = cmsg_space(127 * 4).unwrap() * 2;
+            let mut buf_254 = alloc::vec![0u8; space_254];
+            let mut cw_254 = CmsgWriter::new(&mut buf_254);
+            kassert_eq!(cw_254.push_rights(&fds_127, 127), 127);
+            kassert_eq!(cw_254.push_rights(&fds_127, 127), 127);
+            let (w254, _) = cw_254.finish();
+            copy_to_user(big_ctl_va, &buf_254[..w254]).map_err(|_| "copy 254 fds")?;
+            put_msghdr(msg_va, &Msghdr { msg_control: big_ctl_va, msg_controllen: w254 as u64, ..Default::default() })?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::EINVAL));
 
-            // Unknown SOL_SOCKET cmsg type -> -EINVAL.
+            // Unknown SOL_SOCKET cmsg type -> -EINVAL (both AF_UNIX and AF_INET); non-SOL_SOCKET skipped.
             let mut unk_buf = [0u8; 32];
             let mut cw_unk = CmsgWriter::new(&mut unk_buf);
             kassert!(cw_unk.push_raw(SOL_SOCKET, 99, &[0u8; 4]));
             let (unk_len, _) = cw_unk.finish();
             copy_to_user(ctl_va, &unk_buf[..unk_len]).map_err(|_| "copy unk cmsg")?;
-            let unk_hdr = Msghdr { msg_control: ctl_va, msg_controllen: unk_len as u64, ..Default::default() };
-            copy_to_user(msg_va, &unk_hdr.to_bytes()).map_err(|_| "copy unk hdr")?;
+            put_msghdr(msg_va, &Msghdr { msg_control: ctl_va, msg_controllen: unk_len as u64, ..Default::default() })?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::EINVAL));
+            kassert_eq!(syscall(general::__NR_sendmsg, [sfd, msg_va, 0, 0, 0, 0]), neg(errno::EINVAL));
 
-            // Non-SOL_SOCKET cmsg skipped cleanly.
             let mut skip_buf = [0u8; 32];
             let mut cw_skip = CmsgWriter::new(&mut skip_buf);
             kassert!(cw_skip.push_raw(net::IPPROTO_IP as i32, 1, &[1u8; 4]));
             let (skip_len, _) = cw_skip.finish();
             copy_to_user(ctl_va, &skip_buf[..skip_len]).map_err(|_| "copy skip cmsg")?;
-            copy_to_user(buf_va, b"z").map_err(|_| "copy z")?;
-            one_iov[0..8].copy_from_slice(&buf_va.to_le_bytes());
-            one_iov[8..16].copy_from_slice(&1u64.to_le_bytes());
-            copy_to_user(iov_va, &one_iov).map_err(|_| "copy one_iov")?;
-            let skip_hdr = Msghdr {
-                msg_iov: iov_va,
-                msg_iovlen: 1,
-                msg_control: ctl_va,
-                msg_controllen: skip_len as u64,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &skip_hdr.to_bytes()).map_err(|_| "copy skip hdr")?;
-            kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            // Drain the byte sent above.
-            kassert_eq!(syscall(general::__NR_recvfrom, [dfd, out_va, 1, 0, 0, 0]), 1);
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: skip_len as u64,
+                    ..Default::default()
+                },
+            )?;
+            kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 2);
+            kassert_eq!(syscall(general::__NR_recvfrom, [dfd, out_va, 2, 0, 0, 0]), 2);
 
             // send() returning Err with SCM_RIGHTS drops unconsumed rights cleanly.
             let mut one_r = [0u8; 32];
@@ -2158,81 +2284,285 @@ crate::ktest!(
             kassert_eq!(cw_one.push_rights(&[good_fd], 1), 1);
             let (one_r_len, _) = cw_one.finish();
             copy_to_user(ctl_va, &one_r[..one_r_len]).map_err(|_| "copy one_r")?;
-            let fail_hdr = Msghdr {
-                msg_iov: iov_va,
-                msg_iovlen: 1,
-                msg_control: ctl_va,
-                msg_controllen: one_r_len as u64,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &fail_hdr.to_bytes()).map_err(|_| "copy fail_hdr")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: one_r_len as u64,
+                    ..Default::default()
+                },
+            )?;
             dgram.state.lock().fail_next_send = Some(errno::EAGAIN);
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::EAGAIN));
-            // Closing good_fd now fires its release immediately (proving neither [good, 99], >253, nor failed send leaked a ref).
-            kassert_eq!(syscall(general::__NR_close, [good_fd as u64, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [good_fd_u64, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(good_sock.releases.load(Ordering::SeqCst), 1);
 
-            // 10. SCM_RIGHTS + SCM_CREDENTIALS: in-flight lifetime, EMFILE MSG_CTRUNC, MSG_CMSG_CLOEXEC echo,
-            //     short control buffer (2 rights into cmsg_space(4)), msg_control == NULL, faulting msg_control
-            //     (returns bytes + MSG_CTRUNC, no EFAULT), faulting msg_name (returns -EFAULT).
-            let passed_a = MockSock::new(Family::Unix, SockKind::Dgram, 0);
-            let passed_b = MockSock::new(Family::Unix, SockKind::Dgram, 0);
-            let fa = new_socket_file(Arc::clone(&passed_a) as Arc<dyn SockOps>, false).map_err(|_| "fa")?;
-            let fb = new_socket_file(Arc::clone(&passed_b) as Arc<dyn SockOps>, false).map_err(|_| "fb")?;
-            let id_a = fa.id();
-            let fd_a = process::install_current_fd(fa, false).map_err(|_| "install fa")?;
-            let fd_b = process::install_current_fd(fb, false).map_err(|_| "install fb")?;
+            // 5. InFlightFile::file() and InFlightFile::clone refcount lifecycle.
+            let (clone_sock, clone_fd, clone_id) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let if1 = InFlightFile::from_fd(clone_fd as i32).map_err(|_| "if1")?;
+            kassert_eq!(if1.file().id(), clone_id);
+            let if2 = if1.clone();
+            kassert_eq!(syscall(general::__NR_close, [clone_fd, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(clone_sock.releases.load(Ordering::SeqCst), 0);
+            drop(if1);
+            kassert_eq!(clone_sock.releases.load(Ordering::SeqCst), 0);
+            drop(if2);
+            kassert_eq!(clone_sock.releases.load(Ordering::SeqCst), 1);
+            let sfd_if = InFlightFile::from_fd(sfd as i32).map_err(|_| "sfd_if")?;
+            kassert_eq!(sfd_if.file().id(), sfd_id);
+            drop(sfd_if);
 
+            // 6. flock release on final uninstalled InFlightFile drop, and retained on non-last drop
+            //    (Linux v6.12 fs/file_table.c `__fput` -> fs/locks.c `locks_remove_file`).
+            copy_to_user(path_va, b"/tmp/sock-flock-ktest\0").map_err(|_| "copy flock path")?;
+            let f1 = syscall(
+                general::__NR_openat,
+                [
+                    general::AT_FDCWD as u64,
+                    path_va,
+                    u64::from(general::O_CREAT | general::O_RDWR | general::O_TRUNC),
+                    0o600,
+                    0,
+                    0,
+                ],
+            );
+            kassert!((f1 as i64) >= 0);
+            let f2 =
+                syscall(general::__NR_openat, [general::AT_FDCWD as u64, path_va, u64::from(general::O_RDWR), 0, 0, 0]);
+            kassert!((f2 as i64) >= 0);
+            kassert_eq!(syscall(general::__NR_unlinkat, [general::AT_FDCWD as u64, path_va, 0, 0, 0, 0]), 0);
+
+            let lock_ex = u64::from(general::LOCK_EX);
+            let lock_nb = u64::from(general::LOCK_NB);
+            kassert_eq!(syscall(general::__NR_flock, [f1, lock_ex, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_flock, [f2, lock_ex | lock_nb, 0, 0, 0, 0]), neg(errno::EWOULDBLOCK));
+
+            let mut cw_fl = CmsgWriter::new(&mut one_r);
+            kassert_eq!(cw_fl.push_rights(&[f1 as i32], 1), 1);
+            let (fl_len, _) = cw_fl.finish();
+            copy_to_user(ctl_va, &one_r[..fl_len]).map_err(|_| "copy fl cmsg")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: fl_len as u64,
+                    ..Default::default()
+                },
+            )?;
+            // Dropping a non-last InFlightFile (failed send while f1 is open) must NOT release flock.
+            dgram.state.lock().fail_next_send = Some(errno::EAGAIN);
+            kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::EAGAIN));
+            kassert_eq!(syscall(general::__NR_flock, [f2, lock_ex | lock_nb, 0, 0, 0, 0]), neg(errno::EWOULDBLOCK));
+
+            // Now send f1, close original, verify lock stays held in flight, drop right uninstalled -> lock released.
+            kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 2);
+            kassert_eq!(syscall(general::__NR_close, [f1, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_flock, [f2, lock_ex | lock_nb, 0, 0, 0, 0]), neg(errno::EWOULDBLOCK));
+            put_msghdr(msg_va, &Msghdr { msg_iov: iov_va, msg_iovlen: 1, ..Default::default() })?;
+            kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 2);
+            kassert_eq!(syscall(general::__NR_flock, [f2, lock_ex | lock_nb, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [f2, 0, 0, 0, 0, 0]), 0);
+
+            for f in [sfd, dfd, qfd] {
+                kassert_eq!(syscall(general::__NR_close, [f, 0, 0, 0, 0, 0]), 0);
+            }
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn socket_recvmsg_control_and_block_on() {
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use crate::linux::process::{KernelSigaction, Rlimit, RlimitKind};
+        use crate::linux::signal::raise_for_test;
+        use crate::linux::{errno, general, net};
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        use ktest_support::{get_msghdr, install_mock, neg, put_msghdr, syscall};
+        use lumen_signal::Signal;
+        use lumen_sockabi::abi::Msghdr;
+        use lumen_sockabi::{
+            CmsgIter, CmsgWriter, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_ERRQUEUE, MSG_OOB, MSG_TRUNC, SCM_CREDENTIALS,
+            SCM_RIGHTS, SOL_SOCKET, UnixName, cmsg_len, cmsg_space,
+        };
+
+        process::in_test_process(|pid| -> crate::ktest::TestResult {
+            let base = process::KTEST_USER_VA;
+            let buf_va = base + 64;
+            let out_va = base + 256;
+            let iov_va = base + 512;
+            let addr_va = base + 768;
+            let len_va = base + 900;
+            let msg_va = base + 1024;
+            let ctl_va = base + 1280;
+
+            let (stream, sfd, _) = install_mock(Family::Inet, SockKind::Stream, net::IPPROTO_TCP as i32)?;
+            let (dgram, dfd, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+
+            // 1. Truncated peer address copy-out canary on recvfrom & recvmsg, recvfrom flag guards, done.msg_flags.
+            let unix_dst = SockAddr::Unix(UnixName::abstract_name(b"srv").map_err(|_| "unix name")?);
+            let mut enc = [0u8; 128];
+            let ulen = unix_dst.encode(&mut enc);
+            copy_to_user(buf_va, b"ping").map_err(|_| "copy ping")?;
+            kassert_eq!(syscall(general::__NR_sendto, [dfd, buf_va, 4, 0, 0, 0]), 4);
+            kassert_eq!(
+                syscall(general::__NR_recvfrom, [dfd, out_va, 4, u64::from(MSG_ERRQUEUE), 0, 0]),
+                neg(errno::EAGAIN)
+            );
+            kassert_eq!(
+                syscall(general::__NR_recvfrom, [dfd, out_va, 4, u64::from(MSG_OOB), 0, 0]),
+                neg(errno::EINVAL)
+            );
+            dgram.state.lock().queued_from = Some(unix_dst);
+            copy_to_user(addr_va, &[0xA5u8; 16]).map_err(|_| "fill recvfrom canary")?;
+            copy_to_user(len_va, &4i32.to_le_bytes()).map_err(|_| "copy 4")?;
+            kassert_eq!(syscall(general::__NR_recvfrom, [dfd, out_va, 4, 0, addr_va, len_va]), 4);
+            let mut n_raw = [0u8; 4];
+            let mut got_addr = [0u8; 16];
+            copy_from_user(&mut n_raw, len_va).map_err(|_| "read recvfrom len")?;
+            kassert_eq!(i32::from_le_bytes(n_raw), ulen as i32);
+            copy_from_user(&mut got_addr, addr_va).map_err(|_| "read recvfrom trunc")?;
+            kassert_eq!(&got_addr[..4], &enc[..4]);
+            kassert_eq!(got_addr[4], 0xA5);
+
+            // Truncated `msg_name` canary + `done.msg_flags` (MSG_TRUNC) propagation on recvmsg.
+            kassert_eq!(syscall(general::__NR_sendto, [dfd, buf_va, 4, 0, 0, 0]), 4);
+            dgram.state.lock().next_recv_flags = MSG_TRUNC;
+            copy_to_user(addr_va, &[0xA5u8; 16]).map_err(|_| "fill recvmsg canary")?;
+            let mut r_iov = [0u8; 16];
+            r_iov[0..8].copy_from_slice(&out_va.to_le_bytes());
+            r_iov[8..16].copy_from_slice(&4u64.to_le_bytes());
+            copy_to_user(iov_va, &r_iov).map_err(|_| "copy r_iov")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr { msg_name: addr_va, msg_namelen: 4, msg_iov: iov_va, msg_iovlen: 1, ..Default::default() },
+            )?;
+            kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 4);
+            let rname_out = get_msghdr(msg_va)?;
+            kassert_eq!(rname_out.msg_namelen, ulen as i32);
+            kassert!(rname_out.msg_flags & MSG_TRUNC != 0);
+            copy_from_user(&mut got_addr, addr_va).map_err(|_| "read recvmsg trunc")?;
+            kassert_eq!(&got_addr[..4], &enc[..4]);
+            kassert_eq!(got_addr[4], 0xA5);
+
+            // 2. Multi-fd SCM_RIGHTS receive with NO truncation (2 rights into cmsg_space(8)):
+            //    both fds installed in send order, MSG_CTRUNC clear, exact msg_controllen == cmsg_space(8).
+            copy_to_user(buf_va, b"x").map_err(|_| "copy x")?;
+            let mut one_iov = [0u8; 16];
+            one_iov[0..8].copy_from_slice(&buf_va.to_le_bytes());
+            one_iov[8..16].copy_from_slice(&1u64.to_le_bytes());
+            copy_to_user(iov_va, &one_iov).map_err(|_| "copy one_iov")?;
+
+            let (full_a, fd_fa, id_fa) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let (full_b, fd_fb, id_fb) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
             let mut cbuf = [0u8; 128];
+            let mut cw = CmsgWriter::new(&mut cbuf);
+            kassert_eq!(cw.push_rights(&[fd_fa as i32, fd_fb as i32], 2), 2);
+            let (full_send_len, _) = cw.finish();
+            copy_to_user(ctl_va, &cbuf[..full_send_len]).map_err(|_| "copy full send")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: full_send_len as u64,
+                    ..Default::default()
+                },
+            )?;
+            kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
+            kassert_eq!(syscall(general::__NR_close, [fd_fa, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [fd_fb, 0, 0, 0, 0, 0]), 0);
+
+            let two_fd_cap = cmsg_space(8).unwrap();
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: two_fd_cap as u64,
+                    ..Default::default()
+                },
+            )?;
+            kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
+            let full_out = get_msghdr(msg_va)?;
+            kassert_eq!(full_out.msg_flags & MSG_CTRUNC, 0);
+            kassert_eq!(full_out.msg_controllen, two_fd_cap as u64);
+            let mut full_got = alloc::vec![0u8; two_fd_cap];
+            copy_from_user(&mut full_got, ctl_va).map_err(|_| "read full ctl")?;
+            let mut full_fds = Vec::new();
+            for item in CmsgIter::new(&full_got) {
+                let cmsg = item.map_err(|_| "parse full cmsg")?;
+                if cmsg.level == SOL_SOCKET && cmsg.cmsg_type == SCM_RIGHTS {
+                    full_fds.extend(cmsg.rights_fds().map_err(|_| "decode full fds")?);
+                }
+            }
+            kassert_eq!(full_fds.len(), 2);
+            let rf0 = process::current_io_file(full_fds[0]).ok_or("rf0")?;
+            let rf1 = process::current_io_file(full_fds[1]).ok_or("rf1")?;
+            kassert_eq!(rf0.id(), id_fa);
+            kassert_eq!(rf1.id(), id_fb);
+            drop((rf0, rf1));
+            kassert_eq!(syscall(general::__NR_close, [full_fds[0] as u64, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [full_fds[1] as u64, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(full_a.releases.load(Ordering::SeqCst), 1);
+            kassert_eq!(full_b.releases.load(Ordering::SeqCst), 1);
+
+            // 3. EMFILE truncation + MSG_CMSG_CLOEXEC echoed in msg_flags (Linux v6.12 net/socket.c:2815, 2839) + SCM_CREDENTIALS.
+            let (passed_a, fd_a, id_a) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let (passed_b, fd_b, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
             let mut cw = CmsgWriter::new(&mut cbuf);
             let send_cred = Ucred { pid: pid as i32, uid: 0, gid: 0 };
             kassert!(cw.push_creds(send_cred));
-            kassert_eq!(cw.push_rights(&[fd_a, fd_b], 2), 2);
+            kassert_eq!(cw.push_rights(&[fd_a as i32, fd_b as i32], 2), 2);
             let (clen, _) = cw.finish();
             copy_to_user(ctl_va, &cbuf[..clen]).map_err(|_| "copy scm")?;
-            copy_to_user(buf_va, b"x").map_err(|_| "copy x")?;
-            let send_hdr = Msghdr {
-                msg_iov: iov_va,
-                msg_iovlen: 1,
-                msg_control: ctl_va,
-                msg_controllen: clen as u64,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &send_hdr.to_bytes()).map_err(|_| "copy send_hdr")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: clen as u64,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            kassert_eq!(dgram.state.lock().last_send_creds, Some(send_cred));
-
-            // Close both originals: InFlightFile keeps end_refs > 0, so release() has NOT run.
-            kassert_eq!(syscall(general::__NR_close, [fd_a as u64, 0, 0, 0, 0, 0]), 0);
-            kassert_eq!(syscall(general::__NR_close, [fd_b as u64, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [fd_a, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [fd_b, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(passed_a.releases.load(Ordering::SeqCst), 0);
             kassert_eq!(passed_b.releases.load(Ordering::SeqCst), 0);
 
-            // Lower RLIMIT_NOFILE so only 1 of the 2 rights fits: installs 1 with FD_CLOEXEC,
-            // echoes MSG_CMSG_CLOEXEC in msg_flags (Linux v6.12 net/socket.c:2815, 2839),
-            // sets MSG_CTRUNC, and drops the second right (firing passed_b.release()).
+            let proc = process::current_process();
             let open_now = process::process_open_fds(pid).len() as u64;
             let orig_rlim = proc
                 .rlimit(RlimitKind::Nofile, Some(Rlimit::new(open_now + 1, 1024).ok_or("rlim+1")?))
                 .map_err(|_| "set rlim+1")?;
             let recv_cap = cmsg_space(12).unwrap() + cmsg_space(8).unwrap();
-            let recv_hdr = Msghdr {
-                msg_iov: iov_va,
-                msg_iovlen: 1,
-                msg_control: ctl_va,
-                msg_controllen: recv_cap as u64,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &recv_hdr.to_bytes()).map_err(|_| "copy recv_hdr")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: recv_cap as u64,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, u64::from(MSG_CMSG_CLOEXEC), 0, 0, 0]), 1);
             let _ = proc.rlimit(RlimitKind::Nofile, Some(orig_rlim));
 
-            copy_from_user(&mut out_hdr_raw, msg_va).map_err(|_| "read out hdr")?;
-            let out_hdr = Msghdr::from_bytes(&out_hdr_raw);
+            let out_hdr = get_msghdr(msg_va)?;
             kassert!(out_hdr.msg_flags & MSG_CTRUNC != 0);
             kassert!(out_hdr.msg_flags & MSG_CMSG_CLOEXEC != 0);
-            let expected_ctl_len = cmsg_space(12).unwrap() + cmsg_space(4).unwrap();
-            kassert_eq!(out_hdr.msg_controllen, expected_ctl_len as u64);
+            kassert_eq!(out_hdr.msg_controllen, (cmsg_space(12).unwrap() + cmsg_space(4).unwrap()) as u64);
             let mut got_ctl = alloc::vec![0u8; out_hdr.msg_controllen as usize];
             copy_from_user(&mut got_ctl, ctl_va).map_err(|_| "read got ctl")?;
             let mut got_creds = None;
@@ -2260,51 +2590,41 @@ crate::ktest!(
             kassert_eq!(syscall(general::__NR_close, [recv_fd as u64, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(passed_a.releases.load(Ordering::SeqCst), 1);
 
-            // Short control buffer: on x86-64 `CMSG_SPACE(4)` is 24 bytes (which holds 2 fds per
-            // Linux v6.12 `scm_max_fds`, net/core/scm.c:317: `(24 - 16) / 4 == 2`), while `CMSG_LEN(4)`
-            // is 20 bytes (`(20 - 16) / 4 == 1`). Receiving 2 rights into `cmsg_len(4)` installs 1
-            // (with FD_CLOEXEC clear when MSG_CMSG_CLOEXEC is unset), sets MSG_CTRUNC, reports exact
-            // `msg_controllen == cmsg_len(4)`, and drops/releases the 2nd right.
-            let short_a = MockSock::new(Family::Unix, SockKind::Dgram, 0);
-            let short_b = MockSock::new(Family::Unix, SockKind::Dgram, 0);
-            let sfa = process::install_current_fd(
-                new_socket_file(Arc::clone(&short_a) as Arc<dyn SockOps>, false).map_err(|_| "sfa")?,
-                false,
-            )
-            .map_err(|_| "sfa fd")?;
-            let sfb = process::install_current_fd(
-                new_socket_file(Arc::clone(&short_b) as Arc<dyn SockOps>, false).map_err(|_| "sfb")?,
-                false,
-            )
-            .map_err(|_| "sfb fd")?;
-            let mut cw_short = CmsgWriter::new(&mut cbuf2);
-            kassert_eq!(cw_short.push_rights(&[sfa, sfb], 2), 2);
+            // 4. Short control buffer (`cmsg_len(4)` = 20 fits 1 fd per Linux v6.12 `scm_max_fds` net/core/scm.c:317),
+            //    `msg_control == NULL`, faulting `msg_control` with rights vs credentials-only, faulting `msg_name`.
+            let (short_a, sfa, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let (short_b, sfb, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let mut cw_short = CmsgWriter::new(&mut cbuf);
+            kassert_eq!(cw_short.push_rights(&[sfa as i32, sfb as i32], 2), 2);
             let (short_send_len, _) = cw_short.finish();
-            copy_to_user(ctl_va, &cbuf2[..short_send_len]).map_err(|_| "copy short send")?;
-            let short_send_hdr = Msghdr {
-                msg_iov: iov_va,
-                msg_iovlen: 1,
-                msg_control: ctl_va,
-                msg_controllen: short_send_len as u64,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &short_send_hdr.to_bytes()).map_err(|_| "copy short send hdr")?;
+            copy_to_user(ctl_va, &cbuf[..short_send_len]).map_err(|_| "copy short send")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: short_send_len as u64,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            kassert_eq!(syscall(general::__NR_close, [sfa as u64, 0, 0, 0, 0, 0]), 0);
-            kassert_eq!(syscall(general::__NR_close, [sfb as u64, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [sfa, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [sfb, 0, 0, 0, 0, 0]), 0);
 
             let one_fd_cap = cmsg_len(4).unwrap();
-            let short_recv_hdr = Msghdr {
-                msg_iov: iov_va,
-                msg_iovlen: 1,
-                msg_control: ctl_va,
-                msg_controllen: one_fd_cap as u64,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &short_recv_hdr.to_bytes()).map_err(|_| "copy short recv hdr")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: ctl_va,
+                    msg_controllen: one_fd_cap as u64,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            copy_from_user(&mut out_hdr_raw, msg_va).map_err(|_| "read short out hdr")?;
-            let short_out = Msghdr::from_bytes(&out_hdr_raw);
+            let short_out = get_msghdr(msg_va)?;
             kassert!(short_out.msg_flags & MSG_CTRUNC != 0);
             kassert_eq!(short_out.msg_flags & MSG_CMSG_CLOEXEC, 0);
             kassert_eq!(short_out.msg_controllen, one_fd_cap as u64);
@@ -2323,19 +2643,14 @@ crate::ktest!(
                 0
             );
             kassert_eq!(short_b.releases.load(Ordering::SeqCst), 1);
-            kassert_eq!(short_a.releases.load(Ordering::SeqCst), 0);
             kassert_eq!(syscall(general::__NR_close, [short_fds[0] as u64, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(short_a.releases.load(Ordering::SeqCst), 1);
 
-            // msg_control == NULL with rights pending: MSG_CTRUNC, msg_controllen == 0, rights released.
-            let null_ctl_sock = MockSock::new(Family::Unix, SockKind::Dgram, 0);
-            let nc_fd = process::install_current_fd(
-                new_socket_file(Arc::clone(&null_ctl_sock) as Arc<dyn SockOps>, false).map_err(|_| "nc")?,
-                false,
-            )
-            .map_err(|_| "nc fd")?;
+            // msg_control == NULL with pending rights -> MSG_CTRUNC, msg_controllen == 0, rights released.
+            let (null_ctl_sock, nc_fd, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
+            let mut one_r = [0u8; 32];
             let mut cw_nc = CmsgWriter::new(&mut one_r);
-            kassert_eq!(cw_nc.push_rights(&[nc_fd], 1), 1);
+            kassert_eq!(cw_nc.push_rights(&[nc_fd as i32], 1), 1);
             let (nc_len, _) = cw_nc.finish();
             copy_to_user(ctl_va, &one_r[..nc_len]).map_err(|_| "copy nc")?;
             let nc_send = Msghdr {
@@ -2345,109 +2660,72 @@ crate::ktest!(
                 msg_controllen: nc_len as u64,
                 ..Default::default()
             };
-            copy_to_user(msg_va, &nc_send.to_bytes()).map_err(|_| "copy nc send")?;
+            put_msghdr(msg_va, &nc_send)?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            kassert_eq!(syscall(general::__NR_close, [nc_fd as u64, 0, 0, 0, 0, 0]), 0);
-            let nc_recv = Msghdr { msg_iov: iov_va, msg_iovlen: 1, ..Default::default() };
-            copy_to_user(msg_va, &nc_recv.to_bytes()).map_err(|_| "copy nc recv")?;
+            kassert_eq!(syscall(general::__NR_close, [nc_fd, 0, 0, 0, 0, 0]), 0);
+            put_msghdr(msg_va, &Msghdr { msg_iov: iov_va, msg_iovlen: 1, ..Default::default() })?;
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            copy_from_user(&mut out_hdr_raw, msg_va).map_err(|_| "read nc out")?;
-            let nc_out = Msghdr::from_bytes(&out_hdr_raw);
+            let nc_out = get_msghdr(msg_va)?;
             kassert!(nc_out.msg_flags & MSG_CTRUNC != 0);
             kassert_eq!(nc_out.msg_controllen, 0);
             kassert_eq!(null_ctl_sock.releases.load(Ordering::SeqCst), 1);
 
-            // Faulting non-NULL msg_control does NOT fail recvmsg (Linux v6.12 `____sys_recvmsg`
-            // net/socket.c:2800, `put_cmsg` net/core/scm.c:231): sets MSG_CTRUNC, msg_controllen == 0,
-            // drops reserved slots & rights, returns byte count. Bad msg_name still gives -EFAULT (net/socket.c:2832).
-            let fault_ctl_sock = MockSock::new(Family::Unix, SockKind::Dgram, 0);
-            let fc_fd = process::install_current_fd(
-                new_socket_file(Arc::clone(&fault_ctl_sock) as Arc<dyn SockOps>, false).map_err(|_| "fc")?,
-                false,
-            )
-            .map_err(|_| "fc fd")?;
+            // Faulting non-NULL msg_control with pending rights: sets MSG_CTRUNC per Linux v6.12
+            // `scm_detach_fds` (net/core/scm.c:361), drops reserved slots & rights, returns byte count.
+            let (fault_ctl_sock, fc_fd, _) = install_mock(Family::Unix, SockKind::Dgram, 0)?;
             let mut cw_fc = CmsgWriter::new(&mut one_r);
-            kassert_eq!(cw_fc.push_rights(&[fc_fd], 1), 1);
+            kassert_eq!(cw_fc.push_rights(&[fc_fd as i32], 1), 1);
             let (fc_len, _) = cw_fc.finish();
             copy_to_user(ctl_va, &one_r[..fc_len]).map_err(|_| "copy fc")?;
-            copy_to_user(msg_va, &nc_send.to_bytes()).map_err(|_| "copy fc send")?;
+            put_msghdr(msg_va, &nc_send)?;
             kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            kassert_eq!(syscall(general::__NR_close, [fc_fd as u64, 0, 0, 0, 0, 0]), 0);
+            kassert_eq!(syscall(general::__NR_close, [fc_fd, 0, 0, 0, 0, 0]), 0);
             let open_before_fc = process::process_open_fds(pid).len();
-            let fc_recv = Msghdr {
-                msg_iov: iov_va,
-                msg_iovlen: 1,
-                msg_control: 0x1000,
-                msg_controllen: one_fd_cap as u64,
-                ..Default::default()
-            };
-            copy_to_user(msg_va, &fc_recv.to_bytes()).map_err(|_| "copy fc recv")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: 0x1000,
+                    msg_controllen: one_fd_cap as u64,
+                    ..Default::default()
+                },
+            )?;
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            copy_from_user(&mut out_hdr_raw, msg_va).map_err(|_| "read fc out")?;
-            let fc_out = Msghdr::from_bytes(&out_hdr_raw);
+            let fc_out = get_msghdr(msg_va)?;
             kassert!(fc_out.msg_flags & MSG_CTRUNC != 0);
             kassert_eq!(fc_out.msg_controllen, 0);
             kassert_eq!(process::process_open_fds(pid).len(), open_before_fc);
             kassert_eq!(fault_ctl_sock.releases.load(Ordering::SeqCst), 1);
 
+            // Faulting non-NULL msg_control with ONLY credentials (no rights): does NOT set MSG_CTRUNC
+            // (Linux v6.12 `put_cmsg` net/core/scm.c:281 returns -EFAULT without MSG_CTRUNC, `scm_recv` ignores it).
+            dgram.state.lock().queued_creds = Some(send_cred);
             kassert_eq!(syscall(general::__NR_sendto, [dfd, buf_va, 1, 0, 0, 0]), 1);
-            let bad_rname_hdr =
-                Msghdr { msg_name: 0x1000, msg_namelen: 16, msg_iov: iov_va, msg_iovlen: 1, ..Default::default() };
-            copy_to_user(msg_va, &bad_rname_hdr.to_bytes()).map_err(|_| "copy bad rname")?;
+            put_msghdr(
+                msg_va,
+                &Msghdr {
+                    msg_iov: iov_va,
+                    msg_iovlen: 1,
+                    msg_control: 0x1000,
+                    msg_controllen: cmsg_space(12).unwrap() as u64,
+                    ..Default::default()
+                },
+            )?;
+            kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
+            let cred_fault_out = get_msghdr(msg_va)?;
+            kassert_eq!(cred_fault_out.msg_flags & MSG_CTRUNC, 0);
+            kassert_eq!(cred_fault_out.msg_controllen, 0);
+
+            // Bad msg_name still gives -EFAULT (Linux v6.12 `____sys_recvmsg` net/socket.c:2832).
+            kassert_eq!(syscall(general::__NR_sendto, [dfd, buf_va, 1, 0, 0, 0]), 1);
+            put_msghdr(
+                msg_va,
+                &Msghdr { msg_name: 0x1000, msg_namelen: 16, msg_iov: iov_va, msg_iovlen: 1, ..Default::default() },
+            )?;
             kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), neg(errno::EFAULT));
 
-            // 11. flock leak regression (Linux v6.12 fs/file_table.c `__fput` -> fs/locks.c `locks_remove_file`):
-            //     flock(LOCK_EX), send via SCM_RIGHTS, close original, drop right uninstalled, then
-            //     flock(LOCK_EX | LOCK_NB) on another open description of the same inode succeeds.
-            let flock_path = b"/tmp/sock-flock-ktest\0";
-            copy_to_user(path_va, flock_path).map_err(|_| "copy flock path")?;
-            let f1 = syscall(
-                general::__NR_openat,
-                [
-                    general::AT_FDCWD as u64,
-                    path_va,
-                    u64::from(general::O_CREAT | general::O_RDWR | general::O_TRUNC),
-                    0o600,
-                    0,
-                    0,
-                ],
-            );
-            kassert!((f1 as i64) >= 0);
-            let f2 =
-                syscall(general::__NR_openat, [general::AT_FDCWD as u64, path_va, u64::from(general::O_RDWR), 0, 0, 0]);
-            kassert!((f2 as i64) >= 0);
-            kassert_eq!(syscall(general::__NR_unlinkat, [general::AT_FDCWD as u64, path_va, 0, 0, 0, 0]), 0);
-
-            let lock_ex = u64::from(general::LOCK_EX);
-            let lock_nb = u64::from(general::LOCK_NB);
-            kassert_eq!(syscall(general::__NR_flock, [f1, lock_ex, 0, 0, 0, 0]), 0);
-            kassert_eq!(syscall(general::__NR_flock, [f2, lock_ex | lock_nb, 0, 0, 0, 0]), neg(errno::EWOULDBLOCK));
-
-            let mut cw_fl = CmsgWriter::new(&mut one_r);
-            kassert_eq!(cw_fl.push_rights(&[f1 as i32], 1), 1);
-            let (fl_len, _) = cw_fl.finish();
-            copy_to_user(ctl_va, &one_r[..fl_len]).map_err(|_| "copy fl cmsg")?;
-            copy_to_user(msg_va, &nc_send.to_bytes()).map_err(|_| "copy fl send")?;
-            kassert_eq!(syscall(general::__NR_sendmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            kassert_eq!(syscall(general::__NR_close, [f1, 0, 0, 0, 0, 0]), 0);
-            // Still held by the in-flight InFlightFile until dropped uninstalled.
-            kassert_eq!(syscall(general::__NR_flock, [f2, lock_ex | lock_nb, 0, 0, 0, 0]), neg(errno::EWOULDBLOCK));
-            copy_to_user(msg_va, &nc_recv.to_bytes()).map_err(|_| "copy fl recv")?;
-            kassert_eq!(syscall(general::__NR_recvmsg, [dfd, msg_va, 0, 0, 0, 0]), 1);
-            // Uninstalled right was dropped -> final fput released flock -> LOCK_EX|LOCK_NB now succeeds!
-            kassert_eq!(syscall(general::__NR_flock, [f2, lock_ex | lock_nb, 0, 0, 0, 0]), 0);
-            kassert_eq!(syscall(general::__NR_close, [f2, 0, 0, 0, 0, 0]), 0);
-
-            // 12. UserIovec::new truncates total to MAX_RW_COUNT (Linux v6.12 `import_iovec`),
-            //     and InFlightFile::file() exposes `&KernelFile`.
-            let big_spans = [UserSpan { base: 0x1000, len: MAX_RW_COUNT }, UserSpan { base: 0x2000, len: 4096 }];
-            kassert_eq!(UserIovec::new(&big_spans).total_len(), MAX_RW_COUNT);
-            let inflight_check = InFlightFile::from_fd(sfd as i32).map_err(|_| "inflight_check")?;
-            kassert_eq!(inflight_check.file().id(), sfd_id);
-            drop(inflight_check);
-
-            // 13. block_on: deterministic lost-wake ordering seam, wakeup via KtestThread::settle,
-            //     timeout (-EAGAIN), signal with timeout (-EINTR), signal without (-ERESTARTSYS).
+            // 5. block_on: lost-wake seam, clear-before-check order, settle wakeup, timeout, signals with u64::MAX.
             let lw_ready = Arc::new(AtomicBool::new(false));
             let lw_ready_hook = Arc::clone(&lw_ready);
             let lw_stream_hook = Arc::clone(&stream);
@@ -2459,6 +2737,21 @@ crate::ktest!(
                 kassert_eq!(block_on(&*stream, None, || lw_ready.load(Ordering::SeqCst)), Ok(()));
             }
             kassert_eq!(stream.poll_head.subscriber_count(), 0);
+
+            // Clear-before-check order: `ready` notifies on its 2nd call and returns true on its 3rd.
+            // If `fired` were cleared after `ready()`, `wait_interruptible` would miss the wake and block.
+            let calls = AtomicUsize::new(0);
+            kassert_eq!(
+                block_on(&*stream, Some(u64::MAX), || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 2 {
+                        stream.poll_head.notify(PollMask::IN);
+                    }
+                    n >= 3
+                }),
+                Ok(())
+            );
+            kassert_eq!(calls.load(Ordering::SeqCst), 3);
 
             let ready_flag = Arc::new(AtomicBool::new(false));
             let ready_w = Arc::clone(&ready_flag);
@@ -2478,12 +2771,11 @@ crate::ktest!(
             let dl = time::now_ns().saturating_add(2_000_000);
             kassert_eq!(block_on(&*stream, Some(dl), || false), Err(errno::EAGAIN));
 
-            // Signal with timeout -> -EINTR; without timeout -> -ERESTARTSYS.
+            // Signal with timeout (u64::MAX, no timing ceiling) -> -EINTR; without timeout -> -ERESTARTSYS.
             let me = sched::current().ok_or("current thread")?;
             process::set_current_action(Signal::USR1, KernelSigaction { handler: 1, ..KernelSigaction::default() });
             raise_for_test(&me, Signal::USR1);
-            let far_dl = time::now_ns().saturating_add(10_000_000_000);
-            kassert_eq!(block_on(&*stream, Some(far_dl), || false), Err(errno::EINTR));
+            kassert_eq!(block_on(&*stream, Some(u64::MAX), || false), Err(errno::EINTR));
             kassert_eq!(block_on(&*stream, None, || false), Err(ERESTARTSYS));
 
             // Clear test-raised pending signal before process exit.
@@ -2492,10 +2784,8 @@ crate::ktest!(
 
             kassert_eq!(syscall(general::__NR_close, [sfd, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(syscall(general::__NR_close, [dfd, 0, 0, 0, 0, 0]), 0);
-            kassert_eq!(syscall(general::__NR_close, [qfd, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(stream.releases.load(Ordering::SeqCst), 1);
             kassert_eq!(dgram.releases.load(Ordering::SeqCst), 1);
-            kassert_eq!(seq.releases.load(Ordering::SeqCst), 1);
             Ok(())
         })?
     }

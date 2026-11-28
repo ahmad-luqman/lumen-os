@@ -497,7 +497,8 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `named`), `RecvIo`, `RecvDone`, `SockOps` (with required `disconnect`),
   `block_on`, `sockfs` on `SOCK_DEV` `0:8` with `SockInode` reporting
   `S_IFSOCK` and `socket:[ino]`, `new_socket_file`, and
-  `create_socket`/`create_socketpair` family dispatch).
+  `create_socket`/`create_socketpair` constructor hooks returning
+  `-EAFNOSUPPORT` until C1/C3/C4/C6 plug in).
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested; the `life`
   command's and the Life app's, a path dependency of `apps/`, #202).

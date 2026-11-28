@@ -30,4 +30,7 @@ milestone = "M9"
 tests = [
     "ktest:lumen_kernel::net::sock::socket_and_socketpair_dispatch_by_family",
     "ktest:lumen_kernel::net::sock::socket_io_and_poll_reach_sockops",
+    "ktest:lumen_kernel::net::sock::socket_names_accept_and_options",
+    "ktest:lumen_kernel::net::sock::socket_sendmsg_rights_and_flock",
+    "ktest:lumen_kernel::net::sock::socket_recvmsg_control_and_block_on",
 ]

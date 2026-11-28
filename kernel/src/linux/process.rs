@@ -309,8 +309,11 @@ impl KernelFile {
     }
 
     /// Count of descriptors sharing this description, raising both `fd_refs`
-    /// and the combined end-lifetime count (`dup`, `fork`, `exec`).
-    /// Caller holds the FD table lock with an existing counted descriptor.
+    /// and the combined end-lifetime count (`dup`, `fork`, `exec`, and
+    /// `InFlightFile::clone`).
+    /// Caller either holds the FD table lock with an existing counted
+    /// descriptor, or already owns a counted `InFlightFile` (whose
+    /// `fd_refs`/`end_refs` are guaranteed `> 0`).
     pub fn inc_fd_ref(&self) {
         self.inner.inc_fd_ref();
         let prev = self.end_refs.fetch_add(1, Ordering::Relaxed);
@@ -1933,8 +1936,10 @@ pub fn current_io_file(fd: i32) -> Option<IoFile> {
 }
 
 /// Clone the open file on `fd` and raise its counted FD/end reference under
-/// `Files::table` (for `SCM_RIGHTS` `InFlightFile`). Caller must balance with
-/// `KernelFile::dec_fd_ref` or `ReservedFd::install_ref`, outside every lock.
+/// `Files::table` (for `SCM_RIGHTS` `InFlightFile`). Caller must immediately
+/// wrap the returned `FileRef` in `InFlightFile` (balanced by
+/// `InFlightFile::drop` or `ReservedFd::install_inflight`, outside every lock)
+/// and never balance it with a bare `KernelFile::dec_fd_ref`.
 pub fn clone_current_fd_ref(fd: i32) -> Option<FileRef> {
     with_current_fds(|t| {
         t.get(fd).map(|e| {

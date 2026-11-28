@@ -16,7 +16,7 @@ use core::mem::offset_of;
 
 use lumen_sockabi::abi::{Msghdr, SOCKADDR_UN_LEN};
 use lumen_sockabi::{
-    AF_INET, AF_UNSPEC, Call, CmsgIter, CmsgWriter, Errno, Family, MAX_OPT_LEN, MSG_CMSG_CLOEXEC, MSG_CTRUNC,
+    AF_INET, AF_INET6, AF_UNSPEC, Call, CmsgIter, CmsgWriter, Errno, Family, MAX_OPT_LEN, MSG_CMSG_CLOEXEC, MSG_CTRUNC,
     MSG_DONTWAIT, MSG_EOR, MSG_ERRQUEUE, MSG_OOB, MSGHDR_LEN, OptVal, SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS,
     SOCKADDR_STORAGE_LEN, SOL_SOCKET, SockAddr, SockOpt, UCRED_LEN, check_optlen, clamp_msg_namelen, cmsg_space,
     decode_opt, peek_family, write_opt_for,
@@ -48,8 +48,12 @@ const SOCK_MAX: u32 = SOCK_PACKET + 1;
 const AF_MAX: i32 = 46;
 
 /// Upper bound of IP protocol numbers (`IPPROTO_MAX`, Linux v6.12
-/// `net/ipv4/af_inet.c:263`).
-const IPPROTO_MAX: i32 = 256;
+/// `include/uapi/linux/in.h:84-88`: `IPPROTO_SMC` = 256, `IPPROTO_MPTCP` = 262).
+const IPPROTO_MAX: i32 = 263;
+
+/// Internal 32-bit compat cmsg flag rejected by native 64-bit `sendmsg`/
+/// `recvmsg` (`MSG_CMSG_COMPAT`, Linux v6.12 `net/socket.c:2683, 2891`).
+const MSG_CMSG_COMPAT: u32 = 0x8000_0000;
 
 /// Default `net.core.somaxconn` clamp for `listen(2)` (Linux v6.12
 /// `include/linux/socket.h:298`, `net/socket.c:1887`).
@@ -61,8 +65,8 @@ const SOCK_NONBLOCK: u32 = general::O_NONBLOCK;
 /// `SOCK_CLOEXEC` on Linux x86-64 (identical to `O_CLOEXEC`).
 const SOCK_CLOEXEC: u32 = general::O_CLOEXEC;
 
-/// Maximum control buffer size accepted by `sendmsg` (Linux's `optmem_max`
-/// since 6.8; ARCHITECTURE section 8).
+/// Maximum control buffer size (strictly `< OPTMEM_MAX`, matching Linux v6.12
+/// `net/core/sock.c:2784` `sock_kmalloc` with `sysctl_optmem_max = 131072`).
 const OPTMEM_MAX: usize = 131_072;
 
 /// Look up an open, non-`O_PATH` descriptor (`fdget` in Linux v6.12, returning
@@ -194,6 +198,24 @@ fn copy_addr_from_user(addr: UserPtr, addrlen: i32) -> Result<([u8; SOCKADDR_STO
     Ok((buf, len))
 }
 
+/// Encode `sock_addr` (or empty if `None`), copy at most `cap` bytes to
+/// `addr`, and return the full encoded length (`move_addr_to_user`, Linux
+/// v6.12 `net/socket.c`).
+fn write_name(addr: u64, cap: usize, sock_addr: Option<&SockAddr>) -> Result<i32, u32> {
+    match sock_addr {
+        Some(sa) => {
+            let mut encoded = [0u8; SOCKADDR_UN_LEN + 1];
+            let full_len = sa.encode(&mut encoded);
+            let copy_len = full_len.min(cap);
+            if copy_len > 0 {
+                copy_to_user(addr, &encoded[..copy_len]).map_err(CopyError::to_errno)?;
+            }
+            Ok(full_len as i32)
+        }
+        None => Ok(0),
+    }
+}
+
 /// Write an encoded [`SockAddr`] (or length 0 if `None`) back to
 /// `(addr, addrlen_ptr)` (`move_addr_to_user`, Linux v6.12 `net/socket.c`).
 fn put_name(addr: UserPtr, addrlen_ptr: UserPtr, sock_addr: Option<&SockAddr>) -> Result<(), u32> {
@@ -202,18 +224,7 @@ fn put_name(addr: UserPtr, addrlen_ptr: UserPtr, sock_addr: Option<&SockAddr>) -
     if ulen < 0 {
         return Err(errno::EINVAL);
     }
-    let out_len = match sock_addr {
-        Some(sa) => {
-            let mut encoded = [0u8; SOCKADDR_UN_LEN + 1];
-            let full_len = sa.encode(&mut encoded);
-            let copy_len = full_len.min(ulen as usize);
-            if copy_len > 0 {
-                copy_to_user(addr.addr(), &encoded[..copy_len]).map_err(CopyError::to_errno)?;
-            }
-            full_len as i32
-        }
-        None => 0i32,
-    };
+    let out_len = write_name(addr.addr(), ulen as usize, sock_addr)?;
     // SAFETY: `i32` is 4 bytes with no padding.
     unsafe { copy_pod_to_user(addrlen_ptr.addr(), &out_len) }.map_err(CopyError::to_errno)?;
     Ok(())
@@ -221,18 +232,39 @@ fn put_name(addr: UserPtr, addrlen_ptr: UserPtr, sock_addr: Option<&SockAddr>) -
 
 /// Decode a raw sockaddr slice for `sock` under syscall context `call`.
 ///
-/// Plain `AF_INET` addresses on an `AF_INET6` socket are routed to
-/// `SockAddr::Inet` only for UDP/datagram sockets (`udpv6_sendmsg`,
-/// `__ip6_datagram_connect`); TCP, raw and ICMPv6 ping keep `Family::Inet6`
-/// decoding so 16-byte `AF_INET` gives `-EINVAL` and >=24-byte gives
-/// `-EAFNOSUPPORT` (`tcp_v6_connect`, Linux v6.12 `net/ipv6/tcp_ipv6.c:152`).
+/// - For `SendTo`/`SendMsg`, non-datagram/non-raw sockets return `Ok(None)`.
+/// - Plain `AF_INET` addresses on an `AF_INET6` socket are routed to
+///   `SockAddr::Inet` only for UDP/datagram sockets on connect/send
+///   (`udpv6_sendmsg`, `__ip6_datagram_connect`; C3 refuses routed v4 under
+///   `IPV6_V6ONLY` with `-EAFNOSUPPORT` on connect and `-ENETUNREACH` on send).
+/// - `AF_INET6` raw and ICMPv6 ping `connect` reject non-`AF_INET6` with
+///   `-EAFNOSUPPORT` before any length check (`ip6_datagram_connect_v6_only`,
+///   Linux v6.12 `net/ipv6/datagram.c:285-292`); their send side stays
+///   length-first (`rawv6_sendmsg`).
+/// - `AF_INET6` TCP `connect` keeps length-first `-EINVAL` for 16 bytes and
+///   `-EAFNOSUPPORT` for >= 24 bytes (`tcp_v6_connect`, `net/ipv6/tcp_ipv6.c:152`).
 fn decode_addr(sock: &dyn SockOps, call: Call, bytes: &[u8]) -> Result<Option<SockAddr>, u32> {
-    let allow_v4_on_v6 = sock.family() == Family::Inet6
-        && sock.kind() == SockKind::Dgram
-        && matches!(call, Call::Connect | Call::SendTo | Call::SendMsg)
-        && sock.get_opt(SockOpt::Protocol) != Ok(OptVal::Int(net::IPPROTO_ICMPV6 as i32));
-    if allow_v4_on_v6 && bytes.len() >= 2 && peek_family(bytes) == Ok(AF_INET) {
-        return SockAddr::decode(Family::Inet, call, bytes).map(Some).map_err(Errno::to_errno);
+    if matches!(call, Call::SendTo | Call::SendMsg) && !matches!(sock.kind(), SockKind::Dgram | SockKind::Raw) {
+        return Ok(None);
+    }
+    if sock.family() == Family::Inet6 {
+        let is_icmpv6_ping = sock.kind() == SockKind::Dgram
+            && sock.get_opt(SockOpt::Protocol) == Ok(OptVal::Int(net::IPPROTO_ICMPV6 as i32));
+        let is_v6_udp = sock.kind() == SockKind::Dgram && !is_icmpv6_ping;
+        if is_v6_udp
+            && matches!(call, Call::Connect | Call::SendTo | Call::SendMsg)
+            && bytes.len() >= 2
+            && peek_family(bytes) == Ok(AF_INET)
+        {
+            return SockAddr::decode(Family::Inet, call, bytes).map(Some).map_err(Errno::to_errno);
+        }
+        if (sock.kind() == SockKind::Raw || is_icmpv6_ping)
+            && call == Call::Connect
+            && bytes.len() >= 2
+            && peek_family(bytes) != Ok(AF_INET6)
+        {
+            return Err(errno::EAFNOSUPPORT);
+        }
     }
     match call {
         Call::Bind | Call::Connect => SockAddr::decode(sock.family(), call, bytes).map(Some).map_err(Errno::to_errno),
@@ -293,14 +325,22 @@ fn check_cred_pid(pid: i32) -> Result<(), u32> {
 
 /// Copy and parse `sendmsg`'s control buffer into `(rights, creds)` outside
 /// every socket lock.
+///
+/// Matches Linux v6.12 `sock_kmalloc` (`net/core/sock.c:2784`, strict
+/// `< OPTMEM_MAX`), `__scm_send` (`AF_UNIX` resolves `SCM_RIGHTS` and
+/// `SCM_CREDENTIALS`), and `__sock_cmsg_send` (`net/core/sock.c:2937-2939`,
+/// inet skips `SCM_RIGHTS`/`SCM_CREDENTIALS`; unimplemented `SOL_SOCKET`
+/// types `SO_MARK`, `SO_PRIORITY`, `SO_TIMESTAMPING_*`, `SCM_TXTIME` return
+/// `-EINVAL`).
 fn parse_send_cmsgs(
+    family: Family,
     msg_control: u64,
     msg_controllen: u64,
 ) -> Result<(Vec<InFlightFile>, Option<lumen_sockabi::Ucred>), u32> {
     if msg_controllen == 0 {
         return Ok((Vec::new(), None));
     }
-    if msg_controllen > OPTMEM_MAX as u64 {
+    if msg_controllen >= OPTMEM_MAX as u64 {
         return Err(errno::ENOBUFS);
     }
     let ctl_len = msg_controllen as usize;
@@ -315,6 +355,12 @@ fn parse_send_cmsgs(
         let cmsg = item.map_err(Errno::to_errno)?;
         if cmsg.level != SOL_SOCKET {
             continue;
+        }
+        if family != Family::Unix {
+            match cmsg.cmsg_type {
+                SCM_RIGHTS | SCM_CREDENTIALS => continue,
+                _ => return Err(errno::EINVAL),
+            }
         }
         match cmsg.cmsg_type {
             SCM_RIGHTS => {
@@ -337,11 +383,11 @@ fn parse_send_cmsgs(
     Ok((rights, creds))
 }
 
-/// `read(2)` on a socket (`sock_read_iter`, Linux v6.12 `net/socket.c:1126`):
-/// zero-length returns 0 after `EFAULT` validation without calling `recv`.
-pub(super) fn read_sock(sock: &dyn SockOps, buf: UserPtr, count: u64, nonblock: bool) -> Result<u64, u32> {
-    let span = [single_span(buf, count)?];
-    let iov = UserIovec::new(&span);
+/// Shared receive path for `read`/`readv` on a socket (`sock_read_iter`,
+/// Linux v6.12 `net/socket.c:1126`): zero total length returns 0 without
+/// calling `SockOps::recv`.
+fn recv_spans(sock: &dyn SockOps, spans: &[UserSpan], nonblock: bool) -> Result<u64, u32> {
+    let iov = UserIovec::new(spans);
     if iov.is_empty() {
         return Ok(0);
     }
@@ -350,44 +396,37 @@ pub(super) fn read_sock(sock: &dyn SockOps, buf: UserPtr, count: u64, nonblock: 
     Ok(done.bytes as u64)
 }
 
-/// `write(2)` on a socket (`sock_write_iter`, Linux v6.12 `net/socket.c:1148`):
-/// sets `MSG_EOR` on `SOCK_SEQPACKET`, flags 0 otherwise.
-pub(super) fn write_sock(sock: &dyn SockOps, buf: UserPtr, count: u64, nonblock: bool) -> Result<u64, u32> {
-    let span = [single_span(buf, count)?];
+/// Shared send path for `write`/`writev` on a socket (`sock_write_iter`,
+/// Linux v6.12 `net/socket.c:1148`): sets `MSG_EOR` on `SOCK_SEQPACKET`.
+fn send_spans(sock: &dyn SockOps, spans: &[UserSpan], nonblock: bool) -> Result<u64, u32> {
     let flags = if sock.kind() == SockKind::Seqpacket { MSG_EOR } else { 0 };
     let mut io =
-        SendIo { iov: UserIovec::new(&span), to: None, named: false, rights: Vec::new(), creds: None, flags, nonblock };
+        SendIo { iov: UserIovec::new(spans), to: None, named: false, rights: Vec::new(), creds: None, flags, nonblock };
     sock.send(&mut io).map(|n| n as u64)
 }
 
-/// `readv(2)` on a socket (`sock_read_iter`, Linux v6.12 `net/socket.c:1126`):
-/// zero total length returns 0 after `EFAULT` validation without calling `recv`.
+/// `read(2)` on a socket (`sock_read_iter`, Linux v6.12 `net/socket.c:1126`).
+pub(super) fn read_sock(sock: &dyn SockOps, buf: UserPtr, count: u64, nonblock: bool) -> Result<u64, u32> {
+    let span = [single_span(buf, count)?];
+    recv_spans(sock, &span, nonblock)
+}
+
+/// `write(2)` on a socket (`sock_write_iter`, Linux v6.12 `net/socket.c:1148`).
+pub(super) fn write_sock(sock: &dyn SockOps, buf: UserPtr, count: u64, nonblock: bool) -> Result<u64, u32> {
+    let span = [single_span(buf, count)?];
+    send_spans(sock, &span, nonblock)
+}
+
+/// `readv(2)` on a socket (`sock_read_iter`, Linux v6.12 `net/socket.c:1126`).
 pub(super) fn readv_sock(sock: &dyn SockOps, iovs: &[RawIovec], nonblock: bool) -> Result<u64, u32> {
     let spans = spans_from_raw(iovs)?;
-    let iov = UserIovec::new(&spans);
-    if iov.is_empty() {
-        return Ok(0);
-    }
-    let mut io = RecvIo { iov, flags: 0, nonblock };
-    let done = sock.recv(&mut io)?;
-    Ok(done.bytes as u64)
+    recv_spans(sock, &spans, nonblock)
 }
 
-/// `writev(2)` on a socket (`sock_write_iter`, Linux v6.12 `net/socket.c:1148`):
-/// sets `MSG_EOR` on `SOCK_SEQPACKET`, flags 0 otherwise.
+/// `writev(2)` on a socket (`sock_write_iter`, Linux v6.12 `net/socket.c:1148`).
 pub(super) fn writev_sock(sock: &dyn SockOps, iovs: &[RawIovec], nonblock: bool) -> Result<u64, u32> {
     let spans = spans_from_raw(iovs)?;
-    let flags = if sock.kind() == SockKind::Seqpacket { MSG_EOR } else { 0 };
-    let mut io = SendIo {
-        iov: UserIovec::new(&spans),
-        to: None,
-        named: false,
-        rights: Vec::new(),
-        creds: None,
-        flags,
-        nonblock,
-    };
-    sock.send(&mut io).map(|n| n as u64)
+    send_spans(sock, &spans, nonblock)
 }
 
 /// `socket(domain, type, protocol)` (41): dispatch by family (`AF_UNIX`,
@@ -472,20 +511,14 @@ pub(super) fn sys_sendto(fd: Fd, buf: UserPtr, len: u64, flags: u32, addr: UserP
 fn do_sendto(fd: Fd, buf: UserPtr, len: u64, flags: u32, addr: UserPtr, addrlen: i32) -> Result<u64, u32> {
     let span = [single_span(buf, len)?];
     let (file, sock) = socket_file(fd)?;
-    let (named, to) = if addr.is_null() {
-        (false, None)
-    } else {
-        let (raw, raw_len) = copy_addr_from_user(addr, addrlen)?;
-        let to = if matches!(sock.kind(), SockKind::Dgram | SockKind::Raw) {
-            decode_addr(&*sock, Call::SendTo, &raw[..raw_len])?
-        } else {
-            None
-        };
-        (raw_len != 0, to)
-    };
+    let raw_addr = if addr.is_null() { None } else { Some(copy_addr_from_user(addr, addrlen)?) };
     if flags & MSG_OOB != 0 {
         return Err(errno::EOPNOTSUPP);
     }
+    let (named, to) = match raw_addr {
+        Some((raw, raw_len)) if raw_len > 0 => (true, decode_addr(&*sock, Call::SendTo, &raw[..raw_len])?),
+        _ => (false, None),
+    };
     let mut io = SendIo {
         iov: UserIovec::new(&span),
         to,
@@ -517,15 +550,19 @@ fn do_recvfrom(fd: Fd, buf: UserPtr, len: u64, flags: u32, addr: UserPtr, addrle
     Ok(done.bytes as u64)
 }
 
-/// `sendmsg(fd, msg, flags)` (46): copy in `msghdr`, destination name,
-/// `iovec`s (`__copy_msghdr` order) and `cmsg` control buffer (`SCM_RIGHTS`
-/// resolved to [`InFlightFile`]s before any socket lock), then dispatch to
-/// `SockOps::send`.
+/// `sendmsg(fd, msg, flags)` (46): reject `MSG_CMSG_COMPAT` first
+/// (`net/socket.c:2683`), copy in `msghdr`, destination name, `iovec`s
+/// (`__copy_msghdr` order) and `cmsg` control buffer (`SCM_RIGHTS` resolved
+/// to [`InFlightFile`]s for `AF_UNIX` before any socket lock), then dispatch
+/// to `SockOps::send`.
 pub(super) fn sys_sendmsg(fd: Fd, msg: UserPtr, flags: u32) -> u64 {
     finish(do_sendmsg(fd, msg, flags))
 }
 
 fn do_sendmsg(fd: Fd, msg: UserPtr, flags: u32) -> Result<u64, u32> {
+    if flags & MSG_CMSG_COMPAT != 0 {
+        return Err(errno::EINVAL);
+    }
     let (file, sock) = socket_file(fd)?;
     let mut raw_hdr = [0u8; MSGHDR_LEN];
     copy_from_user(&mut raw_hdr, msg.addr()).map_err(CopyError::to_errno)?;
@@ -542,15 +579,11 @@ fn do_sendmsg(fd: Fd, msg: UserPtr, flags: u32) -> Result<u64, u32> {
         false
     };
     let spans = iovec_spans(hdr.msg_iov, hdr.msg_iovlen)?;
-    let (rights, creds) = parse_send_cmsgs(hdr.msg_control, hdr.msg_controllen)?;
+    let (rights, creds) = parse_send_cmsgs(sock.family(), hdr.msg_control, hdr.msg_controllen)?;
     if flags & MSG_OOB != 0 {
         return Err(errno::EOPNOTSUPP);
     }
-    let to = if named && matches!(sock.kind(), SockKind::Dgram | SockKind::Raw) {
-        decode_addr(&*sock, Call::SendMsg, &raw_name[..namelen])?
-    } else {
-        None
-    };
+    let to = if named { decode_addr(&*sock, Call::SendMsg, &raw_name[..namelen])? } else { None };
     let mut io =
         SendIo { iov: UserIovec::new(&spans), to, named, rights, creds, flags, nonblock: nonblock(&file, flags) };
     let sent = sock.send(&mut io)?;
@@ -559,16 +592,19 @@ fn do_sendmsg(fd: Fd, msg: UserPtr, flags: u32) -> Result<u64, u32> {
     Ok(sent as u64)
 }
 
-/// `recvmsg(fd, msg, flags)` (47): copy in `msghdr` and `iovec`s
-/// (`__copy_msghdr` order), receive via `SockOps::recv`, install `SCM_RIGHTS`
-/// outside every socket lock (`-EMFILE` installs what fits and sets
-/// `MSG_CTRUNC`), encode ancillary data with `CmsgWriter` (a control-buffer
-/// fault sets `MSG_CTRUNC` without failing the call), and write back `msghdr`.
+/// `recvmsg(fd, msg, flags)` (47): reject `MSG_CMSG_COMPAT` first
+/// (`net/socket.c:2891`), copy in `msghdr` and `iovec`s (`__copy_msghdr`
+/// order), receive via `SockOps::recv`, install `SCM_RIGHTS` outside every
+/// socket lock (`-EMFILE` installs what fits and sets `MSG_CTRUNC`), encode
+/// ancillary data with `CmsgWriter`, and write back `msghdr`.
 pub(super) fn sys_recvmsg(fd: Fd, msg: UserPtr, flags: u32) -> u64 {
     finish(do_recvmsg(fd, msg, flags))
 }
 
 fn do_recvmsg(fd: Fd, msg: UserPtr, flags: u32) -> Result<u64, u32> {
+    if flags & MSG_CMSG_COMPAT != 0 {
+        return Err(errno::EINVAL);
+    }
     let (file, sock) = socket_file(fd)?;
     let mut raw_hdr = [0u8; MSGHDR_LEN];
     copy_from_user(&mut raw_hdr, msg.addr()).map_err(CopyError::to_errno)?;
@@ -587,9 +623,19 @@ fn do_recvmsg(fd: Fd, msg: UserPtr, flags: u32) -> Result<u64, u32> {
     Ok(done.bytes as u64)
 }
 
+/// Write a POD field at byte offset `off` inside user `struct msghdr` at `msg_ptr`.
+///
+/// # Safety
+/// `T` must be a plain-old-data integer type with no padding bytes.
+unsafe fn put_hdr_field<T: Copy>(msg_ptr: UserPtr, off: usize, val: &T) -> Result<(), u32> {
+    let addr = msg_ptr.addr().checked_add(off as u64).ok_or(errno::EFAULT)?;
+    // SAFETY: Caller guarantees `T` is POD with no padding bytes.
+    unsafe { copy_pod_to_user(addr, val) }.map_err(CopyError::to_errno)
+}
+
 /// Install received rights, format ancillary data with [`CmsgWriter`], and
 /// write back `msg_name`, `msg_control`, `msg_namelen`, `msg_controllen`, and
-/// `msg_flags` (Linux v6.12 `net/socket.c:2800-2854`, `net/core/scm.c:231-282`).
+/// `msg_flags` (Linux v6.12 `net/socket.c:2800-2854`, `net/core/scm.c:231-369`).
 /// Runs outside every socket lock.
 fn finish_recvmsg(
     msg_ptr: UserPtr,
@@ -619,59 +665,43 @@ fn finish_recvmsg(
         }
     }
     let fds: Vec<i32> = reserved.iter().map(ReservedFd::fd).collect();
-    let mut written_fds = writer.push_rights(&fds, total_rights);
+    let written_fds = writer.push_rights(&fds, total_rights);
     debug_assert_eq!(written_fds, reserved.len());
     let (mut written_ctl_len, mut ctl_flags) = writer.finish();
 
-    // Control-buffer copy-out faults do not fail `recvmsg` (`put_cmsg` /
-    // `____sys_recvmsg`): set `MSG_CTRUNC`, report 0 control bytes, and drop
-    // all reserved slots and pending rights.
+    // Control-buffer copy-out faults do not fail `recvmsg`: `scm_detach_fds`
+    // (Linux v6.12 `net/core/scm.c:361`) sets `MSG_CTRUNC` only when pending
+    // rights could not be delivered, while `put_cmsg` for credentials alone
+    // leaves `MSG_CTRUNC` clear (`net/core/scm.c:281`). Drop all reserved
+    // slots and report 0 control bytes.
     if written_ctl_len > 0 && copy_to_user(hdr.msg_control, &ctl_buf[..written_ctl_len]).is_err() {
-        ctl_flags |= MSG_CTRUNC;
+        if total_rights > 0 {
+            ctl_flags |= MSG_CTRUNC;
+        }
         written_ctl_len = 0;
-        written_fds = 0;
         reserved.clear();
     }
 
     // A bad `msg_name` pointer still returns `-EFAULT` (`net/socket.c:2832-2838`).
-    let out_namelen = if hdr.msg_name != 0 {
-        let len = match done.from.as_ref() {
-            Some(from) => {
-                let mut encoded = [0u8; SOCKADDR_UN_LEN + 1];
-                let full_len = from.encode(&mut encoded);
-                let copy_len = full_len.min(name_cap);
-                if copy_len > 0 {
-                    copy_to_user(hdr.msg_name, &encoded[..copy_len]).map_err(CopyError::to_errno)?;
-                }
-                full_len as i32
-            }
-            None => 0i32,
-        };
-        Some(len)
-    } else {
-        None
-    };
-
-    if let Some(namelen) = out_namelen {
-        let off = msg_ptr.addr().checked_add(offset_of!(Msghdr, msg_namelen) as u64).ok_or(errno::EFAULT)?;
+    if hdr.msg_name != 0 {
+        let namelen = write_name(hdr.msg_name, name_cap, done.from.as_ref())?;
         // SAFETY: `i32` is 4 bytes with no padding.
-        unsafe { copy_pod_to_user(off, &namelen) }.map_err(CopyError::to_errno)?;
+        unsafe { put_hdr_field(msg_ptr, offset_of!(Msghdr, msg_namelen), &namelen) }?;
     }
     let ctl_len_out = written_ctl_len as u64;
-    let ctl_off = msg_ptr.addr().checked_add(offset_of!(Msghdr, msg_controllen) as u64).ok_or(errno::EFAULT)?;
     // SAFETY: `u64` is 8 bytes with no padding.
-    unsafe { copy_pod_to_user(ctl_off, &ctl_len_out) }.map_err(CopyError::to_errno)?;
+    unsafe { put_hdr_field(msg_ptr, offset_of!(Msghdr, msg_controllen), &ctl_len_out) }?;
 
     // Echo `MSG_CMSG_CLOEXEC` into `msg_flags` (Linux v6.12 `net/socket.c:2815, 2839`).
     let out_flags = done.msg_flags | ctl_flags | (flags & MSG_CMSG_CLOEXEC);
-    let flags_off = msg_ptr.addr().checked_add(offset_of!(Msghdr, msg_flags) as u64).ok_or(errno::EFAULT)?;
     // SAFETY: `u32` is 4 bytes with no padding.
-    unsafe { copy_pod_to_user(flags_off, &out_flags) }.map_err(CopyError::to_errno)?;
+    unsafe { put_hdr_field(msg_ptr, offset_of!(Msghdr, msg_flags), &out_flags) }?;
 
     // Commit the reserved slots; any remaining uninstalled rights drop when
     // `done` drops, outside every lock.
     let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
-    for (slot, inflight) in reserved.into_iter().zip(done.rights.drain(..written_fds)) {
+    let take = reserved.len();
+    for (slot, inflight) in reserved.into_iter().zip(done.rights.drain(..take)) {
         let _ = slot.install_inflight(inflight, cloexec);
     }
     Ok(())

@@ -513,8 +513,10 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     }
     if !flags.is_path() && matches!(file.inode().inode_type(), InodeType::Anon | InodeType::Socket) {
         // Anonymous inodes (`alloc_anon_inode`, Linux v6.12 `fs/inode.c`) and
-        // sockets (`sock_no_open`, Linux v6.12 `net/socket.c`) refuse open via
-        // `/proc/<pid>/fd/N` with `-ENXIO` unless `O_PATH` is set.
+        // sockets (`inode_init_always` leaves `i_fop = &no_open_fops` via
+        // `sock_alloc`, Linux v6.12 `fs/inode.c` / `net/socket.c`) — as well
+        // as on-disk `S_IFSOCK` nodes (C1) — refuse open with `-ENXIO` unless
+        // `O_PATH` is set.
         return Err(errno::ENXIO);
     }
     if !flags.is_path() && file.inode().inode_type() == InodeType::Fifo {
