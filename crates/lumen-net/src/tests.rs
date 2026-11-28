@@ -166,8 +166,10 @@ fn time_wait_deadline_is_poll_at_and_bind_expires_without_poll() {
     let id = s.open(Family::V4, Proto::Tcp).unwrap();
     let req = BindReq { port: 1234, ..BindReq::default() };
     s.bind(id, req, Preps::None, Instant::ZERO).unwrap();
-    s.entries[id.index()].as_mut().unwrap().time_wait_until = Some(Instant::from_secs(10));
-    s.remove(id, true, Instant::ZERO);
+    // This fixture exercises a port-only reservation, without a transport.
+    // Real TIME-WAIT tuple retention is covered by the delivery tests.
+    s.ports.time_wait(id, Instant::from_secs(10), None);
+    s.remove(id, false, Instant::ZERO);
     s.poll_round(Instant::ZERO);
     assert_eq!(s.poll_at(Instant::ZERO), Some(Instant::from_secs(10)));
     let n = s.open(Family::V4, Proto::Tcp).unwrap();
@@ -852,4 +854,91 @@ fn icmp_source_override_preserves_checksums_and_neighbor_discovery() {
             }
         }
     }
+}
+
+#[test]
+fn ping_reuse_selects_one_owner_while_raw_icmp_still_fans_out() {
+    // Linux v6.12 net/ipv4/ping.c, ping_get_port:111-133 inserts at
+    // the hash head; ping_lookup:190-228 returns the first matching ping
+    // socket. net/ipv4/raw.c, raw_v4_input:174-193 clones for raw sockets.
+    for v6 in [false, true] {
+        let mut s = stack();
+        let b = budget();
+        let local = loopback_addr(v6);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = s.open(Family::of(local), Proto::IcmpEcho { raw: false }).unwrap();
+            s.bind(
+                id,
+                BindReq { addr: Some(local), port: 0x459, reuse_addr: true, ..BindReq::default() },
+                Preps::Icmp(&mut [prepare_icmp(b).unwrap()].into_iter()),
+                Instant::ZERO,
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        let raw = s.open(Family::of(local), Proto::IcmpEcho { raw: true }).unwrap();
+        s.send(
+            raw,
+            &[if v6 { 128 } else { 8 }, 0, 0, 0, 4, 89, 0, 1],
+            Some(IpEndpoint::new(local, 0)),
+            Preps::Icmp(&mut [prepare_icmp(b).unwrap()].into_iter()),
+            Instant::ZERO,
+        )
+        .unwrap();
+        s.changed();
+        let p = icmp_reply_frame(local, local, 0x459, 1, false);
+        s.frame[..p.len()].copy_from_slice(&p);
+        s.ingress_frame(0, p.len(), Instant::ZERO);
+        assert_eq!(s.recv(ids[0], &mut [0; 64], false), Err(NetError::WouldBlock));
+        let changed = s.changed();
+        assert!(!changed.contains(&ids[0]));
+        assert!(changed.contains(&ids[1]) && changed.contains(&raw));
+        assert_eq!(s.recv(ids[1], &mut [0; 64], false).unwrap().full_len, 8);
+        assert_eq!(s.recv(raw, &mut [0; 64], false).unwrap().full_len, if v6 { 8 } else { 28 });
+    }
+}
+
+#[test]
+fn closed_tcp_tuple_cannot_shadow_a_new_connection() {
+    // Linux v6.12 net/ipv4/inet_hashtables.c, __inet_check_established:
+    // 565-573 operates on hashed connections. A closed/unhashed transport
+    // cannot win lookup against its replacement's live tuple.
+    let mut s = stack();
+    let b = budget();
+    let local = loopback_addr(false);
+    let l = s.open(Family::V4, Proto::Tcp).unwrap();
+    s.bind(l, BindReq { port: 1234, ..BindReq::default() }, Preps::None, Instant::ZERO).unwrap();
+    s.listen(l, 0, &mut [tcp(b)].into_iter(), Instant::ZERO).unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let c = s.open(Family::V4, Proto::Tcp).unwrap();
+        s.bind(
+            c,
+            BindReq { addr: Some(local), port: 4000, reuse_addr: true, ..BindReq::default() },
+            Preps::None,
+            Instant::ZERO,
+        )
+        .unwrap();
+        clients.push(c);
+    }
+    let remote = IpEndpoint::new(local, 1234);
+    assert_eq!(s.connect(clients[0], remote, Some(ConnectPrep::Tcp(tcp(b))), Instant::ZERO), Err(NetError::InProgress));
+    for n in 0..12 {
+        s.poll_round(Instant::from_millis(n));
+    }
+    s.accept(l).unwrap();
+    s.abort(clients[0], Instant::from_millis(12)).unwrap();
+    assert_eq!(
+        s.connect(clients[1], remote, Some(ConnectPrep::Tcp(tcp(b))), Instant::from_millis(12)),
+        Err(NetError::InProgress)
+    );
+    let packet = crate::packet::TcpPacketInfo {
+        tuple: Tuple { local: remote, remote: IpEndpoint::new(local, 4000) },
+        syn: false,
+        rst: false,
+        probe: false,
+        mss: None,
+    };
+    assert!(matches!(s.syn_action(0, Some(&packet)), Syn::Deliver(Some(idx)) if idx == clients[1].index()));
 }

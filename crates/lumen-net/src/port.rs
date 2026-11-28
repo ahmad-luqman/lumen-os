@@ -28,6 +28,7 @@ struct Binding {
     req: Bound,
     listening: bool,
     until: Option<Instant>,
+    tuple: Option<crate::packet::Tuple>,
 }
 
 /// Fixed storage shared by IPv4 and IPv6, with TCP, UDP and ping identifier cursors.
@@ -68,7 +69,7 @@ impl PortTable {
         } else if self.conflict(id, proto, req) {
             return Err(NetError::AddrInUse);
         }
-        self.slots[slot] = Some(Binding { id, group: id, proto, req, listening: false, until: None });
+        self.slots[slot] = Some(Binding { id, group: id, proto, req, listening: false, until: None, tuple: None });
         self.uses[req.port as usize][Self::protocol(proto)] += 1;
         Ok(req)
     }
@@ -109,7 +110,7 @@ impl PortTable {
     pub fn release(&mut self, id: SockId) {
         Self::drop_where(&mut self.slots, &mut self.uses, |b| b.id == id);
     }
-    pub fn time_wait(&mut self, id: SockId, until: Instant) {
+    pub fn time_wait(&mut self, id: SockId, until: Instant, tuple: Option<crate::packet::Tuple>) {
         if let Some(index) = self.slots.iter().position(|b| b.is_some_and(|b| b.id == id)) {
             // TIME-WAIT has an independent fixed pool. When it is full, evict
             // the oldest reservation. Linux refuses the new TW bucket instead.
@@ -122,12 +123,16 @@ impl PortTable {
             }
             let mut b = self.slots[index].take().unwrap();
             b.until = Some(until);
+            b.tuple = tuple;
             b.listening = false;
             self.time_wait[target] = Some(b);
         }
     }
     pub fn expire(&mut self, now: Instant) {
         Self::drop_where(&mut self.time_wait, &mut self.uses, |b| b.until.is_some_and(|t| now >= t));
+    }
+    pub fn tuple_reserved(&self, tuple: crate::packet::Tuple, now: Instant) -> bool {
+        self.time_wait.iter().flatten().any(|b| b.tuple == Some(tuple) && b.until.is_some_and(|t| now < t))
     }
     fn pick_ephemeral(&mut self, proto: Proto) -> Result<u16, NetError> {
         let p = Self::protocol(proto);
@@ -260,6 +265,7 @@ mod tests {
                 req: Bound { port, ..Bound::default() },
                 listening: false,
                 until: None,
+                tuple: None,
             });
             t.uses[port as usize][0] = 1;
         }
@@ -278,7 +284,7 @@ mod tests {
         let mut t = PortTable::try_new(4).unwrap();
         let req = Bound { port: 1234, reuse_addr: true, ..Bound::default() };
         t.bind(id(0), Proto::Tcp, req).unwrap();
-        t.time_wait(id(0), Instant::from_millis(10000));
+        t.time_wait(id(0), Instant::from_millis(10000), None);
         t.expire(Instant::from_millis(9999));
         assert_eq!(t.bind(id(1), Proto::Tcp, Bound { reuse_addr: false, ..req }), Err(NetError::AddrInUse));
         t.bind(id(1), Proto::Tcp, Bound { reuse_addr: true, ..req }).unwrap();
@@ -305,7 +311,7 @@ mod round1_tests {
                         let mut t = PortTable::try_new(1).unwrap();
                         let req = Bound { port: 1234, reuse_addr: old_addr, reuse_port: old_port, ..Bound::default() };
                         t.bind(id(0), Proto::Tcp, req).unwrap();
-                        t.time_wait(id(0), Instant::from_secs(10));
+                        t.time_wait(id(0), Instant::from_secs(10), None);
                         assert_eq!(t.remaining(), 1);
                         let result =
                             t.bind(id(1), Proto::Tcp, Bound { reuse_addr: new_addr, reuse_port: new_port, ..req });
@@ -317,7 +323,7 @@ mod round1_tests {
         let mut t = PortTable::try_new(1).unwrap();
         for n in 1..=2 {
             t.bind(id(n), Proto::Tcp, Bound { port: n as u16, ..Bound::default() }).unwrap();
-            t.time_wait(id(n), Instant::from_secs(n as i64));
+            t.time_wait(id(n), Instant::from_secs(n as i64), None);
         }
         assert_eq!(t.len(), 1);
         assert_eq!(t.time_wait_ports().next(), Some((2, Instant::from_secs(2))));

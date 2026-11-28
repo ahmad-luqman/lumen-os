@@ -110,17 +110,17 @@ struct Entry {
 // alongside each of its eight receive slots, including queued alias traffic.
 #[derive(Clone, Copy, Default)]
 struct Destinations {
-    slots: [Option<IpAddress>; 8],
+    slots: [Option<(IpAddress, bool)>; 8],
     head: usize,
     len: usize,
 }
 impl Destinations {
-    fn push(&mut self, addr: IpAddress) {
+    fn push(&mut self, addr: IpAddress, deliver: bool) {
         assert!(self.len < self.slots.len());
-        self.slots[(self.head + self.len) % self.slots.len()] = Some(addr);
+        self.slots[(self.head + self.len) % self.slots.len()] = Some((addr, deliver));
         self.len += 1;
     }
-    fn pop(&mut self) -> Option<IpAddress> {
+    fn pop(&mut self) -> Option<(IpAddress, bool)> {
         if self.len == 0 {
             return None;
         }
@@ -584,6 +584,7 @@ impl<D: NetDevice> Stack<D> {
         prep: Option<ConnectPrep>,
         now: Instant,
     ) -> Result<(), NetError> {
+        self.ports.expire(now);
         let e = self.entry(id)?;
         if e.proto == Proto::Tcp {
             if e.connected && (e.connect_reported || self.tcp_ref(id)?.state() != tcp::State::Closed) {
@@ -643,7 +644,16 @@ impl<D: NetDevice> Stack<D> {
                 }
                 return Err(NetError::AddrNotAvail);
             }
-            let (h, c) = s.add(ConnectPrep::Tcp(p))?;
+            // Resolve the actual local address before checking the tuple, but
+            // do not install or transmit the prepared SYN until it is unique.
+            let tuple = Tuple { local: p.socket.local_endpoint().unwrap(), remote };
+            if self.tcp_tuple_in_use(i, tuple, now) {
+                if bound.is_none() {
+                    self.ports.release(id);
+                }
+                return Err(NetError::AddrNotAvail);
+            }
+            let (h, c) = self.interfaces[i].as_mut().unwrap().add(ConnectPrep::Tcp(p))?;
             let e = self.entry_mut(id)?;
             e.handles[i] = Some(h);
             e.charges[i] = Some(c);
@@ -683,6 +693,19 @@ impl<D: NetDevice> Stack<D> {
         self.filter_datagrams(id);
         self.touch(id);
         Ok(())
+    }
+    fn tcp_tuple_in_use(&self, i: usize, tuple: Tuple, now: Instant) -> bool {
+        self.ports.tuple_reserved(tuple, now)
+            || self.live_entries().any(|e| {
+                e.proto == Proto::Tcp
+                    && e.handles[i].is_some_and(|h| {
+                        let s = self.interfaces[i].as_ref().unwrap().sockets.get::<tcp::Socket>(h);
+                        !matches!(s.state(), tcp::State::Closed | tcp::State::Listen)
+                            && !(s.state() == tcp::State::TimeWait && e.time_wait_until.is_some_and(|t| now >= t))
+                            && s.local_endpoint() == Some(tuple.local)
+                            && s.remote_endpoint() == Some(tuple.remote)
+                    })
+            })
     }
     /// Clears a UDP peer filter while retaining its local binding.
     pub fn disconnect(&mut self, id: SockId) -> Result<(), NetError> {
@@ -747,6 +770,10 @@ impl<D: NetDevice> Stack<D> {
         destination: Option<IpAddress>,
         arrival: bool,
     ) {
+        // Select one ping owner at arrival, before any cache drains a queue.
+        // Raw sockets remain independent recipients. Record the decision with
+        // the destination so later binds cannot steal already queued replies.
+        let ping_owner = destination.and_then(|dst| self.ping_recipient(i, dst));
         for pos in (0..self.live.len()).rev() {
             let idx = self.live[pos];
             let e = self.entries[idx].as_ref().unwrap();
@@ -760,7 +787,8 @@ impl<D: NetDevice> Stack<D> {
                     && self.interfaces[i].as_ref().unwrap().sockets.get::<icmp::Socket>(h).recv_queue()
                         > self.snapshots[idx].rx
                 {
-                    self.entries[idx].as_mut().unwrap().icmp_destinations[i].push(dst);
+                    let deliver = e.proto == (Proto::IcmpEcho { raw: true }) || ping_owner == Some(id);
+                    self.entries[idx].as_mut().unwrap().icmp_destinations[i].push(dst, deliver);
                 }
                 self.filter_datagrams(id);
                 let e = self.entries[idx].as_ref().unwrap();
@@ -869,6 +897,29 @@ impl<D: NetDevice> Stack<D> {
             }
         }
     }
+    fn ping_recipient(&self, i: usize, destination: IpAddress) -> Option<SockId> {
+        let sockets = &self.interfaces[i].as_ref()?.sockets;
+        // Only checksum-validated echo delivery grows an Ident socket's RX.
+        // Derive the identifier from such a socket rather than parsing twice.
+        let ident = self
+            .live_entries()
+            .find(|e| {
+                e.proto == (Proto::IcmpEcho { raw: false })
+                    && e.handles[i]
+                        .is_some_and(|h| sockets.get::<icmp::Socket>(h).recv_queue() > self.snapshots[e.id.index()].rx)
+            })?
+            .bound?
+            .port;
+        self.live_entries()
+            .filter(|e| {
+                e.proto == (Proto::IcmpEcho { raw: false })
+                    && e.handles[i].is_some()
+                    && e.bound.is_some_and(|b| b.port == ident && b.addr.is_none_or(|a| a == destination))
+                    && family_ok(e.options.v6, e.options.v6only, destination)
+            })
+            .max_by_key(|e| e.bind_order)
+            .map(|e| e.id)
+    }
     /// Select a TCP owner before smoltcp's first-match demultiplexing. The
     /// one-slot set prevents a wildcard pool stealing a tuple or a later
     /// SO_REUSEPORT listener receiving a first-bound listener's excess SYN.
@@ -882,7 +933,9 @@ impl<D: NetDevice> Stack<D> {
             e.proto == Proto::Tcp
                 && e.handles[i].is_some_and(|h| {
                     let s = sockets.get::<tcp::Socket>(h);
-                    s.local_endpoint() == Some(tuple.local) && s.remote_endpoint() == Some(tuple.remote)
+                    !matches!(s.state(), tcp::State::Closed | tcp::State::Listen)
+                        && s.local_endpoint() == Some(tuple.local)
+                        && s.remote_endpoint() == Some(tuple.remote)
                 })
         }) {
             return Syn::Deliver(Some(e.id.index()));
@@ -902,7 +955,7 @@ impl<D: NetDevice> Stack<D> {
                     && req.addr.is_none_or(|a| a == tuple.local.addr)
                     && family_ok(req.v6, req.v6only, tuple.local.addr)
             })
-            .min_by_key(|e| e.bind_order);
+            .min_by_key(|e| (e.bound.unwrap().addr.is_none(), e.bind_order));
         let Some(e) = listener else {
             return Syn::NoOwner;
         };
@@ -1041,43 +1094,79 @@ impl<D: NetDevice> Stack<D> {
             self.dirty[idx].get_or_insert(e.id);
         }
     }
-    /// Choose the UDP recipient before smoltcp's addressless first match.
-    /// A wrong-family socket must never consume and discard another's packet.
+    /// Effective local receive address, including a wildcard connect's source.
+    fn udp_local_addr(&self, e: &Entry) -> Option<IpAddress> {
+        e.bound
+            .and_then(|b| b.addr)
+            .or_else(|| e.peer.and_then(|p| e.iface.and_then(|i| self.iface_addr(i, p.addr.is_ipv6()))))
+    }
+    fn udp_accepts(&self, e: &Entry, i: usize, tuple: Tuple) -> bool {
+        e.proto == Proto::Udp
+            && e.handles[i].is_some()
+            && e.bound.is_some_and(|b| b.port == tuple.local.port)
+            && self.udp_local_addr(e).is_none_or(|a| a == tuple.local.addr)
+            && family_ok(e.options.v6, e.options.v6only, tuple.local.addr)
+            && e.peer.is_none_or(|p| p == tuple.remote)
+            && (e.peer.is_none() || e.iface.is_none_or(|iface| iface.index() == i))
+    }
     fn udp_action(&self, i: usize, incoming: Tuple) -> Syn {
         let tuple = incoming.reversed();
         if i == 1 && self.dhcp.is_some() && incoming.local.port == 67 && incoming.remote.port == 68 {
             return Syn::Deliver(None); // smoltcp handles DHCP before UDP sockets
         }
         self.live_entries()
-            .filter(|e| {
-                e.proto == Proto::Udp
-                    && e.handles[i].is_some()
-                    && e.bound
-                        .is_some_and(|b| b.port == tuple.local.port && b.addr.is_none_or(|a| a == tuple.local.addr))
-                    && family_ok(e.options.v6, e.options.v6only, tuple.local.addr)
-                    && e.peer.is_none_or(|p| p == tuple.remote)
-                    && (e.peer.is_none() || e.iface.is_none_or(|iface| iface.index() == i))
-            })
+            .filter(|e| self.udp_accepts(e, i, tuple))
             // Linux v6.12 __udp{4,6}_lib_lookup tries the exact local
             // address before the wildcard bucket; compute_score then
             // prefers a matching connected peer within that bucket.
-            .min_by_key(|e| (e.bound.unwrap().addr.is_none(), e.peer.is_none(), e.bind_order))
+            .min_by_key(|e| (self.udp_local_addr(e).is_none(), e.peer.is_none(), e.bind_order))
             .map_or(Syn::NoOwner, |e| Syn::Deliver(Some(e.id.index())))
     }
     fn ingress_frame(&mut self, i: usize, len: usize, now: Instant) {
         let packet = tcp_packet(&self.frame[..len], i == 1);
         let destination = packet_destination(&self.frame[..len], i == 1);
         let action = if let Some(tuple) = udp_packet(&self.frame[..len], i == 1) {
-            self.udp_action(i, tuple)
+            let action = self.udp_action(i, tuple);
+            if i == 1 && self.broadcast(tuple.remote.addr, IfaceId::Eth0) && !matches!(action, Syn::Deliver(None)) {
+                // smoltcp returns after its first UDP match, even for a
+                // broadcast. Replay through each eligible transport's
+                // one-slot set; no new buffers or receive charges are needed.
+                self.snapshot(i);
+                for pos in 0..self.live.len() {
+                    let idx = self.live[pos];
+                    if self.udp_accepts(self.entries[idx].as_ref().unwrap(), i, tuple.reversed()) {
+                        self.deliver_transport(i, len, now, Syn::Deliver(Some(idx)), None);
+                    }
+                }
+                self.observe(i, None, destination, true);
+                self.note_sent(i);
+                return;
+            }
+            action
         } else {
             self.syn_action(i, packet.as_ref())
         };
+        if matches!(action, Syn::Drop) {
+            return;
+        }
+        self.snapshot(i);
+        self.deliver_transport(i, len, now, action, packet.as_ref());
+        self.observe(i, packet.as_ref(), destination, true);
+        self.note_sent(i);
+    }
+    fn deliver_transport(
+        &mut self,
+        i: usize,
+        len: usize,
+        now: Instant,
+        action: Syn,
+        packet: Option<&crate::packet::TcpPacketInfo>,
+    ) {
         let selected = match action {
             Syn::Deliver(s) => s,
             Syn::NoOwner => None,
             Syn::Drop => return,
         };
-        self.snapshot(i);
         let state = self.interfaces[i].as_mut().unwrap();
         let temporary = selected.map(|idx| {
             let h = self.entries[idx].as_ref().unwrap().handles[i].unwrap();
@@ -1105,8 +1194,6 @@ impl<D: NetDevice> Stack<D> {
                 self.entries[selected.unwrap()].as_mut().unwrap().remote_mss = mss;
             }
         }
-        self.observe(i, packet.as_ref(), destination, true);
-        self.note_sent(i);
     }
     fn reap_orphans(&mut self, i: usize, now: Instant) {
         let egress_ok = if i == 0 { !self.lo.full() } else { self.eth.as_ref().unwrap().tx_ready() };
@@ -1384,6 +1471,13 @@ impl<D: NetDevice> Stack<D> {
             return;
         };
         self.live.retain(|&idx| idx != id.index());
+        let tuple = if time_wait {
+            let i = e.iface.unwrap().index();
+            let s = self.interfaces[i].as_ref().unwrap().sockets.get::<tcp::Socket>(e.handles[i].unwrap());
+            s.local_endpoint().zip(s.remote_endpoint()).map(|(local, remote)| Tuple { local, remote })
+        } else {
+            None
+        };
         for i in 0..2 {
             if let Some(h) = e.handles[i] {
                 self.interfaces[i].as_mut().unwrap().remove(h);
@@ -1393,7 +1487,7 @@ impl<D: NetDevice> Stack<D> {
             self.interfaces[e.iface.unwrap().index()].as_mut().unwrap().count -= 1;
         }
         if time_wait {
-            self.ports.time_wait(id, e.time_wait_until.unwrap_or(now + TIME_WAIT));
+            self.ports.time_wait(id, e.time_wait_until.unwrap_or(now + TIME_WAIT), tuple);
         } else {
             self.ports.release(id);
         }
@@ -2062,8 +2156,10 @@ impl<D: NetDevice> Stack<D> {
             let state = self.interfaces[i].as_mut().unwrap();
             let socket = state.sockets.get_mut::<icmp::Socket>(h);
             while let Ok((data, from)) = socket.recv() {
-                let local = e.icmp_destinations[i].pop();
+                let destination = e.icmp_destinations[i].pop();
+                let local = destination.map(|(addr, _)| addr);
                 if e.rd
+                    || destination.is_some_and(|(_, deliver)| !deliver)
                     || !matches!(data.first(), Some(0 | 8 | 128 | 129))
                     || !raw && matches!(data.first(), Some(8 | 128))
                     || !family_ok(e.options.v6, e.options.v6only, from)

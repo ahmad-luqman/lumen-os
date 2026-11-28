@@ -4303,7 +4303,11 @@ pub trait NetDevice: Send {
     table (does a socket own its 4-tuple? which listener of the SYN's
     family covers the port? how many free LISTEN sockets has its pool
     this round?), then hands the frame to `poll_ingress_single` through a
-    one-frame `phy::Device`. A SYN no listener of its family covers gets a
+    one-frame `phy::Device`. A live four-tuple wins before listener lookup;
+    Closed transports cannot shadow replacement connections. Among listeners,
+    a specific local address wins before wildcard bindings, then bind order
+    breaks ties (Linux **v6.12**, `net/ipv4/inet_hashtables.c`,
+    `__inet_lookup_listener`, lines 447–462). A SYN no listener of its family covers gets a
     RST lumen-net builds, as a closed port's. A SYN to a listener whose
     accept queue is full or whose pool has no free LISTEN socket this
     round is dropped, as Linux's `tcp_conn_request` does, and the client's
@@ -4326,6 +4330,13 @@ pub trait NetDevice: Send {
     `__udp6_lib_lookup`, lines 235–265 search the specific address first;
     their `compute_score` functions (lines 389–401 and 137–147 respectively)
     prefer a matching peer address and port within that binding.
+    A connected wildcard UDP socket uses its selected local address for
+    receive matching (`net/ipv4/datagram.c`, `__ip4_datagram_connect`,
+    lines 64–70). On Ethernet, limited and subnet broadcasts go to **every**
+    eligible receiver (`net/ipv4/udp.c`, `__udp4_lib_mcast_deliver`,
+    lines 2277–2315). The same frame is delivered through each recipient's
+    one-slot set, with one snapshot/observation pass, no new buffer charges
+    and no per-packet allocation. Unicast retains the specificity ranking.
   - #459's PR 2 host-tests the filter on `lo` and Ethernet (a v4 SYN to a `v6only`
     listener's port is refused, a full pool drops a SYN, a v6 datagram
     never reaches an `AF_INET` socket) and both wildcard-listener orders.
@@ -4523,6 +4534,16 @@ impl SockOps for InetSocket { /* dispatches on `proto` */ }
   - `SO_REUSEPORT` doesn't spread connections: the first bound listener
     takes them (a deviation).
 - **`connect`:**
+  - TCP refuses an already owned four-tuple with `-EADDRNOTAVAIL` before
+    installing or transmitting the prepared socket. This includes SYN-SENT,
+    closing connections and unexpired TIME-WAIT, whose tuple stays with the
+    port reservation after orphan removal (Linux **v6.12**,
+    `net/ipv4/inet_hashtables.c`, `__inet_hash_connect`, lines 1014–1019,
+    and `__inet_check_established`, lines 565–602). Linux's early TIME-WAIT
+    reuse requires a recorded TCP timestamp (`net/ipv4/tcp_ipv4.c`,
+    `tcp_twsk_unique`, lines 164–167, 198); Lumen leaves smoltcp timestamps
+    disabled, so the tuple is reusable only after its existing 10-second
+    expiry. Ephemeral allocation still skips every occupied TCP port.
   - A blocking connect waits until Established (0) or an error.
   - A non-blocking one returns `-EINPROGRESS`. Completion shows as
     `POLLOUT`, and `SO_ERROR` gives 0 or the error and clears it (the
@@ -4709,6 +4730,12 @@ interfaces.
   `ping_lookup`, lines 194–218, for IPv4 and IPv6). Raw sockets also check
   a connected peer's address (`net/ipv4/raw.c`, `raw_v4_match`, lines 119–129;
   `net/ipv6/raw.c`, `raw_v6_match`, lines 67–84).
+- Shared ping identifiers select one matching ping socket, newest bind first,
+  as Linux **v6.12** `net/ipv4/ping.c`, `ping_get_port`, lines 111–133 and
+  `ping_lookup`, lines 190–228 insert at the hash head and return the first
+  match. Raw sockets still each receive a copy. The destination FIFO records
+  this delivery decision at arrival, so later binds cannot redirect queued
+  replies and a full selected queue does not fall back to an older socket.
 - smoltcp's ICMP send metadata has no source address. For a bound 127/8
   alias, egress isolates that socket and corrects the emitted request's source
   and dependent checksums. A boot-reserved vector holds at most `NET_SOCKETS`

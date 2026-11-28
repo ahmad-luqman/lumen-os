@@ -21,21 +21,24 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `memory.rs`: atomic `Budget`/`Charge`,
   fallible `prepare_tcp`/`prepare_udp`/`prepare_icmp` buffers. `port.rs`:
   `PortTable`, protocol/family bind conflicts, next-fit ephemeral ports and
-  TIME-WAIT reservations. `packet.rs`: checksum-checked TCP/UDP tuples for
+  TIME-WAIT port and four-tuple reservations. `packet.rs`: checksum-checked TCP/UDP tuples for
   family-aware ingress selection, the SYN backlog filter and reset
   classification. `stack.rs`: `Stack`,
   generational `SockId` entries, bounded LISTEN pools, accept queues,
   event-based `changed` (including packet metadata capacity), per-state
   timers, orphan cleanup, shutdown readiness, datagram tickets, wildcard
-  receive fairness, UDP recipient specificity, connected-interface send
-  readiness, ICMP local/peer filtering, first-send raw identifiers, hop limits
-  and listener option inheritance. Caller-timed deadlines
+  receive fairness, TCP tuple uniqueness and listener precedence,
+  UDP recipient specificity and broadcast fan-out, connected-interface send
+  readiness, ICMP local/peer filtering, first-send raw identifiers, hop limits,
+  ping owner selection and listener option inheritance. Caller-timed deadlines
   count transmitted keepalive probes and reap unreachable orphans; retired
   TCP transports preserve unread data without duplicate receive buffers.
   Seeded interfaces, typed preparations, explicit `Family`/`V6Only`, ICMP
   destination metadata and independent TIME-WAIT capacity bound stack work.
   `src/tests.rs` checks private invariants; `tests/linux_regressions.rs` and
   `tests/transport_regressions.rs` cover Linux v6.12 semantics and wake paths.
+  `tests/delivery.rs` checks tuple collisions, TIME-WAIT and recipient precedence;
+  `tests/allocation.rs` also covers broadcast fan-out without allocation.
   `lib.rs`: shared types, errno mapping, buffer-size and backlog clamps.
   Host tests drive made-up time over loopback and a frame wire pair,
   including allocation counters, capacity limits, port exhaustion and

@@ -327,3 +327,95 @@ fn bound_icmp_egress_and_identifier_selection_allocate_nothing() {
         assert_eq!(b.used(), 0);
     }
 }
+
+#[test]
+fn udp_broadcast_fanout_preserves_charges_wakes_and_unicast_without_allocation() {
+    // Linux v6.12 net/ipv4/udp.c, __udp4_lib_mcast_deliver:2277-2315
+    // queues a copy to each eligible socket; __udp4_lib_rcv:2443-2446
+    // sends both broadcast and multicast through that path.
+    let (mut sender, mut receiver, _, _) = wire_stacks();
+    let b = budget();
+    let source = bind_udp(&mut sender, budget(), None, 4001, false);
+    sender.set_opt(source, NetOpt::Broadcast(true), Instant::ZERO).unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let id = receiver.open(Family::V4, Proto::Udp).unwrap();
+        receiver
+            .bind(
+                id,
+                BindReq { port: 4000, reuse_addr: true, ..BindReq::default() },
+                Preps::Udp(&mut [udp(b), udp(b)].into_iter()),
+                Instant::ZERO,
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    let connected = receiver.open(Family::V4, Proto::Udp).unwrap();
+    receiver
+        .bind(
+            connected,
+            BindReq { port: 4000, reuse_addr: true, ..BindReq::default() },
+            Preps::Udp(&mut [udp(b), udp(b)].into_iter()),
+            Instant::ZERO,
+        )
+        .unwrap();
+    receiver.connect(connected, IpEndpoint::new(IpAddress::v4(10, 0, 0, 1), 4001), None, Instant::ZERO).unwrap();
+    let used = b.used();
+    let sockets = receiver.socket_count();
+    let mut now = 0;
+    assert_eq!(
+        counted(|| {
+            for destination in [IpAddress::Ipv4(Ipv4Address::BROADCAST), IpAddress::v4(10, 0, 0, 255)] {
+                receiver.changed();
+                sender
+                    .send(
+                        source,
+                        b"all",
+                        Some(IpEndpoint::new(destination, 4000)),
+                        Preps::None,
+                        Instant::from_millis(now),
+                    )
+                    .unwrap();
+                wire_steps(&mut sender, &mut receiver, &mut now, 8);
+                let changed = receiver.changed();
+                for &id in &ids {
+                    assert!(changed.contains(&id));
+                }
+                assert!(!changed.contains(&connected), "connected local unicast address excludes broadcast");
+                assert_eq!(receiver.recv(connected, &mut [0; 8], false), Err(NetError::WouldBlock));
+                for &id in &ids {
+                    let mut data = [0; 8];
+                    assert_eq!(receiver.recv(id, &mut data, false).unwrap().copied, 3);
+                    assert_eq!(&data[..3], b"all");
+                    assert_eq!(receiver.recv(id, &mut data, false), Err(NetError::WouldBlock));
+                }
+                assert_eq!((receiver.socket_count(), b.used()), (sockets, used));
+            }
+            receiver.disconnect(connected).unwrap();
+            receiver.changed();
+            sender
+                .send(
+                    source,
+                    b"one",
+                    Some(IpEndpoint::new(IpAddress::v4(10, 0, 0, 2), 4000)),
+                    Preps::None,
+                    Instant::from_millis(now),
+                )
+                .unwrap();
+            wire_steps(&mut sender, &mut receiver, &mut now, 16);
+            let mut data = [0; 8];
+            assert_eq!(receiver.recv(ids[0], &mut data, false).unwrap().copied, 3);
+            assert_eq!(&data[..3], b"one");
+            for &id in &ids[1..] {
+                assert_eq!(receiver.recv(id, &mut data, false), Err(NetError::WouldBlock));
+            }
+            assert_eq!(receiver.recv(connected, &mut data, false), Err(NetError::WouldBlock));
+            for &id in &ids {
+                receiver.close(id, false, Instant::from_millis(now));
+            }
+            receiver.close(connected, false, Instant::from_millis(now));
+            assert_eq!(b.used(), 0);
+        }),
+        0
+    );
+}
