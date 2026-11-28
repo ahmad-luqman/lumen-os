@@ -5,6 +5,7 @@ artifacts themselves, with the pinned toolchain's LLVM tools so macOS and CI
 behave the same:
 
 Binary checks (the built kernel ELFs):
+  * Each ELF defines at least one smoltcp symbol (not just an undefined reference).
   * ELF64 x86-64 executable, every allocated section in the top 2 GiB
     (0xffffffff80000000+), as the kernel code model requires.
   * The exception fixup tables (`.lumen_fixup`, `.lumen_fixup_nofault`)
@@ -26,6 +27,9 @@ Binary checks (the built kernel ELFs):
     the large code model).
 
 Compiler checks (LLVM IR of the kernel crate, built separately):
+  * At least one smoltcp function definition is present. This covers the
+    smoltcp generics instantiated in the kernel crate, not functions compiled
+    in smoltcp's own rlib, which receive only the binary checks above.
   * Module flag "Code Model" == 2 (kernel).
   * Every function carries `noredzone`, `"frame-pointer"="all"` and target
     features that disable SSE/SSE2.
@@ -171,11 +175,34 @@ READ_ONLY_WRITABLE = {".got"}
 
 
 def nm_symbols(nm: str) -> dict[str, int]:
-    """Read defined symbol addresses from llvm-nm's default output."""
+    """Read defined addresses from demangled `llvm-nm -C` output, only names without spaces."""
     return {
         name: int(addr, 16)
         for addr, _, name in re.findall(r"^([0-9a-f]+) (\w) (\S+)$", nm, re.MULTILINE)
     }
+
+
+def check_smoltcp_symbols(nm: str) -> list[Finding]:
+    """Require a defined smoltcp symbol in demangled `llvm-nm -C` output."""
+    if any(
+        kind != "U" and name.startswith(("smoltcp::", "<smoltcp::"))
+        for kind, name in re.findall(r"^[0-9a-fA-F]+\s+([A-Za-z])\s+(.+)$", nm, re.MULTILINE)
+    ):
+        return []
+    return [Finding("smoltcp", "no defined smoltcp:: symbol in the kernel ELF")]
+
+
+def check_smoltcp_ir(ir: str) -> list[Finding]:
+    """Require a function definition naming the smoltcp crate root in kernel-crate IR."""
+    # Inspect function symbols only, not comments, declarations or metadata.
+    # Anchor smoltcp at a crate root (v0 C or legacy _ZN), so a kernel module
+    # with the same name cannot satisfy the check. v0 permits disambiguators
+    # on the crate and on the following identifier.
+    names = re.findall(r'^define\b[^@\n]*@(?:"([^"]+)"|([^\s(]+))\(', ir, re.MULTILINE)
+    root = r"(?:^_ZN|C(?:s[0-9A-Za-z]*_)?)7smoltcp(?:\d|s[0-9A-Za-z]*_)"
+    if any(re.search(root, quoted or bare) for quoted, bare in names):
+        return []
+    return [Finding("smoltcp", "no smoltcp function definition in the kernel-crate IR")]
 
 
 def check_image_bounds(readobj: str, nm: str) -> list[Finding]:
@@ -298,6 +325,12 @@ def check_ir(ir: str) -> list[Finding]:
 
 
 def emit_kernel_ir() -> str:
+    """Emit normal-kernel crate IR, including generics it instantiates, not dependency IR."""
+    overrides = sorted(name for name in os.environ if name.startswith("SMOLTCP_"))
+    if overrides:
+        raise SystemExit(
+            "audit: smoltcp configuration is pinned in Cargo.toml; unset " + ", ".join(overrides)
+        )
     target_dir = BUILD_DIR / "audit-target"
     env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
     subprocess.run(
@@ -324,18 +357,20 @@ def run_audit(kernels: list[Path]) -> int:
         dis = subprocess.check_output(
             [objdump, "-d", "--no-show-raw-insn", "--x86-asm-syntax=att", str(k)], text=True
         )
-        syms = subprocess.check_output([nm, str(k)], text=True)
+        syms = subprocess.check_output([nm, "-C", str(k)], text=True)
         found = (
             check_sections(hdr)
             + check_image_bounds(hdr, syms)
             + check_fixup_sections(hdr, syms)
             + scan_disassembly(dis)
+            + check_smoltcp_symbols(syms)
         )
         n_insns = sum(1 for line in dis.splitlines() if INSN.match(line))
         status = "ok" if not found else f"{len(found)} finding(s)"
         print(f"audit: {k}: {n_insns} instructions scanned, {status}")
         total += found
-    ir_findings = check_ir(emit_kernel_ir())
+    ir = emit_kernel_ir()
+    ir_findings = check_ir(ir) + check_smoltcp_ir(ir)
     print(f"audit: LLVM IR: {'ok' if not ir_findings else f'{len(ir_findings)} finding(s)'}")
     total += ir_findings
     results = BUILD_DIR / "test-results"

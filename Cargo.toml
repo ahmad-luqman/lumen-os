@@ -126,6 +126,11 @@ lumen-eventfd = { path = "crates/lumen-eventfd" }
 lumen-epoll = { path = "crates/lumen-epoll" }
 lumen-sockabi = { path = "crates/lumen-sockabi" }
 lumen-unix = { path = "crates/lumen-unix" }
+# M9 network stack dependency, licensed 0BSD.
+# Off: default features (std, log, ...) and `socket-tcp-cubic` (f64).
+# Per #469's stack design: lo will use 2 of 2 addresses;
+# eth0 1 address and 1 of 2 routes. Adding an address to lo needs a larger budget.
+smoltcp = { version = "=0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-dhcpv4", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "auto-icmp-echo-reply", "iface-max-addr-count-2", "iface-max-route-count-2"] }
 
 # `vendor/ext4plus` is ext4plus 0.1.0-rc.2's crate file unpacked (sha256
 # 6c83a722…, the checksum Cargo.lock had for it), with Lumen's fixes on top,

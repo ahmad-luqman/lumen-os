@@ -236,3 +236,77 @@ impl Write for Buf {
         Ok(())
     }
 }
+
+// The IR audit builds the normal kernel, where `ktest!` compiles out (#459).
+// Skip that macro: #[used] retains this descriptor and its smoltcp code in
+// kernel-crate IR; the linker's KEEP on .ktests retains them in both ELFs.
+// Only feature = "ktest" code reads .ktests today; a future normal-kernel
+// reader must skip this test descriptor.
+#[used]
+#[unsafe(link_section = ".ktests")]
+static SMOLTCP_LINK_CHECK: KTest = KTest {
+    name: concat!(module_path!(), "::smoltcp_links_and_echoes_over_loopback"),
+    func: smoltcp_links_and_echoes_over_loopback,
+};
+
+fn smoltcp_links_and_echoes_over_loopback() -> TestResult {
+    use smoltcp::iface::{Config, Interface, SocketSet};
+    use smoltcp::phy::{Loopback, Medium};
+    use smoltcp::socket::tcp;
+    use smoltcp::time::{Duration, Instant};
+    use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+
+    // Fixed steps at made-up times: a slow host can't fail it, and a
+    // connection that doesn't progress within 8 steps fails.
+    fn poll_steps(iface: &mut Interface, device: &mut Loopback, sockets: &mut SocketSet<'_>, now: &mut Instant) {
+        for _ in 0..8 {
+            iface.poll(*now, device, sockets);
+            *now += Duration::from_millis(1);
+        }
+    }
+
+    for (family, addr, prefix) in
+        [("IPv4", IpAddress::v4(127, 0, 0, 1), 8), ("IPv6", IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128)]
+    {
+        diag(format_args!("smoltcp loopback: {family} ({addr}/{prefix})"));
+        let mut now = Instant::ZERO;
+        let mut device = Loopback::new(Medium::Ip);
+        let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, Instant::ZERO);
+        iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(addr, prefix)).unwrap();
+        });
+        let socket = || {
+            tcp::Socket::new(tcp::SocketBuffer::new(alloc::vec![0; 256]), tcp::SocketBuffer::new(alloc::vec![0; 256]))
+        };
+        let mut sockets = SocketSet::new(alloc::vec::Vec::new());
+        let server = sockets.add(socket());
+        let client = sockets.add(socket());
+        crate::kassert_eq!(sockets.get_mut::<tcp::Socket>(server).listen((addr, 459)), Ok(()));
+        crate::kassert_eq!(
+            sockets.get_mut::<tcp::Socket>(client).connect(iface.context(), (addr, 459), (addr, 32768)),
+            Ok(())
+        );
+        poll_steps(&mut iface, &mut device, &mut sockets, &mut now);
+        crate::kassert_eq!(sockets.get::<tcp::Socket>(client).state(), tcp::State::Established);
+        crate::kassert_eq!(sockets.get::<tcp::Socket>(server).state(), tcp::State::Established);
+
+        let payload = b"Lumen smoltcp #459";
+        crate::kassert_eq!(sockets.get_mut::<tcp::Socket>(client).send_slice(payload), Ok(payload.len()));
+        poll_steps(&mut iface, &mut device, &mut sockets, &mut now);
+        let mut received = [0; 64];
+        crate::kassert_eq!(sockets.get_mut::<tcp::Socket>(server).recv_slice(&mut received), Ok(payload.len()));
+        crate::kassert_eq!(&received[..payload.len()], payload);
+        let tag = b"echo: ";
+        crate::kassert_eq!(sockets.get_mut::<tcp::Socket>(server).send_slice(tag), Ok(tag.len()));
+        crate::kassert_eq!(
+            sockets.get_mut::<tcp::Socket>(server).send_slice(&received[..payload.len()]),
+            Ok(payload.len())
+        );
+        poll_steps(&mut iface, &mut device, &mut sockets, &mut now);
+        received.fill(0);
+        let expected = b"echo: Lumen smoltcp #459";
+        crate::kassert_eq!(sockets.get_mut::<tcp::Socket>(client).recv_slice(&mut received), Ok(expected.len()));
+        crate::kassert_eq!(&received[..expected.len()], expected);
+    }
+    Ok(())
+}

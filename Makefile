@@ -7,6 +7,14 @@ SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
 .DEFAULT_GOAL := help
 
+# smoltcp's build script gives environment overrides precedence over the pinned
+# Cargo features. Reject even empty/unknown names before any recipe can run.
+# Also catches command-line Make assignments, which Make exports to recipes.
+LUMEN_SMOLTCP_OVERRIDES := $(filter SMOLTCP_%,$(.VARIABLES))
+ifneq ($(strip $(LUMEN_SMOLTCP_OVERRIDES)),)
+$(error smoltcp configuration is pinned in Cargo.toml; unset $(LUMEN_SMOLTCP_OVERRIDES))
+endif
+
 TARGET      := x86_64-unknown-none
 KERNEL_OUT  := target/$(TARGET)/release/lumen-kernel
 BUILD       := build
