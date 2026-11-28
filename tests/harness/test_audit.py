@@ -1,10 +1,19 @@
 """The flag audit must actually catch the problems it claims to catch."""
 
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+from lumen_harness import REPO_ROOT, audit
 from lumen_harness.audit import (
     check_fixup_sections,
     check_image_bounds,
     check_ir,
     check_sections,
+    check_smoltcp_ir,
+    check_smoltcp_symbols,
     scan_disassembly,
 )
 
@@ -324,11 +333,14 @@ def test_nofault_fixup_section_is_read_only_and_in_rodata():
 
 
 IR_OK = """
-define void @f() unnamed_addr #0 {
+define void @_RNvCs123_12lumen_kernel1f() unnamed_addr #0 {
 }
 attributes #0 = { noredzone nounwind "frame-pointer"="all" "probe-stack"="inline-asm" "target-features"="-mmx,-sse,-sse2,+soft-float" }
 !1 = !{i32 1, !"Code Model", i32 2}
 """
+
+SMOLTCP_SYMBOL = "_RINvMs0_NtCs123_7smoltcp5iface4pollE"
+SMOLTCP_IR_OK = IR_OK.replace("_RNvCs123_12lumen_kernel1f", SMOLTCP_SYMBOL)
 
 
 def test_ir_ok():
@@ -352,3 +364,165 @@ def test_ir_missing_stack_probes():
 def test_ir_wrong_code_model():
     bad = IR_OK.replace('"Code Model", i32 2', '"Code Model", i32 1')
     assert [f.check for f in check_ir(bad)] == ["code-model"]
+
+
+def test_smoltcp_requires_a_defined_elf_symbol():
+    for name in (
+        "smoltcp::socket::tcp::Socket::process",
+        "<smoltcp::phy::loopback::Loopback as smoltcp::phy::Device>::receive",
+    ):
+        assert check_smoltcp_symbols(f"ffffffff80001000 t {name}\n") == []
+        assert check_smoltcp_symbols(f"ffffffff80001000 W {name}\n") == []
+    for nm in (
+        "",
+        "                 U smoltcp::socket::tcp::Socket::process\n",
+        "                 w smoltcp::socket::tcp::Socket::process\n",
+        "0000000000000000 U smoltcp::socket::tcp::Socket::process\n",
+        "ffffffff80001000 t lumen_kernel::ktest::smoltcp_links_and_echoes_over_loopback\n",
+        "ffffffff80001000 t not_smoltcp::process\n",
+        "ffffffff80001000 t lumen_kernel::net::smoltcp::device\n",
+        "ffffffff80001000 t <lumen_kernel::X as smoltcp::phy::Device>::receive\n",
+        "ffffffff80001000 t core::ptr::drop_in_place<smoltcp::socket::tcp::Socket>\n",
+        "smoltcp::socket::tcp::Socket::process\n",  # Unparseable output cannot pass.
+    ):
+        assert [f.check for f in check_smoltcp_symbols(nm)] == ["smoltcp"], nm
+
+
+def test_smoltcp_requires_an_ir_definition():
+    symbol = SMOLTCP_SYMBOL
+    # v0 (the pinned compiler), its optional crate/identifier disambiguators,
+    # then legacy mangling and quoted LLVM symbols.
+    for name in (
+        symbol,
+        "_RINvMs0_NtC7smoltcp5iface4pollE",
+        "_RINvMs0_NtCs123_7smoltcps456_5iface4pollE",
+        "_RINvMs0_NtC7smoltcps456_5iface4pollE",
+        "_ZN7smoltcp5iface9Interface4poll17h0123456789abcdefE",
+        f'"{symbol}"',
+    ):
+        assert check_smoltcp_ir(SMOLTCP_IR_OK.replace(symbol, name)) == []
+    without = SMOLTCP_IR_OK.replace(symbol, "kernel_function")
+    for ir in (
+        without,
+        without + f"; define void @{symbol}() #0 {{}}\n",
+        without + f"declare void @{symbol}() #0\n",
+        without + f'!2 = !{{!"{symbol}"}}\n',
+        without.replace("@kernel_function()", f"@kernel_function(ptr %{symbol})"),
+        without.replace("kernel_function", "smoltcp_links_and_echoes_over_loopback"),
+        without.replace("kernel_function", "_ZN12lumen_kernel3net7smoltcp6deviceE"),
+        without.replace("kernel_function", "_RNvNtNtCs123_12lumen_kernel3net7smoltcp6device"),
+    ):
+        assert [f.check for f in check_smoltcp_ir(ir)] == ["smoltcp"], ir
+
+
+@pytest.mark.parametrize("missing", [None, "normal", "ktest", "ir"])
+def test_audit_requires_smoltcp_in_each_elf_and_kernel_ir(monkeypatch, tmp_path, missing):
+    # Exercise run_audit, so dropping either check from the actual audit fails
+    # even if the parser's own tests still pass.
+    monkeypatch.setattr(audit, "BUILD_DIR", tmp_path)
+    monkeypatch.setattr(audit, "llvm_tool", lambda name: name)
+    ir = SMOLTCP_IR_OK if missing != "ir" else IR_OK
+    monkeypatch.setattr(audit, "emit_kernel_ir", lambda: ir)
+    visited = []
+
+    def output(command, *, text):
+        assert text
+        tool, *args = command
+        if tool == "llvm-readobj":
+            return (
+                "Class: 64-bit\nMachine: EM_X86_64\nType: Executable\n"
+                + IMAGE_READOBJ
+                + PLAIN_FIXUP
+                + NOFAULT_FIXUP
+            )
+        if tool == "llvm-objdump":
+            return CLEAN
+        assert tool == "llvm-nm"
+        assert args[0] == "-C"
+        visited.append(args[-1])
+        return IMAGE_NM + (
+            ""
+            if missing == args[-1]
+            else "ffffffff80001000 t smoltcp::socket::tcp::Socket::process\n"
+        )
+
+    monkeypatch.setattr(audit.subprocess, "check_output", output)
+    assert audit.run_audit([Path("normal"), Path("ktest")]) == (0 if missing is None else 1)
+    assert visited == ["normal", "ktest"]
+    assert json.loads((tmp_path / "test-results/audit.json").read_text()) == {
+        "flags": missing is None
+    }
+
+
+@pytest.mark.parametrize("target", ["build", "audit"])
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("SMOLTCP_IFACE_MAX_ADDR_COUNT", "3"),
+        ("SMOLTCP_IFACE_MAX_ROUTE_COUNT", ""),
+        ("SMOLTCP_UNKNOWN_SETTING", "1"),
+    ],
+)
+def test_make_rejects_smoltcp_environment_overrides(target, name, value):
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("SMOLTCP_")
+        and k not in {"MAKELEVEL", "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES"}
+    }
+    # A dry run still evaluates Make's guard, but cannot rebuild or fetch
+    # anything if the guard regresses. A clean environment is the control.
+    command = ["make", "--no-print-directory", "-n", target]
+    clean = subprocess.run(
+        command, cwd=REPO_ROOT, env=env, text=True, capture_output=True, check=False
+    )
+    assert clean.returncode == 0, clean.stderr
+    bad = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env={**env, name: value},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert bad.returncode != 0
+    assert "smoltcp configuration is pinned in Cargo.toml; unset" in bad.stderr
+    assert name in bad.stderr
+    assert bad.stdout == ""  # Before any build recipe, even when artifacts are current.
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("SMOLTCP_IFACE_MAX_ADDR_COUNT", "3"),
+        ("SMOLTCP_IFACE_MAX_ROUTE_COUNT", ""),
+        ("SMOLTCP_UNKNOWN_SETTING", "1"),
+    ],
+)
+def test_emit_kernel_ir_rejects_smoltcp_environment_overrides(monkeypatch, tmp_path, name, value):
+    for key in list(os.environ):
+        if key.startswith("SMOLTCP_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setattr(audit, "BUILD_DIR", tmp_path)
+    ir_path = tmp_path / "audit-target/x86_64-unknown-none/release/deps/lumen_kernel-test.ll"
+    ir_path.parent.mkdir(parents=True)
+    ir_path.write_text(IR_OK)
+    calls = []
+
+    def run(command, **kwargs):
+        assert command[:2] == ["cargo", "rustc"]
+        assert not any(key.startswith("SMOLTCP_") for key in kwargs["env"])
+        calls.append(command)
+
+    monkeypatch.setattr(audit.subprocess, "run", run)
+    assert audit.emit_kernel_ir() == IR_OK  # Clean environment reaches Cargo.
+    monkeypatch.setenv(name, value)
+    with pytest.raises(
+        SystemExit, match=f"smoltcp configuration is pinned in Cargo.toml; unset {name}"
+    ):
+        audit.emit_kernel_ir()
+    assert len(calls) == 1  # An override is rejected before starting Cargo.
+
+
+def test_cargo_config_has_no_smoltcp_overrides():
+    assert "SMOLTCP_" not in (REPO_ROOT / ".cargo/config.toml").read_text()

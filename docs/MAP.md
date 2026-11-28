@@ -6,6 +6,15 @@ Read the entry for an area before changing it; keep the entry current in
 the same PR (names, issue numbers, what each piece owns). Interfaces shared
 across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
 
+- Networking dependencies (#459): root `Cargo.toml` pins `smoltcp =0.14.0`
+  (0BSD, `no_std` + `alloc`, Ethernet/IP media, IPv4/IPv6,
+  TCP/UDP/ICMP/DHCPv4 and automatic ICMP echo). Address and route limits
+  are explicit features (2 each); `Makefile` rejects `SMOLTCP_*` overrides.
+  `kernel/Cargo.toml` consumes it for the dependency check:
+  binary checks on both ELFs; IR checks on the kernel crate and the smoltcp
+  generics it instantiates (`tests/features/net.toml`). Functions compiled
+  in smoltcp's own rlib receive only binary checks. `crates/lumen-net`
+  is #459 PR 2, the Linux socket semantics layer following the stack design.
 - `kernel/src/main.rs`: boot sequence. `boot.rs`: the Limine requests
   (and, by hand, the TSC-frequency and bootloader-performance ones;
   `before_kmain`).
@@ -23,7 +32,10 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   stubs and the vector map, `percpu.rs` (GS base, CPU index, `loaded_space`, #376, `DebugTrap` pending debug traps, #384), `irq.rs` (nested interrupt disable),
   `syscall.rs` (`SyscallFrame`, `SyscallReturn`, `unwind_to_kernel`), `fpu.rs` (M6's `FpuMode`, `UserFpuState`; `install_signal`, `signal_xfeature_layout`, #384),
   local and I/O APIC, 8259 and PIT registers, serial, IST stacks. `user.rs`: ring-3 entry/exit (`run_elf_process`, `UserExit`, `UserFault`), fault-safe copies (`copy_from_user`, `copy_to_user`, `copy_to_user_partial`, `copy_cstr_from_user`, `.lumen_fixup`), non-faulting futex atomics (`read_u32_nofault`, `cmpxchg_u32`, `fault_in_writable`, `.lumen_fixup_nofault`, #373, #383), `handle_user_exception` and `dispatch_syscall`. `crash.rs`: crash
-  reporter. `ktest.rs`: test runner (`lumen.ktest=` runs only the tests with given name prefixes). `script.rs`: rhai scripts (the shell's
+  reporter. `ktest.rs`: test runner (`lumen.ktest=` runs only the tests with given name prefixes);
+  #459's `smoltcp_links_and_echoes_over_loopback` checks IPv4/IPv6 TCP
+  handshakes and tagged replies, retained unconditionally for the audit.
+  `script.rs`: rhai scripts (the shell's
   `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
   (plain text unless `lumen.ansi`), one on each virtual terminal (keyboard) and one in each terminal
   window (`run_in_window`, #155): `mod.rs` the consoles (`Console::place`: anywhere, a virtual terminal
@@ -983,7 +995,10 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built; virtio devices through `Devices`; `press`/`type_text` for keys,
   `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`,
-  `audit.py` (also checks `.lumen_fixup_nofault`, #373), `status.py`,
+  `audit.py` (also checks `.lumen_fixup_nofault`, #373, and requires smoltcp
+  crate-root definitions in each ELF and the kernel-crate IR through
+  `check_smoltcp_symbols`/`check_smoltcp_ir`, #459; `emit_kernel_ir` also
+  rejects `SMOLTCP_*` environment overrides without Make), `status.py`,
   `wasm.py` (the built apps checked: `wasmtime` validation with the
   proposals past rustc's defaults that wasmtime-py can switch off
   switched off (`OFF`, each a real `Config` setting), and a reader for custom sections,

@@ -9,3 +9,17 @@ tests = ["cargo:lumen-sockabi"]
 name = "AF_UNIX stream and datagram queues (logic)"
 milestone = "M9"
 tests = ["cargo:lumen-unix"]
+
+[[feature]]
+name = "smoltcp linked into both kernels (binary checks on both ELFs; IR checks on the kernel crate and the smoltcp generics it instantiates); TCP handshake and tagged reply over IPv4/IPv6 loopback; make rejects SMOLTCP_* overrides"
+milestone = "M9"
+tests = [
+    "audit:flags",
+    "ktest:lumen_kernel::ktest::smoltcp_links_and_echoes_over_loopback",
+    "harness:test_audit::test_smoltcp_requires_a_defined_elf_symbol",
+    "harness:test_audit::test_smoltcp_requires_an_ir_definition",
+    "harness:test_audit::test_audit_requires_smoltcp_in_each_elf_and_kernel_ir[*]",
+    "harness:test_audit::test_make_rejects_smoltcp_environment_overrides[*]",
+    "harness:test_audit::test_emit_kernel_ir_rejects_smoltcp_environment_overrides[*]",
+    "harness:test_audit::test_cargo_config_has_no_smoltcp_overrides",
+]

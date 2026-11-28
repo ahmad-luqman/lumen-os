@@ -35,7 +35,8 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
-    /* In-kernel test registry: every `ktest!` places a descriptor here. */
+    /* Test registry, including the unconditional smoltcp descriptor:
+     * #[used] keeps it in the IR; KEEP keeps it in the ELF (see ktest.rs). */
     .ktests : {
         __ktests_start = .;
         KEEP(*(.ktests))
