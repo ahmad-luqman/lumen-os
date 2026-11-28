@@ -1,0 +1,88 @@
+name: gVisor native reference
+
+on:
+  pull_request:
+    paths:
+      - 'tools/*gvisor*'
+      - 'tools/harness/lumen_harness/gvisor.py'
+      - 'tools/harness/lumen_harness/libctest.py'
+      - 'tools/fetch-zig.sh'
+      - 'tools/harness/lumen_harness/__init__.py'
+      - 'tests/harness/test_gvisor.py'
+      - 'tests/conformance/gvisor-*'
+      - '.github/workflows/gvisor-reference.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gvisor-reference-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reference:
+    runs-on: ubuntu-24.04
+    # Run 46096200249 (per case, root, a netns per case): build 246 s,
+    # native 552 s, whole job 14m11s. Run 46062869835 (batched, unprivileged,
+    # cold): build 434 s, native 551 s. Budgets keep >2x headroom on each.
+    timeout-minutes: 45
+    env:
+      LUMEN_GVISOR_REFERENCE: '1'
+      GVISOR_TEST_JOBS: '2'
+    steps:
+      # Action refs match ci.yml.
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+      - name: Install standalone build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build util-linux iproute2
+      - name: Restore git source objects and pinned zig
+        id: sources
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/gvisor-sources/
+            build/deps/zig
+          key: gvisor-${{ runner.os }}-${{ hashFiles('tools/fetch-gvisor-tests.sh', 'tools/fetch-zig.sh') }}
+      - name: Fetch and verify pinned sources
+        id: fetch
+        timeout-minutes: 15
+        run: make deps-zig && tools/fetch-gvisor-tests.sh
+      - name: Save verified sources before building
+        if: steps.sources.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            build/gvisor-sources/
+            build/deps/zig
+          key: ${{ steps.sources.outputs.cache-primary-key }}
+      - name: Cross-build the subset
+        id: build
+        timeout-minutes: 15
+        run: make gvisor-tests
+      # Per case: a fresh process and netns with lo up, matching gVisor
+      # test/runner and a fresh Lumen boot; retries get fresh namespaces too.
+      - name: Record the full native subset
+        id: native
+        timeout-minutes: 30
+        run: |
+          reference_python=$(uv run --frozen python -c 'import sys; print(sys.executable)')
+          sudo -E env PYTHONPATH=tools/harness "$reference_python" -m lumen_harness.gvisor native --mode per-case
+      - name: Gate on the recorded full native set
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: uv run --frozen pytest tests/harness/test_gvisor.py tests/harness/test_ci_config.py -v --junitxml=build/gvisor-tests/reference.xml
+      - name: Upload build findings and every gtest attempt
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gvisor-reference
+          path: |
+            build/gvisor-tests/*.json
+            build/gvisor-tests/*.txt
+            build/gvisor-tests/*.xml
+            build/gvisor-tests/configure.log
+            build/gvisor-tests/logs
+            build/gvisor-tests/native
+          if-no-files-found: warn

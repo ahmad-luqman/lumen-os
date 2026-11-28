@@ -207,18 +207,7 @@ def _syscall_census_pin_problems(
             f"workflow alpine digest {sorted(wf_images)} != script IMAGE {expected_image}"
         )
 
-    ci_actions = _workflow_actions(ci_text)
-    wf_actions = _workflow_actions(workflow_text)
-    if not wf_actions:
-        problems.append("workflow uses no actions")
-    for action, pins in sorted(wf_actions.items()):
-        for pin in sorted(pins):
-            if not pin or pin in {"main", "master", "HEAD", "latest"}:
-                problems.append(f"{action}: unpinned ref {pin!r}")
-            elif action in ci_actions and pin not in ci_actions[action]:
-                problems.append(
-                    f"{action}@{pin} does not match ci.yml's {sorted(ci_actions[action])}"
-                )
+    problems.extend(_action_pin_problems(workflow_text, ci_text))
     return problems
 
 
@@ -254,3 +243,61 @@ def test_syscall_census_workflow_is_pinned():
     assert _syscall_census_pin_problems(unpinned, ci_text, sh_text)
     drifted = wf_text.replace("actions/upload-artifact@v7", "actions/upload-artifact@v4", 1)
     assert _syscall_census_pin_problems(drifted, ci_text, sh_text)
+
+
+def _action_pin_problems(workflow: str, ci: str) -> list[str]:
+    expected = _workflow_actions(ci)
+    actions = _workflow_actions(workflow)
+    problems = []
+    if not actions:
+        problems.append("no actions")
+    for action, pins in actions.items():
+        if (
+            not pins
+            or pins & {"", "main", "master", "HEAD", "latest"}
+            or action not in expected
+            or pins != expected[action]
+        ):
+            problems.append(f"{action}: pins {sorted(pins)} differ from ci.yml")
+    return problems
+
+
+def test_gvisor_reference_workflow_is_pinned():
+    workflow = (REPO_ROOT / ".github/workflows/gvisor-reference.yml").read_text()
+    ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    assert not _action_pin_problems(workflow, ci)
+    for bad in (
+        workflow.replace("actions/checkout@v7", "actions/checkout@main"),
+        workflow.replace("actions/upload-artifact@v7", "actions/upload-artifact@v4"),
+    ):
+        assert _action_pin_problems(bad, ci)
+    assert "runs-on: ubuntu-24.04" in workflow
+    assert "contents: read" in workflow
+    assert "workflow_dispatch:" in workflow and "pull_request:" in workflow
+    paths = re.findall(r"^      - '([^']+)'$", workflow, re.MULTILINE)
+    assert set(paths) == {
+        "tools/*gvisor*",
+        "tools/harness/lumen_harness/gvisor.py",
+        "tools/harness/lumen_harness/libctest.py",
+        "tools/fetch-zig.sh",
+        "tools/harness/lumen_harness/__init__.py",
+        "tests/harness/test_gvisor.py",
+        "tests/conformance/gvisor-*",
+        ".github/workflows/gvisor-reference.yml",
+    }
+    steps = re.split(r"\n(?=      - )", workflow)
+    [native] = [s for s in steps if "-m lumen_harness.gvisor native" in s]
+    [gate] = [s for s in steps if "pytest tests/harness/test_gvisor.py" in s]
+    [upload] = [s for s in steps if "actions/upload-artifact" in s]
+    assert "--timeout" not in native and "--case-timeout" not in native
+    assert "timeout-minutes: 30" in native
+    assert "timeout-minutes: 45" in workflow
+    assert "46062869835" in workflow and "434 s" in workflow and "551 s" in workflow
+    assert 'sudo -E env PYTHONPATH=tools/harness "$reference_python"' in native
+    assert "native --mode per-case" in native
+    assert "cmake ninja-build util-linux iproute2" in workflow
+    assert steps.index(native) < steps.index(gate) < steps.index(upload)
+    assert "LUMEN_GVISOR_REFERENCE: '1'" in workflow
+    assert "continue-on-error" not in workflow
+    assert "if: ${{ !cancelled() && steps.build.outcome == 'success' }}" in gate
+    assert "if: always()" in upload

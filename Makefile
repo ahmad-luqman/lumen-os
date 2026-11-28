@@ -296,3 +296,10 @@ deps-zig: ## Download the pinned zig, the C cross-compiler for host-built Linux 
 libc-test: deps-zig ## Fetch musl libc-test (pinned commit) and build it with the pinned zig into build/libc-test/
 	tools/fetch-libc-test.sh
 	tools/build-libc-test.sh
+
+# #454: fetch pinned zig and sources, then build the standalone socket subset.
+# The build script never downloads or executes target binaries.
+.PHONY: gvisor-tests
+gvisor-tests: deps-zig ## Fetch pinned gVisor/gtest/Abseil; cross-build static x86_64-linux-musl syscall tests
+	tools/fetch-gvisor-tests.sh
+	tools/build-gvisor-tests.sh
