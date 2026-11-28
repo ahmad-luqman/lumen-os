@@ -45,11 +45,12 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
  │ Linux x86-64 syscall ABI (M6–M10)  +  Capability namespaces (M11)    │  boundary
  ├──────────────────────────────────────────────────────────────────────┤
  │ Kernel core: scheduler (SMP migration M8), user VM + VMA tree (M6),  │
- │ CoW/TLB shootdown/futex/signals (M8), epoll/AF_UNIX (M9),            │
+ │ CoW/TLB shootdown/futex/signals (M8), epoll/AF_UNIX (M9, #450),      │
  │ trace ring buffer + X-ray, crash reporter, logger                    │  kernel
  │ Kernel subsystems: POSIX VFS + writable ext4 + tmpfs/devfs/procfs    │
- │ (M7), block/page cache, BSD sockets/smoltcp (M9), GUI compositor &   │
- │ automation tree (M4), PTYs (M8), drivers (virtio-*, PS/2, NVMe...)   │
+ │ (M7), block/page cache, BSD sockets/smoltcp/virtio-net (M9, #450),   │
+ │ GUI compositor & automation tree (M4), PTYs (M8), drivers (virtio-*, │
+ │ PS/2, NVMe...)                                                       │
  ├──────────────────────────────────────────────────────────────────────┤
  │ HAL (`kernel/src/arch/`): CPU, GDT/TSS, IDT, syscall/SWAPGS,         │
  │ FXSAVE/XSAVE stubs, paging, timers, ports, IPIs                      │
@@ -3037,7 +3038,7 @@ section 2).
 - **Not yet:** scripts from files (M7), floats, capturing closures,
   a script running in the background.
 
-## 7. Driver interface (M3 built: PCI, virtio adapter, MSI-X, virtio-rng, tablet, sound; `InputDevice` M4 built; `BlockDevice` designed in #246, M7)
+## 7. Driver interface (M3 built: PCI, virtio adapter, MSI-X, virtio-rng, tablet, sound; `InputDevice` M4 built; `BlockDevice` designed in #246, M7; `NetDevice`, virtio-net and the network stack designed in #450, M9)
 
 PCI discovery (#94), claiming, the virtio adapter (#95) and MSI-X (#96,
 "Interrupts for devices: MSI-X", below) are built. The first drivers
@@ -3482,8 +3483,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     to the device in buffers of at most a page, so each bounce is one
     frame.
   - The cost: an allocation and a copy per buffer, fine for rng, input and
-    sound; a fast path (no bounce for a buffer within one page or in the
-    HHDM) can come with networking (M9) if profiling asks for it; rng's
+    sound; a no-bounce path for a buffer inside a DMA run the table
+    recorded comes with networking (M9, B2: virtio-net's buffers need it,
+    "Networking" below); rng's
     early return after a wait that gave up relies on the bounce (the
     device never has the caller's buffer), so such a fast path must reset
     the device first. Each
@@ -3780,9 +3782,9 @@ is tested by taking the device).
   unmask: otherwise the probe fails too (not tested: QEMU echoes the
   entry or `NO_VECTOR`, and honours the mask).
 
-### Device classes (`InputDevice` built in M4; `BlockDevice` designed in #246, M7; `NetDevice` M9)
+### Device classes (`InputDevice` built in M4; `BlockDevice` designed in #246, M7; `NetDevice` designed in #450, M9)
 
-`BlockDevice` (M7, designed in #246), `NetDevice` (send/receive frames, M9),
+`BlockDevice` (M7, designed in #246), `NetDevice` (send/receive frames, M9, designed in #450: "Networking" below),
 `InputDevice` (event stream: the keyboard and the tablet, designed in #146 and
 built in #151), `Display` (framebuffer + flush rectangles), `Console`: traits
 whose methods are the subsystem boundaries. `Display` stays later: M4 has one
@@ -4146,11 +4148,667 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   `crate::vt`; no `Reader` follows the rings (they fill and wrap): only the
   shell's `mouse events` and `kbd events` look at the newest.
 
-**virtio first** (rng, input, sound in M3; blk in M7; net in M9) under
+### Networking: `NetDevice`, virtio-net and the stack (designed in #450, M9)
+
+M9's TCP/IP is smoltcp `=0.14.0` (0BSD, `no_std` + `alloc`; pinned by
+#459's PR 1, #467, with `alloc`, `medium-ethernet`, `medium-ip`,
+`proto-ipv4`, `proto-ipv6`, `proto-dhcpv4`, `socket-tcp`, `socket-udp`,
+`socket-icmp`, `socket-dhcpv4`, `auto-icmp-echo-reply`,
+`iface-max-addr-count-2` and `iface-max-route-count-2`: no IP
+fragmentation, raw sockets, DNS socket or SLAAC). The two limits are a
+budget: `lo` uses 2 of 2 addresses (127.0.0.1/8, ::1/128), `eth0` 1
+address and 1 of 2 routes, and a third address on `lo` needs a larger
+budget. smoltcp's `build.rs` lets `SMOLTCP_*` environment variables
+override these limits, so `make` and `make audit` refuse to run with one
+set. The audit requires a defined `smoltcp::` symbol in both kernel ELFs
+and a smoltcp crate-root function definition in the kernel crate's IR;
+checking the IR of smoltcp's own rlib is #470. `crates/lumen-net`
+(#459's PR 2, host-tested) puts Linux socket semantics on it; one kernel
+thread drives it. The evidence is on #450: the smoltcp spike (A10, #459),
+the census (A2, #451, `tests/linux/m9-census.toml`), the fixture (A4,
+#453) and the image (A3, #452). `aster-bigtcp` was not chosen: it isn't
+on crates.io, is MPL-2.0 and is tied to Asterinas's kernel.
+
+**`NetDevice` (B2).** Defined in lumen-net, as `BlockDevice` is in
+lumen-bcache, so host tests and the virtio-net driver implement the same
+interface. lumen-net's adapter turns any `NetDevice` into smoltcp's
+`phy::Device`, and smoltcp never sees virtio. Only the net thread calls
+it, under the stack lock (below), so no method blocks:
+
+```rust
+// crates/lumen-net/src/device.rs (#459's PR 2)
+pub const ETH_FRAME_MAX: usize = 1514;        // no FCS, no VLAN tag
+pub struct NetInfo { pub mac: [u8; 6], pub mtu: usize, pub link_up: bool }  // mtu: the IP MTU
+pub enum TxError { Full, DeviceFailed }
+pub trait NetDevice: Send {
+    fn info(&self) -> NetInfo;
+    /// Whether a transmit slot is free now.
+    fn tx_ready(&self) -> bool;
+    /// Copies one received frame, if any, into `buf` and reposts the
+    /// device's buffer before returning; the frame's length.
+    fn receive(&mut self, buf: &mut [u8; ETH_FRAME_MAX]) -> Option<usize>;
+    /// `f` writes a frame of `len` bytes into a free transmit slot.
+    fn transmit<R>(&mut self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> Result<R, TxError>;
+    /// Reclaim completed transmissions; returns how many.
+    fn reclaim(&mut self) -> usize;
+}
+```
+
+- **Against smoltcp's token model:** the adapter's `Device::receive` and
+  `Device::transmit` return `None` while `tx_ready()` is false, so smoltcp
+  keeps the packet in its socket and retries on a later poll. A received
+  frame is copied into one 1514-byte buffer the adapter owns and handed
+  to smoltcp from there.
+- **`TxError::DeviceFailed`** drops the frame, counts it in `net`, warns
+  once, and marks the link down until the device recovers.
+- **`info()`** is read once per poll round. Its `mtu` is the IP MTU: the
+  adapter reports `max_transmission_unit = mtu + 14` for Ethernet.
+
+**virtio-net (B2, `kernel/src/net/virtio_net.rs`, added to `DRIVERS`).**
+- **The device:** matches virtio type 1, one device (a second is declined
+  with `ProbeError::NotMine` before its transport, as the tablet's). It
+  uses `VirtIONetRaw<VirtioHal, VirtioTransport, 16>`, not `VirtIONet`,
+  whose `send` spins until the device completes (`add_notify_wait_pop`):
+  the same reason virtio-blk drives its own queue rather than
+  `VirtIOBlk`'s spinning calls. Features are the crate's (`MAC`, `STATUS`,
+  `RING_INDIRECT_DESC`, `VERSION_1`; the transport hides `RING_EVENT_IDX`,
+  section 7's adapter).
+- **Buffers allocated once:** 16 receive and 16 transmit buffers of 2048
+  bytes (the virtio-net header and a 1514-byte frame), each a DMA run
+  from the `Hal` (`dma_alloc`: under a page, contiguous in the HHDM),
+  allocated at probe. They pass through **`share`'s no-bounce path**, which
+  B2 owns: a buffer inside a DMA run the table recorded is shared at its
+  own physical address, with no copy and no new run. Correctness needs it,
+  not speed: otherwise every frame would allocate a bounce run under the
+  stack lock, and `share` panics when it is out of frames. A frame is one
+  descriptor (the header in the same buffer, `fill_buffer_header`), so no
+  indirect list is allocated.
+- **Receive:** the buffers are posted at probe with `receive_begin`;
+  `receive` takes a completed one (`poll_receive`, `receive_complete`),
+  copies its frame out and reposts it at once.
+- **Transmit:** `transmit_begin` into a free buffer; `reclaim` runs
+  `poll_transmit`/`transmit_complete` for finished ones.
+- **Interrupts:** an MSI-X vector whose handler rings the driver's
+  `Doorbell` and kicks the net thread, nothing more. Both receives and
+  transmit completions ring it. The MAC comes from the configuration's
+  `mac` (`mac_address`). The link is reported up (slirp's always is):
+  `VirtIONetRaw` exposes no status reader, so `STATUS` changes are
+  ignored in M9.
+- **Runs:** the buffers and rings are fixed DMA runs in section 7's table
+  (`RUNS = 256`); B2 recounts the table's worst case on its PR and raises
+  `RUNS` if it leaves less than a margin of 16.
+- **`net` shell command:** the MAC, link, addresses, the DHCP lease,
+  frame counts and drops, open sockets, refill failures, socket memory
+  (used/limit), and (from B3) the ports held in TIME-WAIT. Its `selftest`
+  subcommand (B2) sends an ARP request for
+  10.0.2.2 and waits for the reply: until B3 it drives the device
+  directly, and afterwards it goes through `NetStack::inner`.
+- The harness's `Devices(net=True)` (#453: `restrict=on`, `ipv6=off`,
+  `guestfwd` services on per-run Unix sockets) attaches it.
+
+**Two interfaces, each with its own `SocketSet` (B3).**
+- **`lo`:** `Medium::Ip` over `lumen_net::Loopback`, a ring of 16
+  preallocated packet slots of the MTU, 65535 bytes (1 MiB, allocated at
+  boot and not charged to the socket budget). The spike found every
+  poll-time allocation in smoltcp's `phy::Loopback` transmit path (a
+  fresh `Vec` per packet), so `lo` doesn't use it. `Loopback`'s `receive`
+  returns tokens whenever a packet is queued, however full the ring is,
+  and its `TxToken` writes into the slot the `RxToken` frees, so a full
+  ring can always drain (a reply never waits for room). Its addresses are
+  127.0.0.1/8 and ::1/128, with AnyIP on: in 0.14.0 `has_ip_addr` accepts
+  every address when AnyIP is set (`iface/interface/mod.rs:907`), so every
+  127/8 address is local. #459's PR 2 tests a TCP connection to
+  127.0.0.2.
+- **`eth0`:** `Medium::Ethernet` over the virtio-net `NetDevice`, MTU
+  1500, IPv4 only in M9 (below).
+- **Why two sets:** smoltcp 0.14.0's TCP `dispatch` resets a socket whose
+  local address the polling interface doesn't own (`if
+  !cx.has_ip_addr(tuple.local.addr) { self.reset(); ... }`), so a socket
+  connected over `lo` and polled through `eth0` becomes Closed with no
+  packet sent (spike, part 1). Each set is polled only by its own
+  interface. For the same reason, **losing or changing `eth0`'s address
+  resets its TCP sockets** (a deviation: Linux keeps them until they time
+  out).
+- **The interface is chosen at `bind` or `connect`:** a loopback local or
+  remote address (127/8, ::1, or a v4-mapped 127/8) goes to `lo`, any
+  other to `eth0`. Binding a non-local address is `-EADDRNOTAVAIL`; a
+  connect to a non-loopback address with no configured `eth0` is
+  `-ENETUNREACH`.
+- **Wildcards:** a wildcard TCP listener (0.0.0.0, or `::` without
+  `IPV6_V6ONLY`, which covers 0.0.0.0 too) holds a LISTEN pool on each
+  set. A wildcard-bound UDP socket holds a smoltcp socket on each set; its
+  readiness is their union, `recv` alternates between the two sets when
+  both hold data (neither starves), and `send` routes by destination. A
+  wildcard socket that connects fixes its interface then.
+- **Families:** an `AF_INET6` socket using a v4-mapped address gets an
+  IPv4 smoltcp endpoint, and `getsockname`/`getpeername` report the
+  mapped form. A smoltcp socket with no local address accepts either
+  family, so lumen-net filters:
+  - **TCP listeners** use a family-specific `ListenEndpoint` where one
+    exists: on `lo` a `v6only` `::` pool listens on `Some(::1)` (`eth0` has
+    no IPv6 in M9). An `AF_INET` 0.0.0.0 pool listens on no address, so it
+    would take an IPv6 SYN too; the SYN filter (below) stops that.
+  - **The SYN filter, on both interfaces:** `Stack::poll_round` pulls each
+    frame (from the `NetDevice`, or `lo`'s ring) into its own buffer,
+    classifies an inbound SYN while it holds `&SocketSet` and the listener
+    table (does a socket own its 4-tuple? which listener of the SYN's
+    family covers the port? how many free LISTEN sockets has its pool
+    this round?), then hands the frame to `poll_ingress_single` through a
+    one-frame `phy::Device`. A SYN no listener of its family covers gets a
+    RST lumen-net builds, as a closed port's. A SYN to a listener whose
+    accept queue is full or whose pool has no free LISTEN socket this
+    round is dropped, as Linux's `tcp_conn_request` does, and the client's
+    retransmission finds the pool refilled.
+  - **One overlap is refused:** binding a 0.0.0.0 listener and a `v6only`
+    `::` listener on the same port in one set is `-EADDRINUSE` (a
+    deviation: Linux allows the pair), because both pools would match an
+    IPv4 SYN on `lo` and smoltcp gives it to whichever comes first.
+  - **UDP:** an `AF_INET` wildcard socket drops IPv6 datagrams in `recv`;
+    a `v6only` `::` socket drops IPv4 ones; a dual-stack `::` socket keeps
+    both, reporting IPv4 senders v4-mapped.
+  - #459's PR 2 host-tests the filter on `lo` (a v4 SYN to a `v6only`
+    listener's port is refused, a full pool drops a SYN, a v6 datagram
+    never reaches an `AF_INET` socket) and the refused overlap.
+
+**The `net` thread (B3, `kernel/src/net/stack.rs`).** One kernel thread
+runs every poll. Its loop:
+1. Wait (`WaitQueue::wait_until_or_deadline`) for a doorbell ring, a
+   kick, or the next deadline.
+2. Take the stack lock. For each interface: reclaim transmissions,
+   `poll_maintenance`, then `poll_ingress_single` at most `RX_BUDGET = 16`
+   times, then `poll_egress`. Take the next deadline, the earlier of the
+   two `poll_at`s.
+3. Release the lock, notify the listed sockets (below), and refill
+   listener pools outside the lock.
+4. If an interface used its whole receive budget, or `lo`'s ring was
+   full, loop again at once without waiting. When `eth0`'s transmit queue
+   was full, go to 1 and wait for the doorbell (transmit completions ring
+   it), never spinning; otherwise go to 1. So a flood never holds the
+   lock for more than one budget, and readiness reaches waiters between
+   rounds.
+
+Syscalls work on smoltcp sockets inline, under the stack lock: they queue
+and dequeue data, connect, listen, shut down and close, then kick the
+thread (an `AtomicBool` and a wake). They never poll an interface. So the
+device has one user (section 7's rule for a device waited on at length:
+one owner thread), timers are one thread's business, and no syscall pays
+for another socket's packets. Time is `time::now_ns` (monotonic), in
+smoltcp's microsecond `Instant`.
+
+**The stack lock, `NetStack::inner` (B3; section 9's level 9b).** A
+`SleepMutex` over both interfaces, both sets, lumen-net's `Stack` (ports,
+listeners, errors) and the kernel's table from `SockId` to
+`Weak<InetSocket>` (an array of `NET_ENTRIES` allocated at boot). The
+virtio-net device lives inside it: the driver has no lock of its own, and
+its interrupt handler only rings and kicks.
+- **A sleep mutex,** because a poll round handles up to a budget of
+  packets and TCP's work on each: too long for interrupts off.
+- **Never held across a user copy.** Stream data moves through a kernel
+  buffer of at most 4 KiB on the caller's stack, a chunk per hold; a
+  socket's I/O lock (level 0, below) keeps one socket's senders, and its
+  receivers, in order across the chunks. A stream receive peeks under the
+  lock, copies out without it, and consumes what was copied under the
+  next hold; a TCP `MSG_PEEK` returns at most one chunk. A UDP or ICMP
+  datagram is copied whole: into a heap buffer of its length (at most
+  65507 bytes), allocated before the lock for a send. A receive first
+  asks the length (a peek that doesn't advance the wildcard socket's set
+  alternation and returns a `RecvTicket` naming the set and datagram),
+  allocates outside the lock, then takes that same datagram by ticket.
+- **Nothing allocates under it.** Socket buffers and listener-pool
+  sockets are allocated and charged before it is taken: the spike's
+  counting allocator saw smoltcp's socket and interface code allocate
+  nothing on its poll paths, and `SocketSet` growth can allocate. So each
+  set has a fixed capacity, `NET_SOCKETS = 1024` slots, allocated at boot
+  (B3 states their bytes), and a socket past it is `-ENOBUFS`. Frees may
+  happen under it (a closed socket's buffers).
+- `VirtioHal::TABLE` (10f) is taken under it by `share`/`unshare`'s
+  no-bounce path.
+
+**The kernel's side (B3, `kernel/src/net/stack.rs` and `inet.rs`).** C3,
+C4 and C6 append to `Proto`'s arms and never change the rest:
+
+```rust
+// kernel/src/net/stack.rs (B3)
+pub struct NetStack {
+    inner: SleepMutex<NetInner>,              // level 9b
+    kicked: AtomicBool, wake: WaitQueue,      // the thread's wait
+    budget: &'static Budget,                  // NET_MEM_CAP
+}
+struct NetInner { stack: lumen_net::Stack<VirtioNet>, socks: Box<[Weak<InetSocket>; NET_ENTRIES]> }
+impl NetStack {
+    pub fn get() -> &'static NetStack;
+    pub fn with<R>(&self, f: impl FnOnce(&mut lumen_net::Stack<VirtioNet>) -> R) -> R;  // takes inner
+    pub fn kick(&self);
+    pub fn register(&self, id: SockId, sock: &Arc<InetSocket>);   // under inner
+}
+// kernel/src/net/inet.rs (B3)
+pub struct InetSocket {
+    id: SockId, family: Family, proto: Proto,
+    send_lock: SleepMutex<()>, recv_lock: SleepMutex<()>,       // Lock 0
+    opts: SpinLock<InetOpts>,                                   // 10c leaf: timeouts, sizes, flags
+    poll: KernelPollHead,
+}
+pub enum Proto { Tcp(TcpState), Udp(UdpState), Icmp(IcmpState) }   // C4, C3, C6 fill their arm
+impl SockOps for InetSocket { /* dispatches on `proto` */ }
+```
+
+**Readiness (B3).**
+- Each inet socket has a `KernelPollHead`. Its `Pollable::poll`
+  subscribes first, then reads lumen-net's `readiness(id)` under the
+  stack lock and maps it to a mask:
+
+  | lumen-net `Readiness` (Linux's `tcp_poll` case) | `PollMask` |
+  |---|---|
+  | `readable`: data queued, the peer's FIN, or a listener's queued connection | `POLLIN \| POLLRDNORM` |
+  | `writable`: send space (TCP: at least a third of the buffer free, as `sk_stream_is_writeable`), or a connect just completed | `POLLOUT \| POLLWRNORM` |
+  | `rdhup`: the peer's FIN received | `POLLRDHUP` (with `POLLIN`) |
+  | `hup`: both directions shut, or Closed after a connection | `POLLHUP` (with `POLLIN \| POLLOUT` once Closed) |
+  | `error`: a pending error (`SO_ERROR` unread) | `POLLERR` |
+  | a socket never connected nor listening, or Closed (TCP) | `POLLOUT \| POLLWRNORM \| POLLHUP`, and for Closed also `POLLIN \| POLLRDNORM \| POLLRDHUP` (`tcp_poll`) |
+
+  `ktest:lumen_kernel::linux::syscall::poll::poll_masks_of_each_file_kind`
+  gains a row per case (B3 over a test socket; C4 checks the TCP states
+  through real connections, section 15).
+
+- **Listed on events, not by comparing bits:** lumen-net lists a socket in
+  `changed` whenever a poll changed its state, grew its receive queue
+  (each arrival), grew its transmit space, or set an error, as Linux's
+  `sk_data_ready`/`sk_write_space` fire on every arrival. Comparing
+  readiness bits would lose a wake: a syscall can drain a socket inline
+  between two polls, so the bits read the same before and after a new
+  segment. Only `changed()` takes entries off the list and clears their
+  flags; no other method removes a listing, so a listed socket is always
+  notified (a notify that finds nothing new costs one spurious re-check).
+  `changed` has one entry per slot, deduplicated by a per-slot flag, so
+  it can't overflow.
+- **Notified after the lock:** the thread upgrades the listed sockets'
+  `Weak<InetSocket>`s into a preallocated `Vec`, releases the stack lock,
+  and only then calls `notify` on each, never nested in the stack lock. A
+  syscall that changes readiness inline (an `accept` emptying the queue, a
+  `shutdown`) notifies after releasing it too.
+- **Blocking calls** (`recv` on an empty socket, `send` on a full one,
+  `accept`, `connect`) wait with `sock::block_on` (section 8), re-checking
+  under the lock after each wake.
+
+**TCP over smoltcp (B3, C4).**
+- **The smoltcp socket is made at `connect` or `listen`,** with the
+  buffer sizes set by then; `socket` makes only Lumen's state. A
+  `SO_RCVBUF`/`SO_SNDBUF` after that is recorded and reported, but the
+  buffer keeps its size (a deviation: Linux resizes a live socket).
+- **The listen backlog is a pool of LISTEN sockets** (smoltcp has none: a
+  LISTEN socket takes one connection).
+  - `listen` clamps `backlog` as Linux's `__sys_listen`: `(unsigned
+    int)backlog > somaxconn` becomes `somaxconn`, 4096, so a negative one
+    is 4096 (lumen-net's own `clamp_backlog`, the same rule as lumen-unix's).
+  - The accept queue holds up to backlog + 1 established connections
+    (Linux's `sk_acceptq_is_full` compares with `>`).
+  - The pool on each set the listener covers holds `min(backlog + 1,
+    LISTEN_POOL_MAX)` LISTEN sockets, `LISTEN_POOL_MAX = 8`, each with the
+    listener's buffer sizes, as Linux's children inherit. `listen` fills
+    it before it returns: the spike's refill-one-per-poll variant
+    completed 1 of 4 simultaneous connects, while a pool of four handled
+    three bursts of four.
+  - A pool socket in SYN-RECEIVED stays in the pool, with a 63 s timeout
+    (Linux's five SYN-ACK retries). After each poll, the thread moves pool
+    sockets that reached ESTABLISHED or CLOSE-WAIT to the accept queue,
+    clearing their 63 s timeout (below). `shortfalls()` counts both those
+    and pool sockets that fell back to LISTEN or Closed (a reset
+    handshake); `refill` replaces either. The thread prepares the
+    replacements outside the lock and installs
+    them before its next round, and stops refilling while the accept queue
+    is full. A refill that fails (`-ENOBUFS`, `-ENOMEM`) warns once per
+    listener, counts in `net`, and is retried after each poll.
+  - A SYN past the pool, or to a full listener, is dropped by the SYN
+    filter (above), as Linux drops it, so the client retries; no RST.
+  - **Closing a listener** aborts (RST) its queued connections and
+    removes its pool sockets, crediting their charges.
+  - **Why not backlog + 1:** a pool socket owns its buffers (128 KiB at
+    the defaults below). A full pool for `listen(SOMAXCONN)` would be
+    512 MiB, and for `listen(128)` 16 MiB a set, against the budget below.
+    Eight a set is 1 MiB, 2 MiB for a wildcard listener. The census
+    doesn't record `listen`'s backlog; the gate's servers (asyncio's
+    default is 100, busybox `nc`) take their clients one at a time.
+- **Ephemeral ports and `bind` (C3, C4).**
+  - lumen-net's `PortTable` holds one table per protocol (TCP, UDP),
+    shared by both families as Linux's are.
+  - Ephemeral ports come from 32768–60999 (Linux's default
+    `ip_local_port_range`), next-fit from a per-table cursor, wrapping,
+    and never a port any socket of that protocol uses. That is stricter
+    than Linux, which shares a port between distinct 4-tuples; the range
+    still holds 28,232 ports.
+  - Two binds of one port conflict when their addresses overlap (equal,
+    or either a wildcard of an overlapping family, where a dual-stack `::`
+    overlaps every IPv4 address) unless both set `SO_REUSEPORT` (one uid
+    in Lumen), or both set `SO_REUSEADDR` and, for TCP, neither listens.
+  - A port in TIME-WAIT (below) stays taken, and a new bind there needs
+    `SO_REUSEADDR`: this is why servers set it (the census's four
+    `SO_REUSEADDR` calls). The conflict is `-EADDRINUSE`, and with the
+    range used up `-EADDRNOTAVAIL`.
+  - `IPV6_V6ONLY` is settable before `bind`, and `-EINVAL` after.
+  - `SO_REUSEPORT` doesn't spread connections: the first bound listener
+    takes them (a deviation).
+- **`connect`:**
+  - A blocking connect waits until Established (0) or an error.
+  - A non-blocking one returns `-EINPROGRESS`. Completion shows as
+    `POLLOUT`, and `SO_ERROR` gives 0 or the error and clears it (the
+    census: nine `EINPROGRESS`, then `SO_ERROR`).
+  - A second connect while one is in progress is `-EALREADY`, and once
+    connected `-EISCONN`.
+  - An interrupted blocking connect follows "Signals and sockets"
+    (section 8) and the connection carries on, as Linux's.
+- **Timeouts smoltcp doesn't have.** smoltcp retransmits forever unless a
+  socket has a timeout (`set_timeout`). That timeout is an idle timer in
+  every state (`timed_out`: `now >= remote_last_ts + timeout`, scheduled by
+  `poll_at`), so lumen-net sets one per state and clears it when the state
+  ends:
+  - SYN-SENT: 127 s (Linux's six SYN retries), then `ETIMEDOUT`;
+  - a pool socket in SYN-RECEIVED: 63 s (above);
+  - on reaching ESTABLISHED or CLOSE-WAIT: `set_timeout(None)`, or with
+    `SO_KEEPALIVE` the keep-alive timeout below; toggling `SO_KEEPALIVE`
+    later sets or clears it;
+  - `SO_KEEPALIVE`: the keep-alive interval is `TCP_KEEPIDLE` and the
+    timeout idle + `TCP_KEEPINTVL` × `TCP_KEEPCNT` (Linux's defaults 7200
+    s, 75 s, 9), then `ETIMEDOUT`;
+  - a neighbour that never answers ARP (smoltcp keeps the packet
+    unsent): `EHOSTUNREACH` once the SYN-SENT timeout runs out with no TCP
+    segment for that tuple having left the adapter;
+  - an orphan (closed by its user): 60 s, and FIN-WAIT-2 aborted at 60 s
+    (Linux's `tcp_fin_timeout`); `set_ack_delay(None)` on close, so its
+    last ACK isn't held back.
+  - **Deviations:** no `tcp_retries2` give-up, so a dead peer without
+    keep-alive is retransmitted to forever; keep-alive sends one probe at
+    idle and then times out, where Linux sends nine probes 75 s apart; an
+    unreachable neighbour is found at the connect timeout, not after
+    Linux's few seconds of ARP.
+  - `cargo:lumen-net` tests that a connection idle for 200 s (a made-up
+    `Instant`) stays ESTABLISHED.
+- **Errors** (lumen-net classifies each transition after a poll and keeps
+  it as the socket's pending error):
+  - SynSent to Closed by a RST is `ECONNREFUSED`;
+  - Closed from a synchronized state after a RST is `ECONNRESET`;
+  - a Closed transition with no RST seen is `ETIMEDOUT` if a timeout was
+    set, else `ECONNRESET`.
+  - After the error is taken (`SO_ERROR` or the call that reports it),
+    `recv` returns 0 and `send` gives `-EPIPE` with `SIGPIPE` (section 8).
+    The first call after a reset reports `-ECONNRESET`, as Linux's
+    pending `sk_err` comes first. A `recv` after the peer's FIN returns 0.
+- **Half-close and close:**
+  - `SHUT_WR` is smoltcp's `close` (a FIN). `SHUT_RD` is Lumen's flag:
+    `recv` returns 0 and later data is dropped. `SHUT_RDWR` is both.
+  - `close` with unread received data, or with `SO_LINGER` on and
+    `l_linger` 0, aborts (a RST), as Linux's `tcp_close`. Otherwise
+    smoltcp's `close` runs, and the socket stays in its set as an orphan
+    through FIN-WAIT, CLOSING or LAST-ACK, holding its port, its slot and
+    its charged buffers. Other linger times aren't waited on (a
+    deviation).
+  - **TIME-WAIT costs a port, not buffers.** smoltcp holds TIME-WAIT for
+    10 s (`CLOSE_DELAY`, `socket/tcp.rs:301`). An orphan leaves its set
+    after the first poll that finds it in TIME-WAIT and whose egress
+    didn't stop (so its last ACK went out), freeing its slot and crediting
+    its buffers, and leaves a port-table entry with that deadline, as
+    Linux's small time-wait buckets do. Otherwise every active close would
+    hold 128 KiB for 10 s: C8's 500 connections would need about 60 MiB.
+    A FIN retransmitted into that window gets a RST, not an ACK (a
+    deviation).
+- **TCP options** (C5):
+  - `TCP_NODELAY` turns Nagle off;
+  - the keep-alive options as above, each stored and reported;
+  - `TCP_CORK` is stored and reported, with no effect (smoltcp has no
+    cork; a deviation; four census calls);
+  - `TCP_MAXSEG` is settable as on Linux (0, or 88 to 32767, else
+    `-EINVAL`) and stored with no effect on smoltcp's segment size (a
+    deviation); reading it reports smoltcp's segment size.
+- **Timers under the busy-host rule (B3, C4).** smoltcp's retransmission,
+  delayed ACK, keep-alive, zero-window probe and TIME-WAIT timers, and the
+  timeouts above, all run on the `Instant` the net thread passes. A
+  stalled vCPU only delays them; none fires early. So a scenario may
+  assert only floors and confirmed effects:
+  - may: a connection completes; bytes arrive intact and in order; a
+    connect to a closed port is `ECONNREFUSED`; a non-blocking connect to
+    a listener eventually gives `POLLOUT` and `SO_ERROR` 0; a reset gives
+    `ECONNRESET`; an `SO_RCVTIMEO` wait lasted at least its time and
+    returned `-EAGAIN`;
+  - may not: "refused within N ms", a retransmission or keep-alive
+    ceiling, a TIME-WAIT length, or any throughput figure. Exact timer
+    rules (TIME-WAIT's rebind refusal, the timeouts) are host-tested in
+    `cargo:lumen-net` over a made-up `Instant`.
+
+**UDP (C3).** smoltcp UDP sockets, each direction a packet buffer of 32
+slots and the socket's buffer size in payload bytes.
+- **Sizes:** a datagram longer than the MTU less its headers is
+  `-EMSGSIZE`: on `lo` 65507 bytes, IPv4's limit, which Lumen applies
+  over ::1 too, less IPv6's longer header (65487, where Linux allows 65527:
+  a deviation); on `eth0` 1472, where Linux fragments (a deviation: no
+  fragmentation feature). A datagram longer than the send buffer is
+  `-EMSGSIZE` too, where Linux sends it into an empty queue (a deviation).
+- **Calls:** `MSG_PEEK`, `MSG_TRUNC` (`recv` returns the datagram's full
+  length), and `connect` (the default destination and a source filter;
+  `AF_UNSPEC` disconnects). `SO_BROADCAST` is accepted (slirp's
+  `restrict=on` drops it anyway). musl's resolver path (the census: a
+  non-blocking `bind`, `sendto` port 53, `recvmsg`, `poll`) needs exactly
+  these.
+- **A deviation:** an ICMP port unreachable isn't reported. Linux gives a
+  connected UDP socket `-ECONNREFUSED`; smoltcp hands ICMP errors only to
+  an ICMP socket bound to that UDP port (`Endpoint::Udp`), which Lumen
+  doesn't open in M9.
+
+**ICMP (C6).** `auto-icmp-echo-reply` answers echo requests on both
+interfaces.
+- **Ping sockets** (`SOCK_DGRAM` with `IPPROTO_ICMP` or `IPPROTO_ICMPV6`):
+  a smoltcp ICMP socket bound to the socket's identifier (its "port":
+  from `bind`, or a free one in 1–65535, as Linux's `ping_get_port`). It sends
+  the caller's echo request with that identifier, and `recv` returns the
+  ICMP message without an IP header. smoltcp's ICMP socket accepts both
+  directions for its identifier, so lumen-net drops echo **requests** from
+  a ping socket's queue, leaving replies. Every gid may open one, a
+  deviation from Linux's default `net.ipv4.ping_group_range`, which admits
+  none (Lumen runs everyone as root).
+- **`SOCK_RAW` with `IPPROTO_ICMP` or `IPPROTO_ICMPV6`, echo only**
+  (busybox `ping` as root opens `SOCK_RAW` protocol 1: the census). The
+  socket binds its ICMP socket to the identifier of the first echo
+  request it sends and keeps both requests and replies for it, as a raw
+  socket sees both. IPv4 messages come with a synthesized 20-byte IPv4
+  header, as a Linux raw socket delivers them. Other ICMP types aren't
+  delivered (a deviation), and `SOCK_RAW` with any other protocol is
+  `-EPROTONOSUPPORT`.
+
+**Memory (B3, C5).**
+- **Defaults:**
+  - TCP: 64 KiB each way;
+  - UDP: 64 KiB of payload and 32 slots each way;
+  - ICMP: 4 KiB and 8 slots.
+- **`SO_RCVBUF`/`SO_SNDBUF`** as Linux's `sock_setsockopt`: the value is
+  doubled and clamped to [2304 (`SOCK_MIN_RCVBUF` on x86-64) or 4608
+  (`SOCK_MIN_SNDBUF`), 425984 (twice `rmem_max`/`wmem_max`)], and
+  `getsockopt` reports the doubled value. An explicit `SO_*BUF` allocates
+  half of the reported value, the bytes the caller asked for (with no
+  explicit `SO_*BUF`, the sizes under "Defaults" are allocated). Lumen's `rmem_max`/`wmem_max` are 212992,
+  the default through Linux 6.17 (6.18 raised them to 4 MiB; a D4 case
+  that depends on it gets an xfail entry). The reported defaults are
+  131072 both ways for TCP (Linux reports `tcp_rmem[1]`, 131072, for
+  receive; its send default, 16384, grows by autotuning, so the send
+  figure is a deviation) and 212992 for UDP (`rmem_default`). The
+  `SO_*BUFFORCE` options act as the plain ones (a deviation: they exist to
+  pass the maximum, which Lumen keeps).
+- **A system-wide socket-memory budget**, `NET_MEM_CAP`: min(32 MiB, an
+  eighth of the frames usable at boot). That is about 28 MiB in the
+  harness's default 256 MiB guests and 32 MiB in the gates' 512 MiB ones
+  (tmpfs's quota, by comparison, is a fixed 32 MiB: section 9).
+  - **Why it fits:** M8's D2 budget leaves at least 130 MiB of the 450 MiB
+    usable for the heaviest build, and the M9 gates build their C
+    extension and gem after their socket steps, not beside them, so a full
+    budget of socket buffers still leaves room. The heap window (1 TiB of
+    virtual space) isn't the limit; frames are.
+  - **What it charges:** an atomic counter in lumen-net, charged when
+    buffers are prepared, outside the stack lock: inet socket buffers
+    (pool sockets included), UDP and ICMP packet buffers, and AF_UNIX
+    queues (the kernel charges a queue for its capacity when lumen-unix
+    allocates it, `SegmentStorage` and `ByteStorage`, and credits what it
+    drops: section 10). It is credited when they are freed.
+  - **Past it:** `-ENOBUFS` from the call that needed the memory
+    (`connect`, `listen`, a first `bind` or `send`, a unix `send` that
+    must grow its queue: a blocking one gets `-ENOBUFS` where Linux
+    waits, a deviation).
+  - `lo`'s ring and virtio-net's buffers are fixed, and not charged.
+  - The `net` command shows use and limit.
+
+**Address configuration (B4, `kernel/src/net/config.rs`).**
+- **`lumen.net=`** on the kernel command line (`cmdline.rs`'s `key=value`):
+  `off`, `dhcp` (the default when a virtio-net device is present), or
+  `<addr>/<prefix>[,gw=<addr>][,dns=<addr>]`. `lo` is always up.
+- **DHCPv4** through smoltcp's `dhcpv4` socket in `eth0`'s set, run by the
+  net thread. A lease sets the address, the default route and the DNS
+  list, and a lost lease clears them. Each change logs `INFO  net: eth0
+  dhcp <addr>/<prefix> router <addr> dns <addr>` (an interface tests match;
+  slirp leases 10.0.2.15/24, router 10.0.2.2, DNS 10.0.2.3), and the `net`
+  command shows the lease. No `/proc/net/pnp` in M9: no workload reads it
+  (the census saw no `/proc/net/*` read).
+- **`/etc/resolv.conf` and `/etc/hosts` come from the image.** The test
+  copy (#463's `NetFixture.prepare_image`) puts the gate's names
+  (`*.lumen.test`, reached over TCP `guestfwd`) in `/etc/hosts` and
+  `nameserver 127.0.0.1` in `/etc/resolv.conf`. It also removes the
+  copy's inherited CA certificates and their hash links, and its apk
+  keys, then installs the run's CA (the bundles, the PEM and its subject
+  hash link) and the run's apk key, so the copy trusts only those. The
+  source image is never written. The stock developer image
+  keeps Alpine's files. slirp's DNS proxy at 10.0.2.3 never answers under
+  `restrict=on` (A4), so nothing points at it.
+- **DNS in tests:** no UDP reaches the host under `restrict=on`. libslirp's
+  `udp_input` drops every UDP datagram but BOOTP/DHCP and TFTP (A4, which
+  #463's `test_restricted_slirp_drops_outbound_tcp_and_udp` confirms on
+  QEMU 11.1.3 with libslirp 4.9.7). So a DNS check runs a guest-side
+  responder on loopback: `tools/linux-m9`'s `dnsd` mode (A and AAAA for
+  one name; the census's `local_server.py` `dns_reply` is its model),
+  bound to 127.0.0.1:53, with musl's resolver asking it. Fixture names
+  come from `/etc/hosts`, and every UDP scenario uses guest loopback.
+- **Not in M9:** userspace `udhcpc`, `AF_PACKET` and netlink (the census
+  saw none: no `getifaddrs`, `if_nameindex` or `SIOCGIF*`).
+- **IPv6:** `lo` carries ::1 fully (TCP and UDP over ::1). `eth0` has no
+  IPv6 in M9: the fixture runs `ipv6=off` (#453, `restrict=on`), and
+  smoltcp's `proto-ipv6-slaac` isn't among #467's features. SLAAC on
+  `eth0` is a later item (ROADMAP).
+
+**lumen-net's interface (#459's PR 2, written against this section).**
+No kernel locks; the kernel wraps a `Stack` in `NetStack::inner`. Host
+tests run two stacks over a `NetDevice` wire pair, and one over
+`Loopback` with a counting allocator: no allocation in any `Stack` method,
+only in the `prepare_*` functions and `try_new`. Two host tests guard the
+readiness listing: one drains a socket inline, delivers a segment, and
+checks the socket is listed in `changed`; the other lists a socket by an
+arrival, calls `send` and `readiness` on it inline, and checks it is still
+in `changed`.
+
+```rust
+// crates/lumen-net/src/lib.rs (#459's PR 2)
+pub const NET_SOCKETS: usize = 1024;          // slots per interface set, fixed at boot
+pub const NET_ENTRIES: usize = 2 * NET_SOCKETS; // SockIds: sockets holding no slot yet, plus every slot
+pub const LISTEN_POOL_MAX: usize = 8;         // LISTEN sockets per listener per set
+pub const RX_BUDGET: usize = 16;              // poll_ingress_single calls per interface per round
+pub const EPHEMERAL: core::ops::RangeInclusive<u16> = 32768..=60999;
+
+pub struct Loopback { /* `slots` preallocated packets of `mtu` bytes */ }
+impl Loopback { pub fn try_new(mtu: usize, slots: usize) -> Result<Self, NetError>; }  // NoMem
+
+/// The socket-memory budget: an atomic counter, usable outside any lock.
+pub struct Budget { /* limit, used: AtomicUsize */ }
+impl Budget {
+    pub const fn new(limit: usize) -> Self;
+    pub fn try_charge(&'static self, bytes: usize) -> Result<Charge, NetError>;  // NoBufs
+    pub fn credit(&self, bytes: usize);       // for a Charge turned into_raw
+    pub fn used(&self) -> usize;
+}
+pub struct Charge { /* &'static Budget, bytes; credits on drop */ }
+impl Charge { pub fn bytes(&self) -> usize; pub fn into_raw(self) -> usize; }
+
+/// Buffers allocated (`try_reserve_exact`) and charged before the stack
+/// lock is taken.
+pub struct BufSizes { pub rx: usize, pub tx: usize }
+pub struct TcpPrep { /* tcp::Socket with its buffers, its Charge */ }
+pub struct UdpPrep { /* .. */ }
+pub struct IcmpPrep { /* .. */ }
+pub enum Prep { Tcp(TcpPrep), Udp(UdpPrep), Icmp(IcmpPrep) }
+pub fn prepare_tcp(budget: &'static Budget, sizes: BufSizes) -> Result<TcpPrep, NetError>;
+pub fn prepare_udp(budget: &'static Budget, sizes: BufSizes) -> Result<UdpPrep, NetError>;
+pub fn prepare_icmp(budget: &'static Budget) -> Result<IcmpPrep, NetError>;
+
+#[derive(Clone, Copy, PartialEq, Eq)] pub enum IfaceId { Lo, Eth0 }
+#[derive(Clone, Copy, PartialEq, Eq)] pub struct SockId { idx: u32, generation: u32 }
+impl SockId { pub fn index(self) -> usize; }   // into the kernel's NET_ENTRIES array
+pub enum Proto { Tcp, Udp, IcmpEcho { raw: bool } }
+pub struct BindReq { pub addr: Option<IpAddress>, pub port: u16,   // None: wildcard; 0: ephemeral
+                     pub v6: bool, pub v6only: bool, pub reuse_addr: bool, pub reuse_port: bool }
+pub struct Readiness { pub readable: bool, pub writable: bool, pub hup: bool,
+                       pub rdhup: bool, pub error: bool }
+pub enum Shut { Rd, Wr, RdWr }
+pub enum NetOpt { NoDelay(bool), Cork(bool), KeepAlive(bool), KeepIdle(Duration),
+                  KeepIntvl(Duration), KeepCnt(u32), Linger(Option<Duration>),
+                  Ttl(u8), Tos(u8), Broadcast(bool), V6Only(bool) }
+pub enum OptQuery { NoDelay, Cork, KeepAlive, KeepIdle, KeepIntvl, KeepCnt, Linger,
+                    Ttl, Tos, Broadcast, V6Only, MaxSeg }
+pub struct Received { pub copied: usize, pub full_len: usize,
+                      pub from: Option<IpEndpoint>, pub ticket: RecvTicket }  // which set, which item
+pub enum Lease { Configured { addr: Ipv4Cidr, router: Option<Ipv4Address>,
+                              dns: [Option<Ipv4Address>; 3], server: Ipv4Address },
+                 Deconfigured }
+pub enum NetError { WouldBlock, InProgress, Already, IsConn, NotConn, AddrInUse,
+                    AddrNotAvail, ConnRefused, ConnReset, TimedOut, HostUnreach, Pipe,
+                    NetUnreach, MsgSize, NoBufs, NoMem, Inval, OpNotSupp }
+impl NetError { pub const fn to_errno(self) -> u32; }
+
+pub struct Stack<D: NetDevice> { /* lo + eth0 Interfaces and sets, PortTable, entries */ }
+impl<D: NetDevice> Stack<D> {
+    pub fn try_new(lo: Loopback, now: Instant) -> Result<Self, NetError>;  // both sets' fixed storage
+    pub fn attach_eth(&mut self, dev: D, config: EthConfig, now: Instant); // Dhcp | Static {..}
+    pub fn open(&mut self, proto: Proto) -> Result<SockId, NetError>;      // Lumen state only
+    /// How many preps the next `bind`, `send` or `connect` on `id` needs
+    /// (two for a wildcard UDP socket, one per set).
+    pub fn preps_needed(&self, id: SockId, to: Option<IpEndpoint>) -> usize;
+    pub fn bind(&mut self, id: SockId, req: BindReq, preps: &mut dyn Iterator<Item = Prep>)
+        -> Result<(), NetError>;
+    pub fn connect(&mut self, id: SockId, remote: IpEndpoint, prep: Option<Prep>, now: Instant)
+        -> Result<(), NetError>;                                           // InProgress for TCP
+    pub fn disconnect(&mut self, id: SockId) -> Result<(), NetError>;      // UDP AF_UNSPEC
+    pub fn listen(&mut self, id: SockId, backlog: usize, pool: &mut dyn Iterator<Item = TcpPrep>)
+        -> Result<(), NetError>;
+    pub fn shortfalls(&self) -> &[(SockId, IfaceId, usize)];               // pools to refill
+    pub fn refill(&mut self, id: SockId, iface: IfaceId, prep: TcpPrep);
+    pub fn accept(&mut self, id: SockId) -> Result<(SockId, IpEndpoint), NetError>;
+    pub fn send(&mut self, id: SockId, data: &[u8], to: Option<IpEndpoint>,
+                preps: &mut dyn Iterator<Item = Prep>) -> Result<usize, NetError>;
+    pub fn recv(&mut self, id: SockId, buf: &mut [u8], peek: bool) -> Result<Received, NetError>;
+    pub fn consume(&mut self, id: SockId, ticket: RecvTicket);             // dequeues from that set
+    /// A datagram's length and ticket, without advancing the set alternation;
+    /// `recv_ticket` then takes exactly that datagram.
+    pub fn datagram_len(&self, id: SockId) -> Result<(usize, RecvTicket), NetError>;
+    pub fn recv_ticket(&mut self, id: SockId, ticket: RecvTicket, buf: &mut [u8], peek: bool)
+        -> Result<Received, NetError>;
+    pub fn shutdown(&mut self, id: SockId, how: Shut) -> Result<(), NetError>;
+    pub fn close(&mut self, id: SockId, linger_zero: bool);                // orphans keep running
+    pub fn readiness(&self, id: SockId) -> Readiness;                      // stale id: hup | error
+    pub fn take_error(&mut self, id: SockId) -> Option<NetError>;          // SO_ERROR
+    pub fn local_endpoint(&self, id: SockId) -> Option<IpEndpoint>;
+    pub fn remote_endpoint(&self, id: SockId) -> Option<IpEndpoint>;
+    pub fn set_opt(&mut self, id: SockId, opt: NetOpt) -> Result<(), NetError>;
+    pub fn get_opt(&self, id: SockId, q: OptQuery) -> Result<NetOpt, NetError>;
+    pub fn poll_round(&mut self, now: Instant) -> Round;                   // more: loop again at once
+    pub fn poll_at(&self, now: Instant) -> Option<Instant>;
+    pub fn changed(&mut self) -> &[SockId];                                // since the last call
+    pub fn lease_event(&mut self) -> Option<Lease>;
+    pub fn iface_of(&self, id: SockId) -> Option<IfaceId>;
+}
+pub struct Round { pub more: bool }
+```
+
+A method given a stale `SockId` (its generation no longer matches)
+returns `NetError::Inval`. `Lease`'s `dns` is a fixed array (no heap);
+`changed` and `shortfalls` have fixed capacity. #459's PR 2 writes a host
+test for each row of the error and timeout lists above.
+
+**virtio first** (rng, input, sound in M3; blk in M7; net in M9, designed in #450) under
 QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12
 behind the same traits.
 
-## 8. Processes, syscalls and capabilities (WASM apps M5: built, #195; Linux x86-64 ABI M6 built #230/#232–#238, M7 built (#246 design), M8 designed in #336; capability namespaces M11)
+## 8. Processes, syscalls and capabilities (WASM apps M5: built, #195; Linux x86-64 ABI M6 built #230/#232–#238, M7 built (#246 design), M8 designed in #336, M9 designed in #450; capability namespaces M11)
 
 Lumen runs two kinds of user code:
 
@@ -4158,14 +4816,14 @@ Lumen runs two kinds of user code:
    explicit capability handles (`Log`, `Time`, `Desktop`, `Window`, `Trace`),
    described in "Apps: WASM modules in the kernel" below.
 2. **Native ring-3 Linux x86-64 processes (M6 built, M7 built, M8
-   designed in #336, M9–M10 planned):**
+   designed in #336, M9 designed in #450, M10 planned):**
    unmodified Linux `x86_64` ELF binaries (targeting Alpine Linux `musl`)
    entering through the standard Linux `syscall` ABI. Starting in M11, each
    Linux process/sandbox can be confined by capability-scoped VFS mount
    namespaces and network allowlists, preserving Principle 2 (no ambient
    authority for agents) without requiring custom `libc` or runtime forks.
 
-### Linux x86-64 syscall ABI (M6 built #232–#238; M7 built (#246 design); M8 designed in #336)
+### Linux x86-64 syscall ABI (M6 built #232–#238; M7 built (#246 design); M8 designed in #336; M9 designed in #450)
 
 - **Register convention:** identical to Linux x86-64. Syscall number in `rax`;
   up to 6 arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` (`r10` replaces
@@ -4189,7 +4847,9 @@ Lumen runs two kinds of user code:
   and `sys`, the clusters listed under "B0's stubs" below, #371, plus
   `time.rs` (#383) shared by blocking syscalls). M7's and M8's stubs are
   gone; of the M8 table's rows only `sendfile` and `membarrier` stay
-  `-ENOSYS`; with `clone3`, `execveat`, `futex_waitv`, the scheduler-policy
+  `-ENOSYS` (M9's C7 implements `sendfile`; M9's clusters are
+  `syscall/socket.rs`, `epoll.rs` and `evfd.rs`, B0's stubs in the M9
+  subsection below); with `clone3`, `execveat`, `futex_waitv`, the scheduler-policy
   calls, `signalfd*` and `times` they make up `ENOSYS_BY_DECISION` in
   `tools/harness/lumen_harness/syscalls.py` ("Stays `-ENOSYS` in M8"
   below). M7's and M8's handlers follow three rules:
@@ -4276,7 +4936,7 @@ Lumen runs two kinds of user code:
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS` (`0x1002`, validates `addr < USER_MAX`, `0` allowed); `ARCH_GET_FS` (`0x1003`, writes `fs_base` to `*addr` via `copy_to_user` and returns `0`); other codes `-EINVAL` |
 | 186 | `gettid()` | returns thread TID |
 | 218 | `set_tid_address(tidptr)` | stores `clear_child_tid` pointer and returns current TID |
-| 228 | `clock_gettime(clockid, tp)` | `CLOCK_REALTIME` (0, from RTC/boot offset), `CLOCK_MONOTONIC` (1), `CLOCK_MONOTONIC_RAW` (4), `CLOCK_REALTIME_COARSE` (5), `CLOCK_MONOTONIC_COARSE` (6), `CLOCK_BOOTTIME` (7) |
+| 228 | `clock_gettime(clockid, tp)` | `CLOCK_REALTIME` (0, from RTC/boot offset), `CLOCK_MONOTONIC` (1), `CLOCK_MONOTONIC_RAW` (4), `CLOCK_REALTIME_COARSE` (5), `CLOCK_MONOTONIC_COARSE` (6), `CLOCK_BOOTTIME` (7); M9's C7 adds `CLOCK_PROCESS_CPUTIME_ID` (2) and `CLOCK_THREAD_CPUTIME_ID` (3) (the M9 table) |
 | 231 | `exit_group(status)` | terminates the process and frees its `AddressSpace` and FD table |
 | 302 | `prlimit64(pid, res, new, old)` | validates `pid == 0 \|\| pid == current_pid` (`-ESRCH` otherwise) and `res < RLIM_NLIMITS` (16, `-EINVAL` otherwise); M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), and `RLIM_INFINITY` for other valid resources when `old` is non-null; writable per-process limits came later (`RLIMIT_STACK` in C12, `RLIMIT_NOFILE` and `RLIMIT_NPROC` in #435, the rest in M10: the M8 row) |
 | 318 | `getrandom(buf, len, flags)` | rejects unknown flag bits (`-EINVAL`), fills user buffer from `crate::rng` (section 7) via `copy_to_user`, and returns bytes written |
@@ -4285,7 +4945,7 @@ In addition to the 30 table entries above, M6 includes console `poll(2)` (syscal
 to satisfy Rust `std`'s `sanitize_standard_fds` startup check (`poll([0, 1, 2], 3, 0)`)
 and `busybox` `lineedit` stdin readiness waits; pipe and PTY
 `poll`/`ppoll`/`select` landed in M8 (#374, #386, #388; see the M8 table
-below). Sockets are M9.
+below). Sockets are M9 (designed in #450: the M9 table below).
 
 #### M7 POSIX VFS, file-backed `mmap`, and dynamic-linking syscalls (designed in #246)
 
@@ -4524,7 +5184,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 37 | `alarm(seconds)` | `setitimer(ITIMER_REAL)` for `seconds`, returning the old timer's seconds rounded as Linux's `alarm_setitimer` | C13 |
 | 38 | `setitimer(which, new, old)` | `ITIMER_REAL` only (others `-EINVAL`, as `getitimer`); a `timeval` field out of range `-EINVAL`; `new` `NULL` disarms (Linux still accepts it); arms the process's `ITIMER_REAL`, which sends `SIGALRM` (`SI_KERNEL`) to the process at expiry and re-arms by its interval (musl's `alarm` is this call: the census's signals workload) | C13 |
 | 39 | `getpid()` | the process's pid (the thread group id) | B1 |
-| 40 | `sendfile(out, in, off, count)` | **`-ENOSYS`**: its one census call is busybox `cat`, which got `-EINVAL` on Linux too, and busybox falls back to `read`/`write` on any error (`libbb/copyfd.c`) | — |
+| 40 | `sendfile(out, in, off, count)` | **`-ENOSYS`**: its one census call is busybox `cat`, which got `-EINVAL` on Linux too, and busybox falls back to `read`/`write` on any error (`libbb/copyfd.c`); M9's C7 implements it (ruby-gem calls it: #451's census; the M9 table) | — |
 | 56 | `clone(flags, newsp, parent_tid, child_tid, tls)` | section 8, "`clone`, `fork` and `vfork`" | C1, C3 |
 | 57 | `fork()` | the same, `SIGCHLD` | C1 |
 | 58 | `vfork()` | the same, `CLONE_VM \| CLONE_VFORK \| SIGCHLD` | C1 |
@@ -4572,7 +5232,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 231 | `exit_group(status)` | ends every thread of the process (section 8, "Exit") | C1, C3 |
 | 234 | `tgkill(tgid, tid, sig)` | `tgid <= 0` or `tid <= 0` `-EINVAL`; `tid` not in `tgid` `-ESRCH`; as `tkill` | C5 |
 | 247 | `waitid(idtype, id, infop, options, rusage)` | section 8, "`wait4` and `waitid`" | C1, C6 |
-| 259 | `mknodat(dirfd, path, mode, dev)` | the type checked first, before the path is looked up, as Linux's `may_mknod`: `S_IFDIR` `-EPERM`, a type that isn't `S_IFREG`, `S_IFCHR`, `S_IFBLK`, `S_IFIFO`, `S_IFSOCK` or 0 `-EINVAL`; then `S_IFIFO` (a FIFO, section 10) and `S_IFREG` or 0 (an empty regular file) are made with `mode & !umask`, and `S_IFCHR`, `S_IFBLK` and `S_IFSOCK` are `-EPERM` (a deviation: Linux allows any user to make socket nodes with directory access, and requires `CAP_MKNOD` only for character/block devices); a name in use `-EEXIST`; a read-only mount, devfs or procfs `-EROFS` (GNU make 4.4's `-j2` jobserver FIFO: the census); through `Start` (section 8's rule 2) and a new lumen-vfs operation, `mknod_at`, over a new `VfsInode::mknod` method (ext4 and tmpfs implement it; `fixed_namespace_ops!` grows from seven operations to eight, devfs and procfs answering `-EROFS`) | C7 |
+| 259 | `mknodat(dirfd, path, mode, dev)` | the type checked first, before the path is looked up, as Linux's `may_mknod`: `S_IFDIR` `-EPERM`, a type that isn't `S_IFREG`, `S_IFCHR`, `S_IFBLK`, `S_IFIFO`, `S_IFSOCK` or 0 `-EINVAL`; then `S_IFIFO` (a FIFO, section 10) and `S_IFREG` or 0 (an empty regular file) are made with `mode & !umask`, and `S_IFCHR`, `S_IFBLK` and `S_IFSOCK` are `-EPERM` (a deviation: Linux allows any user to make socket nodes with directory access, and requires `CAP_MKNOD` only for character/block devices; M9's C1 makes `S_IFSOCK` nodes, section 10's `AF_UNIX`); a name in use `-EEXIST`; a read-only mount, devfs or procfs `-EROFS` (GNU make 4.4's `-j2` jobserver FIFO: the census); through `Start` (section 8's rule 2) and a new lumen-vfs operation, `mknod_at`, over a new `VfsInode::mknod` method (ext4 and tmpfs implement it; `fixed_namespace_ops!` grows from seven operations to eight, devfs and procfs answering `-EROFS`) | C7 |
 | 270 | `pselect6(n, readfds, writefds, exceptfds, tsp, sig)` | as `select`, with a `timespec` (written back) and `sig`, a pointer to `{ const sigset_t *ss; size_t ss_len }`: with `ss` set, `ss_len != 8` `-EINVAL` and the mask swapped for the wait in one step (`saved_mask`), restored on return unless a handler runs, as Linux's `restore_saved_sigmask_unless`; interrupted `-ERESTARTNOHAND` (make waits here with `SIGCHLD` unblocked only for the wait: the census) | B3, C6 |
 | 271 | `ppoll(fds, nfds, tsp, sigmask, sigsetsize)` | as `poll`, with `pselect6`'s mask rule and a `timespec`, the time left written back (Linux's `poll_select_finish`); interrupted `-ERESTARTNOHAND` | B3, C6 |
 | 273, 274 | `set_robust_list`, `get_robust_list` | section 8, "`futex`" | C4 |
@@ -4581,7 +5241,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 297 | `rt_tgsigqueueinfo(tgid, tid, sig, info)` | copy `info` first (`-EFAULT`); then `tgid`/`tid <= 0` gives `-EINVAL`; otherwise as `rt_sigqueueinfo`, to one thread | C5 |
 | 302 | `prlimit64(pid, res, new, old)` | M6's checks; a write to `RLIMIT_STACK` (`rlim_cur > rlim_max` `-EINVAL`) is kept and used by the next `execve` (its stack and argument budget, section 8). Since #435, `RLIMIT_NOFILE` and `RLIMIT_NPROC` writes are kept per process (inherited across `fork`, kept across `execve`) and enforced: `open`, `openat`, `pipe`, `pipe2` and `dup` return `-EMFILE` with no free fd below the soft limit; `dup2`/`dup3` to a target at or past it `-EBADF`; `fcntl(F_DUPFD*)` with `arg` at or past it `-EINVAL`; `poll`/`ppoll` with `nfds` past it `-EINVAL`; the kernel's own installs (`Stdio`, the fork and exec copies) aren't limited; and an `RLIMIT_NOFILE` hard limit above `MAX_FDS` (1024) is refused with `-EPERM`, as Linux refuses one above `nr_open`; `fork`, `vfork` and `clone` return `-EAGAIN` once the extant user tasks (processes other than init, non-leader threads, unreaped zombies) reach the soft `RLIMIT_NPROC`. Unlike Linux, which exempts uid 0 and tasks with `CAP_SYS_RESOURCE`/`CAP_SYS_ADMIN`, root is not exempt: Lumen has one uid, 0, and no capabilities, so an exemption would make the limit unenforceable (libc-test's `pthread_atfork-errno-clobber` sets it to 0 and expects `fork` to fail). Every other resource's write is still checked and ignored until M10. The census: gcc and g++ raise the stack to 64 MiB and `cc1`/`cc1plus` read it back | C12 |
 | 309 | `getcpu(cpu, node, cache)` | the current CPU's index and node 0 (either pointer may be `NULL`); with no vDSO, musl's `sched_getcpu` makes this syscall | C12 |
-| 324 | `membarrier(cmd, flags, cpu_id)` | **`-ENOSYS`**: musl registers `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED` when it starts a thread, ignores the result, and its barrier falls back to signalling each thread (the census: git, pthread, vim over the pty) | — |
+| 324 | `membarrier(cmd, flags, cpu_id)` | **`-ENOSYS`**: musl registers `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED` when it starts a thread, ignores the result, and its barrier falls back to signalling each thread (the census: git, pthread, vim over the pty); stays `-ENOSYS` in M9, whose census saw only that registration (cmd `0x10`) | — |
 
 **Changed M6 and M7 rows.** `read`, `write`, `readv`, `writev` (0, 1, 19,
 20) reach pipes, FIFOs and ttys (section 10): a blocking one interrupted
@@ -4606,20 +5266,314 @@ invalidates every address space's mappings, as `ftruncate`. `openat` and
 and `sched_rr_get_interval` (142–148: no real-time policies, no census
 call; musl's pthread scheduling attributes then fail); `signalfd` and
 `signalfd4` (282, 289: no census call, and no milestone plans them yet);
-`times` (100) and the CPU-time clocks (no census call). This list is
+`times` (100) and the CPU-time clocks (no census call). M9 (#450)
+implements `sendfile` and the CPU-time clocks in `clock_gettime` (C7,
+from #451's census) and keeps the rest. This list is
 B0's `ENOSYS_BY_DECISION`, and its census coverage check
 (`harness:test_syscalls::test_m8_table_covers_the_census`) fails if a
 census syscall is in neither `M6_SYSCALLS`, `M7_SYSCALLS`, `M8_SYSCALLS`
 nor that list.
 
-- **M9 (Networking & async I/O):** BSD sockets including both `accept` (43)
-  and `accept4` (288), `AF_UNIX` (`socketpair`, `SCM_RIGHTS`), `epoll_*`
-  (on section 10's readiness interface), `eventfd2`, and `timerfd_*`.
-- **M10 (JIT VM & Tier-1 runtimes):** `mremap`, `madvise` (`MADV_DONTNEED`,
-  `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64` (every
-  resource but `RLIMIT_STACK`, enforced since C12, and `RLIMIT_NOFILE` and
+- **M9 (Networking & async I/O):** designed in #450, the next
+  subsection.
+- **M10 (JIT VM & Tier-1 runtimes):** `mremap`, `madvise` (`MADV_DONTNEED`
+  and the rest; M9's C7 takes `MADV_FREE` for ruby's fibers),
+  `memfd_create`, `inotify_*`, writable `prlimit64` (every resource but
+  `RLIMIT_STACK`, enforced since C12, and `RLIMIT_NOFILE` and
   `RLIMIT_NPROC`, since #435), and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery (`sysinfo`
   moved to M8 with #337's census).
+
+#### M9 sockets, `epoll`, `eventfd` and `timerfd` (designed in #450)
+
+The table is pinned from #451's census of the M9 gate workloads (12
+workloads: apk over local HTTPS, curl with a test CA, python3 with asyncio,
+sqlite3 and a C extension, ruby with Net::HTTP, Fiber and a native gem,
+busybox wget, nc and ping, and a socketpair/`SCM_RIGHTS`/epoll/eventfd/
+timerfd benchmark; 109 distinct syscalls; `tests/linux/m9-census.toml`,
+#450's A2 comment), plus the rest of each family the gate and the gVisor
+subset (D4, #454) need. Every handler follows section 8's three rules.
+Socket addresses, control messages and option values are decoded and
+encoded by `crates/lumen-sockabi` (#464): `SockAddr::decode`,
+`SockAddr::decode_dest` (an optional datagram destination: `Ok(None)` is
+no address) and `encode`, each decode under a `Call` (`Bind`, `Connect`,
+`SendTo`, `SendMsg`) that picks Linux's per-call length and family rules,
+with `peek_family` and `clamp_msg_namelen`; `CmsgIter`/`CmsgWriter`;
+`decode_opt`, `check_optlen` and `write_opt`/`write_opt_for`; and the
+pinned layouts in its `abi` module.
+
+**M9's issues.** The labels every M9 section uses, filed from this design
+once it merges (epic #449). The Phase A crates are open PRs as of this
+design: lumen-epoll (#461, A6), lumen-unix (#466, A7), lumen-sockabi
+(#464, A8), lumen-eventfd (#468, A9), smoltcp's pin (#467, #459's PR 1)
+and the fixture (#463, A4); the gVisor build is #465 (A5). Rows depend on
+them by PR until they merge. #459's PR 2 (lumen-net) is written against
+section 7's stack and is a dependency of B2 and B3. The developer image
+(#462) and the census (#460) are merged.
+
+| Label | Scope | Depends on | Owns (files; interfaces; tests) | Sections |
+|---|---|---|---|---|
+| B0 | the skeleton | #450, #464 | `M9_SYSCALLS` (appended to `linux/mod.rs`), stub modules `syscall/socket.rs`, `syscall/epoll.rs`, `syscall/evfd.rs`, `vfs/anon.rs` (anonymous inodes, dev `0:9`, named `anon_inode:[eventpoll]`, `[eventfd]`, `[timerfd]`), `KernelFile::id` (a global counter), `KernelFile::anon: Option<AnonObj>` (B5 and B6 append their arms) and `KernelFile::pollable()`, which `poll_file` and `epoll_ctl` both use, `syscalls.py`'s `PLANNED`/`ENOSYS_BY_DECISION` changes, empty `tests/scenarios/test_net.py`, `tools/linux-m9/` (modes `m9_net`, `m9_unix`, `m9_io`, `m9_proc`, `dnsd`; in `test_rootfs_dev.py`'s fixture tuple); `cargo:lumen-sockabi` (#464), `ktest:lumen_kernel::linux::m9_abi_constants_match_spec`, `harness:test_syscalls::test_m9_table_covers_the_census` | 8, 15 |
+| B1 | socket file objects and every socket handler | B0 | `kernel/src/net/mod.rs`, `kernel/src/net/sock.rs`: `SockOps`, `block_on`, `InFlightFile`, sockfs (dev `0:8`), `KernelFile::sock`; every handler in `syscall/socket.rs` written once as generic `SockOps` dispatch (address decode, `msghdr`, `CmsgIter`/`CmsgWriter`, slot reservation and install), so families only implement `SockOps`; `socket`/`socketpair` dispatch by family, `read`/`write`/`readv`/`writev` as send and receive, `S_IFSOCK` `fstat`, `/proc/<pid>/fd` `socket:[ino]`, `FIONBIO`, `FIONREAD`; `ktest:lumen_kernel::net::sock::socket_and_socketpair_dispatch_by_family`, `ktest:lumen_kernel::net::sock::socket_io_and_poll_reach_sockops` | 8 |
+| B2 | `NetDevice` and virtio-net | B0, #459's PR 2, #463 | `kernel/src/net/virtio_net.rs` (in `DRIVERS`), `share`'s no-bounce path for recorded DMA runs (`virtio.rs`), the `net` shell command and its `selftest`, `RUNS` if its count needs it; `scenario:test_net::test_virtio_net_frames` | 7 |
+| B3 | the stack and the `net` thread | B1, B2, #459's PR 2 | `kernel/src/net/stack.rs` (`NetStack`, the thread, readiness, listener refill, the SYN filter's kernel side, the `net` command's TIME-WAIT list), `kernel/src/net/inet.rs` (`InetSocket` and its `Proto` enum, whose arms C3, C4 and C6 append; section 7's code block); `cargo:lumen-net` (#459), `ktest:lumen_kernel::net::stack::loopback_tcp_echo_through_the_net_thread`, `ktest:lumen_kernel::net::stack::readiness_notifies_after_the_stack_lock`, `ktest:lumen_kernel::net::stack::listen_pool_refills_between_polls`, `ktest:lumen_kernel::net::stack::socket_limits_give_enobufs` | 7, 9 |
+| B4 | address configuration | B3, #463 | `kernel/src/net/config.rs` (`lumen.net=`, DHCPv4, the lease log line); `ktest:lumen_kernel::net::config::net_cmdline_parses_off_dhcp_and_static`, `scenario:test_net::test_dhcp_dns_and_loopback` (its B4 checks; C3 and C4 add theirs) | 7 |
+| B5 | `epoll` | B0, B1, #461 | `kernel/src/linux/epoll.rs` (`Epoll`, the release hook, deferred notify), `syscall/epoll.rs`, lumen-vfs's `PollWaker`/`PollDefer` change (section 10) and every waker's update; `cargo:lumen-epoll`, `cargo:lumen-vfs`, `ktest:lumen_kernel::linux::epoll::interest_outlives_a_closed_dup_and_goes_with_the_last`, `ktest:lumen_kernel::linux::epoll::nested_notify_is_deferred_past_the_source_lock`, `ktest:lumen_kernel::linux::epoll::epoll_ctl_errors_in_linux_order`, `ktest:lumen_kernel::linux::epoll::copy_out_fault_unreports_the_rest`, `scenario:test_linux_io::test_epoll_edge_and_level_triggered` | 9, 10 |
+| B6 | `eventfd` and `timerfd` | B0, #468 | `kernel/src/linux/evfd.rs`, `syscall/evfd.rs`, `linux::timer`'s timerfd target; `cargo:lumen-eventfd`, `ktest:lumen_kernel::linux::evfd::timerfd_expiries_count_on_the_timers_worker`, `scenario:test_linux_io::test_eventfd_and_timerfd` | 8, 10 |
+| C1 | `AF_UNIX` stream, datagram and seqpacket | B1, #464, #466 | `kernel/src/net/unix.rs` (bound-socket and abstract tables, autobind, `SO_PEERCRED`), `S_IFSOCK` in `vfs/tmpfs.rs`'s and `vfs/ext4.rs`'s `mknod`, `mknodat`'s socket type, a socket node's open `-ENXIO`; `cargo:lumen-unix`, `ktest:lumen_kernel::net::unix::path_bind_makes_a_socket_inode_on_tmpfs_and_ext4`, `ktest:lumen_kernel::net::unix::unlink_while_bound_keeps_the_socket_and_frees_the_name`, `ktest:lumen_kernel::vfs::ext4::ext4_socket_mknod_writes_a_special_inode`, `scenario:test_net::test_af_unix_and_scm_rights` (its checks tagged C1) | 9, 10 |
+| C2 | `SCM_RIGHTS`, `SCM_CREDENTIALS` and the collector | C1 | `kernel/src/net/unix_gc.rs` (the in-flight registry, the cap, `unix_gc`); `ktest:lumen_kernel::net::unix_gc::collects_an_unreachable_in_flight_cycle`, `ktest:lumen_kernel::net::unix_gc::in_flight_cap_gives_etoomanyrefs`, `ktest:lumen_kernel::net::unix_gc::closing_a_long_in_flight_chain_doesnt_recurse`, `scenario:test_net::test_af_unix_and_scm_rights` (its checks tagged C2) | 9, 10 |
+| C3 | UDP over IPv4 and IPv6 | B3, B4, #464 | `kernel/src/net/udp.rs`; `scenario:test_net::test_udp_datagrams_over_loopback`, `test_dhcp_dns_and_loopback`'s DNS check | 7, 8 |
+| C4 | TCP over IPv4 and IPv6 | B3, B4, #464 | `kernel/src/net/tcp.rs` (connect, listen and its pool, accept, shutdown, errors, `SIGPIPE`); `scenario:test_net::test_ipv4_and_ipv6_tcp_echo`, `test_dhcp_dns_and_loopback`'s TCP checks | 7, 8 |
+| C5 | options, names and message calls | C1, C3, C4 | `tests/conformance/libc-test-xfail.txt` loses #434's two entries (libc-test's `socket.c` needs C3's UDP and C5's `getsockname` and `SO_RCVTIMEO`; the PR says `Fixes #434`); the option table in `net/inet.rs` and `net/unix.rs`, `getsockname`/`getpeername`, `sendmsg`/`recvmsg` control paths, `SO_RCVTIMEO`/`SO_SNDTIMEO`; `scenario:test_net::test_bsd_socket_options_and_nonblocking` | 7, 8 |
+| C6 | ICMP: ping sockets and raw echo | B3 | `kernel/src/net/icmp.rs`, its `Proto` arm; appends `Icmp6Filter`, `Ipv6Checksum`, `Ipv6HopLimit` and `Ipv6RecvHopLimit` to lumen-sockabi's `SockOpt` (append-only) and answers them; `scenario:test_net::test_ping_over_loopback` | 7 |
+| C7 | the census's leftovers | B1, C1 | `sendfile`, `copy_file_range`, `getresuid`/`getresgid`, `madvise(MADV_FREE)`, the CPU-time clocks in `clock_gettime`/`clock_getres`; `scenario:test_linux_proc::test_m9_small_syscalls` | 8 |
+| C8 | network and epoll stress, SMP | B5, B6, C4 | `scenario:test_net::test_connection_and_epoll_stress`, `test_epoll_edge_and_level_triggered`'s mixed-set check (a socket, an eventfd and a timerfd) | 15 |
+| D0 | the heavy tier (section 15) | — | `tier = "heavy"` in `tests/features/*.toml` and `status.py --tier pr\|heavy\|all`, `@pytest.mark.heavy`, `make test-heavy`, a KVM-only workflow; `harness:test_status::test_heavy_tier_is_gated_apart` (`--check --tier pr` ignores heavy rows and `--tier heavy` checks only them, each reading its own results file, and `--tier all` needs both) | 15 |
+| D1 | gate: `apk` and `curl` over HTTPS | B4, C4, C5, C7, #463 | `scenario:test_alpine::test_apk_and_curl_https_local` | 15 |
+| D2 | gate: python3 | B5, B6, C1–C5, C7 | `scenario:test_alpine::test_python3_asyncio_sqlite_and_c_ext` | 15 |
+| D3 | gate: ruby | B5, B6, C1–C5, C7 | `scenario:test_alpine::test_ruby_http_fibers_and_native_gem` | 15 |
+| D4 | gate: gVisor's socket subset | D0, B5, B6, C1–C6, #465 | `make rootfs-gvisor` (its own image), `tests/conformance/gvisor-xfail.txt`, the per-case runner; `scenario:test_conformance::test_gvisor_socket_suite` (a `net.toml` row with `tier = "heavy"`), `harness:test_gvisor::test_a_timed_out_case_is_run_once_more`, `harness:test_gvisor::test_a_flaky_entry_covers_a_fail_or_timeout_never_an_error` | 15 |
+
+**Where the code lives.** The socket layer in `kernel/src/net/`:
+`mod.rs` (B1: the module and its `init`), `sock.rs` (B1), `virtio_net.rs`
+(B2), `stack.rs` and `inet.rs` (B3), `config.rs` (B4), `udp.rs` (C3),
+`tcp.rs` (C4), `icmp.rs` (C6), `unix.rs` (C1) and `unix_gc.rs` (C2).
+`AF_UNIX` is there, not in `linux/`, so every family shares `sock.rs`'s
+file object and one `docs/MAP.md` entry. `lo`'s device is lumen-net's
+`Loopback`, so there is no `loopback.rs`. `epoll` in
+`kernel/src/linux/epoll.rs` (B5), `eventfd` and `timerfd` in
+`kernel/src/linux/evfd.rs` (B6). Handlers in `syscall/socket.rs` (B0's
+stubs; B1 writes them all, generic over `SockOps`), `syscall/epoll.rs` (B5) and
+`syscall/evfd.rs` (B6); C7's rows go where their M7/M8 neighbours are
+(`syscall/io.rs`, `syscall/mem.rs`, `syscall/sys.rs`). Files several
+issues edit, append-only: `syscall/mod.rs`'s dispatch arms, `linux/mod.rs`'s
+`M9_SYSCALLS`, `tests/features/net.toml` and `epoll.toml` (one row per
+issue), root `Cargo.toml`'s `[workspace.dependencies]`, `Makefile`
+targets, `test_rootfs_dev.py`'s fixture tuple, the shared scenario files
+(`test_net.py`, `test_linux_io.py`, `test_linux_proc.py`: one test or
+tagged check per issue), the `tools/linux-m9` programs (one mode or
+check per issue), and these append-only regions with named owners:
+`inet.rs`'s `Proto` arms (C3's UDP, C4's TCP, C6's ICMP), `unix.rs`'s
+option arms (C2's `SO_PASSCRED`, C5's table), lumen-sockabi's `SockOpt`
+variants (C6's ICMPv6 options) and `AnonObj`'s arms (B5, B6).
+`net/inet.rs` is B3's, then C5's (after C3 and C4 merge);
+`linux/process.rs` gains B0's `KernelFile::id` and `anon`, B1's
+`KernelFile::sock`, and B5's `KernelFile::epitems` and release hook. Each issue updates its area's `docs/MAP.md` entry.
+
+**B0's stubs.** Only new numbers get typed `-ENOSYS` stubs, each issue in
+the last column replacing its own. B0 appends `M9_SYSCALLS` to
+`kernel/src/linux/mod.rs` like `M8_SYSCALLS`, and
+`ktest:lumen_kernel::linux::m9_abi_constants_match_spec` pins every
+number, flag, errno and struct layout below from `linux-raw-sys` (its
+`net` feature, which lumen-sockabi turns on): `sockaddr_in` 16 bytes,
+`sockaddr_in6` 28, `sockaddr_un` 110, `sockaddr_storage` 128, `msghdr`
+56, `cmsghdr` 16, `ucred` 12, `linger` 8, `timeval` 16, `epoll_event` 12
+(packed: `u32` events, then `u64` data at offset 4), `itimerspec` 32. In
+`syscalls.py`, `PLANNED["M9"]` gains `sendfile` (from
+`ENOSYS_BY_DECISION`), `copy_file_range`, `getresuid`, `getresgid` and
+`madvise` (from `PLANNED["M10"]`: C7 takes `MADV_FREE`, M10 the rest);
+`ENOSYS_BY_DECISION` loses `sendfile` and gains `sendmmsg` and
+`recvmmsg`; and `test_m9_table_covers_the_census` fails if a census
+syscall is in neither `M6_SYSCALLS`–`M9_SYSCALLS` nor that list.
+
+| # | Syscall | M9 behaviour | Issue |
+|---|---|---|---|
+| 28 | `madvise(addr, len, advice)` | **moved from M10** for ruby's fibers (the census: advice 8): `addr` not page-aligned `-EINVAL`, `len` 0 returns 0; `MADV_FREE` (8) checks the range is mapped (`-ENOMEM` otherwise) and anonymous (a file mapping `-EINVAL`, as Linux's `madvise_free_single_vma`) and keeps the pages, which Linux's lazy free allows (it may reclaim them, never must); every other advice `-EINVAL` until M10 | C7 |
+| 40 | `sendfile(out, in, offset, count)` | **implemented** (ruby-gem's file copies: the census): `in` a regular file (else `-EINVAL`), `out` any writable descriptor (a socket or pipe included); `offset` `NULL` reads at and moves `in`'s position, else reads at `*offset` and writes the new offset back; `count` capped at `MAX_RW_COUNT` (`0x7ffff000`); copies through a kernel buffer in chunks, each read holding only `in`'s locks and each write only `out`'s, so section 9's Lock 0 stays one at a time (`copy_file_range` the same); a non-blocking `out` that takes nothing `-EAGAIN`; returns the bytes written | C7 |
+| 41 | `socket(domain, type, protocol)` | `AF_UNIX` (1), `AF_INET` (2), `AF_INET6` (10); any other family `-EAFNOSUPPORT` (`AF_NETLINK` and `AF_PACKET` included: the census saw neither). `type`'s low bits `SOCK_STREAM` (1), `SOCK_DGRAM` (2), `SOCK_SEQPACKET` (5, `AF_UNIX` only; inet `-ESOCKTNOSUPPORT`, as `inet_create` with no SCTP) or `SOCK_RAW` (3: inet with ICMP only; `AF_UNIX` makes a `SOCK_DGRAM` socket, as `unix_create`, which gVisor tests); flags `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, any other bit `-EINVAL`; `protocol` 0 or the type's own (TCP 6, UDP 17; ICMP 1 or ICMPv6 58 with `SOCK_DGRAM` or `SOCK_RAW`), else `-EPROTONOSUPPORT`; the slot reserved first (`-EMFILE`) | B1, C1, C3, C4, C6 |
+| 42 | `connect(fd, addr, addrlen)` | `SockAddr::decode` with `Call::Connect`, after `peek_family` catches `AF_UNSPEC`; inet: section 7's TCP and UDP rules (`-EINPROGRESS`, `-EALREADY`, `-EISCONN`, `-ECONNREFUSED`, `-ENETUNREACH`; `AF_UNSPEC` disconnects a datagram socket); unix: the path or abstract name looked up in the bound-socket tables (section 10), `-ECONNREFUSED` if absent or not listening, `-EPROTOTYPE` for another type, a full backlog `-EAGAIN` with `O_NONBLOCK`, else a wait; interrupted as "Signals and sockets" below | C1, C3, C4 |
+| 43 | `accept(fd, addr, addrlen)` | `accept4(fd, addr, addrlen, 0)` (busybox nc: the census) | C1, C4 |
+| 44 | `sendto(fd, buf, len, flags, addr, addrlen)` | `sendmsg` with one span and an optional name (a datagram socket's decoded by `SockAddr::decode_dest` with `Call::SendTo`; a stream socket ignores it) | C1, C3, C4 |
+| 45 | `recvfrom(fd, buf, len, flags, addr, addrlen)` | `recvmsg` with one span, the name written back truncated to `*addrlen` with the full length stored, as Linux's `move_addr_to_user` | C1, C3, C4 |
+| 46 | `sendmsg(fd, msg, flags)` | `msghdr` copied in (`-EFAULT`; a negative `msg_namelen` `-EINVAL`, above 128 clamped, `clamp_msg_namelen`), a datagram socket's name decoded by `SockAddr::decode_dest` with `Call::SendMsg` (0 is no address; a stream socket ignores the name), at most `UIO_MAXIOV` (1024) spans (`-EMSGSIZE`), the control buffer walked by `CmsgIter` (`SCM_RIGHTS` at most `SCM_MAX_FD` 253 descriptors, else `-EINVAL`; `SCM_CREDENTIALS`, section 10); flags `MSG_DONTWAIT`, `MSG_NOSIGNAL`, `MSG_MORE` (accepted, no effect), `MSG_EOR` (seqpacket); `MSG_OOB` `-EOPNOTSUPP`; a stream socket whose peer is gone `-EPIPE` with `SIGPIPE` unless `MSG_NOSIGNAL`; per family a destination on a connected socket follows Linux (unix datagrams: lumen-unix's `DgramPeer::resolve_send_target` uses the destination given, no `-EISCONN`, and `-ENOTCONN` without one) | C1, C2, C3, C4, C5 |
+| 47 | `recvmsg(fd, msg, flags)` | flags `MSG_PEEK`, `MSG_TRUNC`, `MSG_DONTWAIT`, `MSG_WAITALL` (stream), `MSG_CMSG_CLOEXEC`; `MSG_ERRQUEUE` `-EAGAIN` (no error queues); `MSG_OOB` `-EINVAL` (no urgent data, as Linux's TCP); `msg_flags` gets `MSG_TRUNC` and `MSG_CTRUNC`; received descriptors installed after the queue lock is released, and those that don't fit are closed with `MSG_CTRUNC` set (lumen-unix's `take_fds`) | C1, C2, C3, C4, C5 |
+| 48 | `shutdown(fd, how)` | `how` outside 0..=2 `-EINVAL`; an unconnected inet socket `-ENOTCONN` (a unix one returns 0, as `unix_shutdown`); TCP: section 7; unix: lumen-unix's `shutdown` | C1, C4 |
+| 49 | `bind(fd, addr, addrlen)` | `SockAddr::decode` with `Call::Bind` (Linux's length check before the family; `-EINVAL`, `-EAFNOSUPPORT`); already bound `-EINVAL`; inet: the port table (section 7); unix: a path, an abstract name, or autobind for `addrlen == 2` (section 10) | C1, C3, C4 |
+| 50 | `listen(fd, backlog)` | stream and seqpacket only (`-EOPNOTSUPP`); the backlog clamped as `__sys_listen`; an unbound inet socket autobinds an ephemeral port; a second `listen` sets the new backlog | C1, C4 |
+| 51 | `getsockname(fd, addr, addrlen)` | the local name, encoded by lumen-sockabi and truncated as `recvfrom`'s | C5 |
+| 52 | `getpeername(fd, addr, addrlen)` | the peer's name; unconnected `-ENOTCONN` | C5 |
+| 53 | `socketpair(domain, type, protocol, sv)` | `AF_UNIX` only (inet `-EOPNOTSUPP`), stream, datagram or seqpacket; two slots reserved first, and a bad `sv` drops both reservations, as `pipe2` | B1, C1 |
+| 54 | `setsockopt(fd, level, name, val, len)` | `decode_opt` (`len < 4` `-EINVAL` before an unknown or get-only name's `-ENOPROTOOPT`, as Linux; get-only is `!SockOpt::settable`); the options in "Options" below | C5 |
+| 55 | `getsockopt(fd, level, name, val, len)` | the same table; a negative `*len` `-EINVAL` (`check_optlen`, at `SOL_SOCKET`, `IPPROTO_IP` and `IPPROTO_TCP`, as Linux 6.12's `do_tcp_getsockopt`); `write_opt_for` truncates to `*len` and stores the length written | C5 |
+| 118 | `getresuid(ruid, euid, suid)` | writes 0 three times (every process is root until M11); `-EFAULT` (ruby-gem: the census) | C7 |
+| 120 | `getresgid(rgid, egid, sgid)` | the same | C7 |
+| 213 | `epoll_create(size)` | `size <= 0` `-EINVAL`, else `epoll_create1(0)` | B5 |
+| 228 | `clock_gettime(clockid, tp)` | M6's clocks, plus `CLOCK_PROCESS_CPUTIME_ID` (2: the process's threads' ticks, as `getrusage(RUSAGE_SELF)`'s user and system time) and `CLOCK_THREAD_CPUTIME_ID` (3: the caller's), at the tick's 1 ms granularity (ruby, 772 calls: the census); `clock_getres` reports 1 ns for both, as Linux; `timer_create` and `clock_nanosleep` keep M8's refusals | C7 |
+| 232 | `epoll_wait(epfd, events, maxevents, timeout)` | `maxevents <= 0` or above `INT_MAX / 12` `-EINVAL`; `events` outside the user range `-EFAULT` before waiting (Linux's `access_ok`, a range check only); `timeout` in ms, negative waits forever; section 10's two-phase collection; interrupted `-EINTR` (epoll never restarts, as Linux) | B5 |
+| 233 | `epoll_ctl(epfd, op, fd, event)` | section 10; `event` copied in for `ADD` and `MOD` only | B5 |
+| 281 | `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)` | `epoll_wait` with `pselect6`'s mask rule (`sigsetsize != 8` `-EINVAL`); interrupted `-EINTR` (the census: 64 calls, `EINTR` seen) | B5 |
+| 283 | `timerfd_create(clockid, flags)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (lumen-eventfd's `TimerClock::from_clockid`, after the flags; the alarm clocks `-EPERM` (`ClockError::AlarmNotPermitted`, Linux's answer without `CAP_WAKE_ALARM`), any other `-EINVAL`); flags `TFD_NONBLOCK`, `TFD_CLOEXEC`, else `-EINVAL` | B6 |
+| 284 | `eventfd(initval)` | `eventfd2(initval, 0)` | B6 |
+| 286 | `timerfd_settime(fd, flags, new, old)` | `TFD_TIMER_ABSTIME`; `TFD_TIMER_CANCEL_ON_SET` accepted and never cancels (Lumen has no `clock_settime`); other flags or a bad `itimerspec` `-EINVAL` (`itimerspec_to_ns`, which clamps a large `tv_sec` to `KTIME_MAX_NS` as `ktime_set`); `old` gets the previous setting; section 10 | B6 |
+| 287 | `timerfd_gettime(fd, cur)` | the time left and the interval (`TimerCount::get`'s `ITimer { value, interval }`, the time left clamped so `now` plus it stays within `KTIME_MAX_NS`) | B6 |
+| 288 | `accept4(fd, addr, addrlen, flags)` | flags `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, else `-EINVAL`; not listening `-EINVAL`; the new slot reserved before a connection is taken (`-EMFILE` leaves it queued); an empty queue `-EAGAIN` with `O_NONBLOCK`, else a wait; the peer's name as `recvfrom`'s (python3's asyncio passes both flags: the census) | C1, C4 |
+| 290 | `eventfd2(initval, flags)` | `EventfdFlags::from_bits` (`EFD_CLOEXEC`, `EFD_NONBLOCK`, `EFD_SEMAPHORE`; else `-EINVAL`); section 10 | B6 |
+| 291 | `epoll_create1(flags)` | `EPOLL_CLOEXEC`, else `-EINVAL`; an anonymous inode (`anon_inode:[eventpoll]`); `-EMFILE` | B5 |
+| 326 | `copy_file_range(in, off_in, out, off_out, len, flags)` | **new** (ruby-gem: the census): `flags != 0` `-EINVAL`; both regular files (`-EINVAL`, a directory `-EISDIR`); `out` opened `O_APPEND` `-EBADF`; overlapping ranges of one file `-EINVAL`; files on different superblocks `-EXDEV` (Linux's rule for filesystems without a cross-device copy); offsets as `sendfile`'s; returns the bytes copied | C7 |
+| 441 | `epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)` | `epoll_pwait` with a `timespec` (`NULL` waits forever; a bad one `-EINVAL`): not in the census, but gVisor's `epoll_test` (D4) calls it and it shares `epoll_pwait`'s path | B5 |
+
+**The socket file object (B1, `kernel/src/net/sock.rs`).** Every family
+implements one trait, and the handlers reach it through
+`KernelFile::sock: Option<Arc<dyn SockOps>>`, set when the description is
+made (as `pipe` is) and never changed. B1 writes every handler in
+`syscall/socket.rs` once, generic over it: address decoding, `msghdr`,
+`CmsgIter`/`CmsgWriter`, slot reservation and install. C1, C3, C4 and C6
+only implement it, in parallel:
+
+```rust
+// kernel/src/net/sock.rs (B1)
+pub enum SockKind { Stream, Dgram, Seqpacket, Raw }
+/// A descriptor in flight in SCM_RIGHTS: its end reference is counted
+/// (`inc_fd_ref`) while it lives, and `Drop` runs `dec_fd_ref`, so it is
+/// dropped only outside every lock (section 9's end-release rule).
+pub struct InFlightFile(FileRef);
+/// One send's user side, decoded by the handler: spans checked
+/// (`UIO_MAXIOV`), a datagram socket's destination decoded by
+/// lumen-sockabi's `SockAddr::decode_dest`, and the
+/// control buffer (at most 131072 bytes, Linux's `optmem_max` since 6.8;
+/// `-ENOBUFS` past it) walked with `CmsgIter`: `SCM_RIGHTS` resolved to
+/// `InFlightFile`s, `SCM_CREDENTIALS` decoded, messages at levels other
+/// than `SOL_SOCKET` skipped, an unknown `SOL_SOCKET` type `-EINVAL`.
+pub struct SendIo<'a> { pub iov: UserIovec<'a>, pub to: Option<SockAddr>,
+                        pub rights: Vec<InFlightFile>, pub creds: Option<Ucred>,
+                        pub flags: u32, pub nonblock: bool }
+/// One receive's: spans, room for descriptors (from `msg_controllen`),
+/// flags.
+pub struct RecvIo<'a> { pub iov: UserIovec<'a>, pub max_fds: usize,
+                        pub flags: u32, pub nonblock: bool }
+/// The handler installs `rights`, encodes them and `creds` with
+/// `CmsgWriter`, and copies the control buffer out.
+pub struct RecvDone { pub bytes: usize, pub msg_flags: u32, pub from: Option<SockAddr>,
+                      pub rights: Vec<InFlightFile>, pub creds: Option<Ucred> }
+pub trait SockOps: Pollable + Send + Sync {
+    fn family(&self) -> Family;
+    fn kind(&self) -> SockKind;
+    fn bind(&self, addr: &SockAddr) -> Result<(), u32>;
+    fn listen(&self, backlog: i32) -> Result<(), u32>;
+    fn accept(&self, nonblock: bool) -> Result<(Arc<dyn SockOps>, Option<SockAddr>), u32>;
+    fn connect(&self, addr: &SockAddr, nonblock: bool) -> Result<(), u32>;
+    /// Takes what it queues from `io.rights`; what is left goes back to
+    /// the handler, which drops it after the call.
+    fn send(&self, io: &mut SendIo<'_>) -> Result<usize, u32>;
+    fn recv(&self, io: &mut RecvIo<'_>) -> Result<RecvDone, u32>;
+    fn shutdown(&self, how: ShutdownHow) -> Result<(), u32>;
+    fn local_name(&self) -> Result<SockAddr, u32>;
+    fn peer_name(&self) -> Result<SockAddr, u32>;                  // ENOTCONN
+    fn set_opt(&self, opt: SockOpt, val: &OptVal) -> Result<(), u32>;
+    fn get_opt(&self, opt: SockOpt) -> Result<OptVal, u32>;
+    fn fionread(&self) -> Result<usize, u32>;
+    /// The description's last end reference (section 10's end release).
+    fn release(&self);
+}
+/// The one blocking wait: a `PollWait` on `src`'s `PollHead` until
+/// `ready()` holds or the absolute `deadline` (from `SO_RCVTIMEO`/
+/// `SO_SNDTIMEO`; `None`: forever) passes. Its results follow "Signals and
+/// sockets" below.
+pub fn block_on(src: &dyn Pollable, deadline: Option<u64>, ready: impl FnMut() -> bool) -> Result<(), u32>;
+```
+
+The rules every implementor keeps:
+- Errors are positive errnos (section 8's rule 3).
+- `SendIo::iov` and `RecvIo::iov` copy to and from user memory only while
+  the socket's own Lock 0 I/O lock is held, never under `NetStack::inner`
+  or a spin lock, and that lock is released around `block_on`.
+- Readiness changes notify after the family's locks are released.
+- **`SCM_RIGHTS`:** no family touches an FD table. Rights count as in
+  flight only once a family queues them: inet refuses them (`-EINVAL`); a
+  unix stream attaches them to the first byte it queues; a send that
+  queued nothing returns them. The handler checks the `-ETOOMANYREFS` cap
+  and runs the collector (section 10) before it takes any socket lock. On
+  receive, an `-EMFILE` installs the descriptors that fit, sets
+  `MSG_CTRUNC` and drops the rest, as Linux's `scm_detach_fds`.
+- **`SCM_CREDENTIALS`:** any values pass, as Linux's `scm_check_creds`
+  lets a caller with `CAP_SYS_ADMIN`, `CAP_SETUID` and `CAP_SETGID` (root);
+  a pid naming no process is `-ESRCH`.
+
+**Changed rows.**
+- `read`, `write`, `readv` and `writev` (0, 1, 19, 20) on a socket are a
+  receive or send with flags 0, and on an eventfd or timerfd section 10's.
+- `close` (3) runs a socket's release at its description's last end
+  reference (unix: lumen-unix's `close`; TCP: section 7's close), and
+  the epoll release hook (section 10).
+- `fstat` gives `S_IFSOCK` for a socket.
+- `ioctl` (16): `FIONBIO` on any descriptor; `FIONREAD` on a socket
+  (`SockOps::fionread`: unix, `StreamPair::readable_bytes` or
+  `DgramQueue::fionread`; TCP, bytes queued;
+  UDP, the next datagram's length); other socket requests `-ENOTTY` (the census saw
+  only `FIONBIO` and `FIOCLEX`).
+- `fcntl`'s `F_SETFL` `O_NONBLOCK` reaches sockets, epoll, eventfd and
+  timerfd; `lseek` on them `-ESPIPE`.
+- `poll`, `ppoll`, `select`, `pselect6` reach every new kind through
+  `Pollable`.
+- `mknodat` (259) makes `S_IFSOCK` nodes (C1, section 10), and an `open`
+  of a socket node is `-ENXIO`, as Linux.
+- `sendfile` (40) is no longer `-ENOSYS` (M8's answer): C7 implements it.
+
+**Options (C5).** Each lumen-sockabi `SockOpt` variant (`decode_opt`);
+an inet or unix socket answers those of its family and `-ENOPROTOOPT` for
+the rest:
+
+| `SockOpt` | Behaviour |
+|---|---|
+| `ReuseAddr`, `ReusePort` | stored; the bind rules (section 7) |
+| `KeepAlive`, `TcpKeepIdle`, `TcpKeepIntvl`, `TcpKeepCnt` | stored and applied (section 7's timeouts) |
+| `Broadcast` | stored; no effect (slirp drops broadcast) |
+| `SndBuf`, `RcvBuf`, `SndBufForce`, `RcvBufForce` | section 7's doubling and clamp |
+| `RcvTimeo`, `SndTimeo` | stored (old and new numbers); `block_on`'s deadline |
+| `Linger` | stored; `l_linger` 0 aborts at close (section 7) |
+| `PassCred` | unix (C2): attach credentials on receive |
+| `PeerCred` | unix, read-only (C1) |
+| `RcvLowat` | 1 only; another value stored and reported, no effect (a deviation) |
+| `SndLowat` | not settable (`decode_opt` `-ENOPROTOOPT`, as Linux); `getsockopt` 1 |
+| `Error` | read-only, read and clear |
+| `Type`, `Domain`, `Protocol`, `AcceptConn` | read-only |
+| `Debug`, `DontRoute`, `OobInline` | stored; no effect |
+| `TcpNoDelay`, `TcpCork`, `TcpMaxSeg` | section 7 (`TcpMaxSeg` stored, not applied) |
+| `TcpQuickAck`, `TcpUserTimeout` | stored and reported; no effect (deviations) |
+| `IpTos`, `IpTtl`, `Ipv6UnicastHops` | stored; the TTL and hop limit set on the smoltcp socket |
+| `IpRecvErr`, `Ipv6RecvErr` | stored; nothing is ever queued (no error queues) |
+| `Ipv6V6Only` | before `bind` only (section 7) |
+| `Icmp6Filter` (C6) | raw ICMPv6: stored and reported; replies already pass an echo-reply filter (busybox `ping6` exits if it is refused) |
+| `Ipv6Checksum` (C6) | raw ICMPv6: accepted; checksums are always computed |
+| `Ipv6HopLimit`, `Ipv6RecvHopLimit` (C6) | stored and reported; no control message is ever attached |
+
+**Signals and sockets (C4, C5).**
+- **`SIGPIPE`:** a send on a stream socket whose peer is gone or which is
+  shut for writing is `-EPIPE` with `SIGPIPE` to the calling thread, as a
+  pipe write's (section 10), unless `MSG_NOSIGNAL` (the census saw it on
+  `sendto` and `sendmsg`). A seqpacket send in the same state is `-EPIPE`
+  with no signal: Linux sends it through `unix_dgram_sendmsg`, and only
+  `unix_stream_sendmsg` raises `SIGPIPE`. So C1 maps lumen-unix's
+  `PeerClosed` by type: `-EPIPE` for seqpacket, `-ECONNREFUSED` for a
+  connected datagram socket (`af_unix.c`, v6.12).
+- **A signal during a blocking socket wait** returns `-EINTR` when the
+  socket has a timeout for that direction (`SO_RCVTIMEO`, `SO_SNDTIMEO`),
+  and `-ERESTARTSYS` without one: Linux's `sock_intr_errno(timeo)`. M8's
+  restart rules then apply (`SA_RESTART` turns `-ERESTARTSYS` into a
+  restart). Bytes already moved are returned instead of the error.
+- **A timeout** ends the wait with `-EAGAIN` (`-EINPROGRESS` for `connect`,
+  as Linux).
+
+**Stays `-ENOSYS` (or refused) in M9, and why.**
+- **`-ENOSYS`:**
+  - `sendmmsg` (307) and `recvmmsg` (299): no census call;
+  - `membarrier` (324): its census calls (ruby's 6) all pass cmd `0x10`,
+    which is `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED` (`linux-raw-sys`),
+    the registration musl makes when it starts a thread and whose result
+    it ignores (M8's row), not a barrier;
+  - `signalfd` and `signalfd4`: no census call, and gVisor's subset (#465)
+    doesn't build their test;
+  - the rest of M8's list.
+- **`-EAFNOSUPPORT`:** `AF_NETLINK` (16), `AF_PACKET` (17) and every family
+  but the three above: no census use (no `getifaddrs`, `if_nameindex` or
+  `udhcpc`; kernel DHCP keeps them out of the gate).
+- **`-EPROTONOSUPPORT`:** inet `SOCK_RAW` beyond ICMP and ICMPv6 echo.
+- **`-ESOCKTNOSUPPORT`:** `SOCK_SEQPACKET` on inet (no SCTP).
+- **`-ENOTTY`:** the `SIOCGIF*`/`SIOCSIF*` requests (no census use).
+- **Out-of-band data and `SIGURG`:** `MSG_OOB` as in the table; `SIGURG`
+  is never sent.
+
+This list is B0's `ENOSYS_BY_DECISION` change (the census coverage check
+is described under "B0's stubs").
 
 ### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` loader built #255, designed in #246; `dlopen` through ld-musl's file `mmap` built #255, M7)
 
@@ -8210,7 +9164,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     special file stored on ext4 (none in M7's image) opens for writing on
     a read-only mount, as on a writable one, and its reads and writes are
     `-EINVAL` (Linux: a FIFO waits for its peer, a socket node is
-    `-ENXIO`, a device node reaches its driver).
+    `-ENXIO`, a device node reaches its driver). M8 gave FIFOs their pipe
+    (section 10); M9's C1 makes opening a socket node `-ENXIO` (designed
+    in #450, section 10's `AF_UNIX`).
   - `InodeCache`: the `(DevId, Ino)` → `Arc<VfsInode>` map above. It evicts
     an entry only on `unlink`/`rmdir`/`rename`, a detach or `umount`, or
     when a lookup or open finds the cached entry dead (detached, `nlink ==
@@ -8702,18 +9658,32 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     objects that fit within already mapped capacity; a loader ktest also
     checks exact live heap bytes after teardown.
 
-### Global lock ordering (M7–M8; M8's locks designed in #336)
+### Global lock ordering (M7–M9; M8's locks designed in #336, M9's in #450)
 
-Every lock in the VM/storage/VFS stack, and M8's process, signal and IPC
-locks, obeys a strict acyclic total order: a lock may be taken while
-holding only locks above it.
+Every lock in the VM/storage/VFS stack, M8's process, signal and IPC
+locks, and M9's socket and epoll locks, obeys a strict acyclic total
+order: a lock may be taken while holding only locks above it.
 
 ```text
+00. Whole-object locks above Lock 0 (SleepMutex; M9, designed in #450),
+    user copies allowed under them:
+    a. EPOLL_LOOPS (the global LoopCheck of epoll-in-epoll interests),
+       taken before any epoll mutex by every path that adds or removes an
+       epoll-target interest or releases an epoll file
+    b. Epoll::mtx (Linux's ep->mtx; section 10), held across
+       Pollable::poll and epoll_wait's copy out; several only along one
+       nesting chain, outer before inner (LoopCheck keeps every chain
+       acyclic and at most EP_MAX_NESTS edges long)
+    c. UNIX_GC (the AF_UNIX collector; section 10), never held with a or b
  0. Locks held across a whole call, user copies included (SleepMutex), one
     at a time: OpenFile::pos (a B8 addition beside offset; a read, write,
     readv, writev, lseek or getdents64 of a regular file, a directory or a
     procfs file: Linux's f_pos_lock) or PipeObject::pipe (a pipe or FIFO,
-    lumen-pipe's contract)
+    lumen-pipe's contract), or, from M9, a socket's I/O lock: an
+    InetSocket's send or receive lock (one call's whole send or receive,
+    every chunk, released across a blocking wait as a pipe's is; Linux's
+    lock_sock), a unix connection's StreamPair, a unix
+    socket's DgramQueue or a Listener (sections 7 and 10)
  1. AddressSpace::inner (SleepMutex); two only in fork_copy, the parent's
     then the child's (the child is new: nothing else holds it)
  1a. The TLB shootdown board, SHOOTDOWN (SleepMutex): taken only under
@@ -8736,6 +9706,10 @@ holding only locks above it.
  9a. Tty::lock (SleepMutex): a PTY pair's or a console's line discipline,
     foreground group and output (section 10); never held across a user
     copy or with any lock 0–9
+ 9b. NetStack::inner (SleepMutex; M9, section 7): both interfaces, both
+    socket sets, lumen-net's Stack and the virtio-net device; taken under
+    a Lock 0 socket lock or an epoll mutex, never held across a user copy
+    or with any lock 1–9a, and nothing allocates under it
 10. IRQ-off SpinLocks, in this sub-order:
     a. PROCS (the process table: lumen-proc's ProcTree, processes and
        threads; not a leaf: Process::signal and the locks below nest
@@ -8749,13 +9723,21 @@ holding only locks above it.
        state), Files::table, FsState::inner, TIMERS, an inode's mappers list
        (section 5), FIFO slot and `KernelFile::pipe_end` (section 10), and `syscall/lock.rs`'s POSIX_WAITERS (a
        PosixWaitGraph record's insert and removal allocate and free under
-       it; never held with PROCS, an inode's lock or the lock wait queue's)
+       it; never held with PROCS, an inode's lock or the lock wait queue's);
+       from M9: KernelFile::epitems, UNIX_BOUND, UNIX_ABSTRACT,
+       UNIX_INFLIGHT, a UnixSocket's state, a datagram socket's
+       SendBudget (taken briefly under a receiver's Lock 0 queue lock), an
+       InetSocket's options, an eventfd's or timerfd's counter, and TIMERS
+       with its timerfd entries: a timerfd's counter, then TIMERS (the
+       worker moves expired entries out of TIMERS before it takes a
+       counter), the one nesting among these (section 10)
     d. a futex bucket (a leaf, except that one other bucket may be nested
        under it in ascending index order; nothing allocates or frees
        under it: lumen-futex's rule)
-    e. a PollHead's subscriber list (section 10; M9's epoll ready list
-       nests inside it); and `serial_in::POLL_HEAD`'s holder for the legacy
-       console bridge (cloned and released before calling `notify`, never
+    e. a PollHead's subscriber list (section 10; M9's epoll ReadyQueue and
+       a DeferSlot's link each nest inside it as a leaf, never the two
+       together and never one PollHead in another); and
+       `serial_in::POLL_HEAD`'s holder for the legacy console bridge (cloned and released before calling `notify`, never
        nested with another lock). C10's tty subscribers are separate; IRQ 4
        still takes the legacy holder and notifies its subscribers
     f. VirtioHal::TABLE; WaitQueue locks; the scheduler's run queues
@@ -8782,6 +9764,16 @@ slots, the futex buckets and the `PollHead` lists.
 Sections 5, 6, 8 and 10 name these locks and cite this list for their
 places. Until each lands, M7's order holds
 without it.
+
+M9 adds (designed in #450): level 00 (`EPOLL_LOOPS`, the epoll mutexes,
+`UNIX_GC`), the socket I/O locks in Lock 0, Lock 9b (`NetStack::inner`),
+the level-10c leaves listed there, and `ReadyQueue` and `DeferSlot` at
+10e. The epoll mutex comes before Lock 0 because lumen-epoll's protocol
+(#461) holds it across `Pollable::poll`, which takes a pipe's Lock 0
+(`PipeObject`'s `poll` locks the pipe) or a tty's Lock 9a, and across
+`epoll_wait`'s copy out. The stack lock comes after 9a because a socket's
+`poll` takes it under an epoll mutex, and because the net thread's polls
+must not wait on a user page fault.
 
 Lock 2 is held across a regular file's `read_at`/`write_at` (#254b), but
 not across procfs's `read_at`: `/proc/<pid>/maps` takes the address
@@ -8887,13 +9879,22 @@ and `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_threa
   and the `Weak<Process>` entries leaving `TIMERS` (upgraded, and the
   `Arc` dropped, only after `TIMERS` is released).
 - Dropping an `IoFile` or the last `FileRef`, or calling `dec_fd_ref`,
-  may release a pipe end and take Lock 0. Never do these while holding
-  locks 1–10 or `OpenFile::pos`.
-- Never hold locks 2–9 or 9a across `copy_from_user` / `copy_to_user`
-  (which may trigger `#PF` and acquire Lock 1). Lock 0 is the one
-  `SleepMutex` that may be held across them: a fault under it takes Lock 1,
-  which comes after it, and nothing holding a lock numbered 1 to 10 ever
-  takes Lock 0.
+  may release a pipe end and take Lock 0, and from M9 runs the epoll
+  release hook (level 00) and a socket's release. Never do these while
+  holding any lock 00–10, Lock 0 included. A queue's in-flight `FileRef`s
+  (`SCM_RIGHTS`) are drained under its lock onto the thread's
+  deferred-release list and dropped after it, one at a time by the
+  outermost release (section 10's AF_UNIX); the collector's purge feeds
+  the same list after `UNIX_GC` is released.
+- Never hold locks 2–9, 9a or 9b across `copy_from_user` / `copy_to_user`
+  (which may trigger `#PF` and acquire Lock 1). Locks 00 and 0 are the
+  `SleepMutex`es that may be held across them: a fault under one takes
+  Lock 1, which comes after both, and nothing holding a lock numbered 1 to
+  10 ever takes Lock 0 or 00.
+- A `PollWaker` never takes another `PollHead`'s subscriber lock. An
+  epoll's notify of its own `PollHead` is deferred until the source's lock
+  is released (`PollDefer`, section 10). A socket's `notify` is called only
+  after `NetStack::inner` is released.
 - Never wait for a TLB shootdown's acknowledgements with interrupts off or
   any `SpinLock` held (section 5).
 - No interrupt handler sends a signal or takes a level-10 lock above `f`
@@ -8916,16 +9917,19 @@ block-level CoW snapshots (or an optional LumenFS volume) back `snap`/`undo`,
 so an agent session still takes an O(1) snapshot before each step and supports
 "Undo step" and "Undo all" (Principle 3).
 
-## 10. IPC (pipes, FIFOs, readiness and PTYs designed in #336, M8; `AF_UNIX` and `epoll` planned, M9)
+## 10. IPC (pipes, FIFOs, readiness and PTYs designed in #336, M8; `AF_UNIX`, `epoll`, `eventfd` and `timerfd` designed in #450, M9)
 
 Instead of a separate custom IPC channel ABI, native ring-3 processes use
 standard Linux IPC primitives:
 
 - **Pipes, FIFOs, readiness and PTYs (M8):** below.
-- **Unix domain sockets & event multiplexing (M9):** `AF_UNIX` (`SOCK_STREAM`,
-  `SOCK_DGRAM`, `socketpair`, and `SCM_RIGHTS` FD passing), plus
-  `epoll_create1`/`epoll_ctl`/`epoll_wait` (level- and edge-triggered, on
-  the readiness interface below), `eventfd2`, and `timerfd_*`.
+- **Unix domain sockets & event multiplexing (M9, designed in #450):**
+  `AF_UNIX` (`SOCK_STREAM`, `SOCK_DGRAM`, `SOCK_SEQPACKET`, `socketpair`,
+  `SCM_RIGHTS` and `SCM_CREDENTIALS`, and a collector for in-flight
+  cycles), plus `epoll` (level- and edge-triggered, one-shot, nested, on
+  the readiness interface below), `eventfd` and `timerfd`: the sections
+  after "The console as a tty". The inet sockets and the stack are
+  section 7's.
 - **Desktop & automation bridge (M11):** userspace agents and desktop apps
   reach Lumen's automation tree (section 11) over a dedicated `AF_UNIX` socket
   (or `/dev/lumen-ui` device) carrying the existing postcard wire protocol
@@ -9040,7 +10044,7 @@ standard Linux IPC primitives:
   would hang it, where independent recipes could finish one after the
   other.
 
-### The readiness interface (B3), for `poll` now and `epoll` in M9
+### The readiness interface (B3), for `poll` and, with M9's deferred notify, `epoll`
 
 Pure types in lumen-vfs (host-tested), implemented by each file kind:
 
@@ -9051,10 +10055,24 @@ pub struct PollMask(u16);           // Linux's bits: IN 0x1, PRI 0x2, OUT 0x4, E
                                     // WRNORM 0x100, WRBAND 0x200, RDHUP 0x2000
 pub trait PollWaker: Send + Sync {
     /// Called under the source's PollHead lock with the bits that may have
-    /// turned on. May only set atomics and wake a thread (or, M9, queue an
-    /// epoll entry under a leaf lock); never allocates or blocks.
-    fn wake(&self, ready: PollMask);
+    /// turned on. May only set atomics, wake a thread, queue an epoll entry
+    /// under a leaf lock, and push onto `defer` (M9, B5); never allocates,
+    /// blocks, or takes another PollHead's lock.
+    fn wake(&self, ready: PollMask, defer: &mut PollDefer);   // M9: `defer` added by B5
 }
+/// M9 (B5, designed in #450): work a waker leaves until the source's
+/// subscriber lock is released ("M9's `epoll`" below). Type-erased like
+/// `PollWaker`, so no signature gains a lock family: the entry owns its
+/// link, and lumen-vfs's `DeferSlot<F>` is the helper it embeds.
+pub trait PollDeferred: Send + Sync {
+    fn queued(&self) -> &AtomicBool;
+    fn swap_next(&self, next: Option<Arc<dyn PollDeferred>>) -> Option<Arc<dyn PollDeferred>>;
+    fn run(&self);
+}
+pub struct DeferSlot<F: LockFamily> { /* queued: AtomicBool, next: F::LeafLock<Option<Arc<dyn PollDeferred>>> */ }
+pub struct PollDefer { /* head: Option<Arc<dyn PollDeferred>> */ }
+// PollHead::notify(PollMask) keeps its signature: it builds a PollDefer,
+// passes it to each waker under its lock, and drains it after releasing.
 pub trait Pollable: Send + Sync {
     /// The readiness of one open description now (`mode`: its access mode,
     /// since a pipe's two ends share one inode and an O_RDWR FIFO answers
@@ -9075,8 +10093,8 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lo
 - `VfsInode::pollable(&self) -> Option<&dyn Pollable>`, `None` by default:
   regular files, directories, procfs and devfs's always-ready devices
   answer `POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM` (M7's rule). Pipes,
-  FIFOs, both PTY ends and the console tty implement it; M9's sockets,
-  `eventfd` and `timerfd` will. `LockFamily` gains a level-10e spin lock
+  FIFOs, both PTY ends and the console tty implement it; so do M9's
+  sockets (B1, C1, B3), epoll files (B5), `eventfd` and `timerfd` (B6). `LockFamily` gains a level-10e spin lock
   (`LeafLock`: the kernel's `SpinLock`, the host tests' `std` mutex) for
   `PollHead`'s subscriber list. `subscribe` allocates its slot before
   taking that lock, and `PollGuard`'s `Drop` removes the waker and frees
@@ -9107,10 +10125,36 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lo
   the call returns, by any way out (an interrupted wait included).
   `select` reads a mask through `fs/select.c`'s `POLLIN_SET`, `POLLOUT_SET`
   and `POLLEX_SET`.
-- **M9's `epoll`** reuses it unchanged: an interest is a `PollGuard` held
-  as long as the descriptor is in the set, and the epoll instance's waker
-  queues the descriptor on its ready list; the `ready` bits passed to
-  `wake` give edge-triggered mode its edge.
+- **M9's `epoll`** (B5, "`epoll`" below): an interest holds a `PollGuard`
+  for as long as it lives (until `EPOLL_CTL_DEL`, its description's last
+  close, or the epoll's own), and the epoll's waker queues the interest on
+  its `ReadyQueue`; the `ready` bits passed to `wake` give edge-triggered
+  mode its edge. It changes this interface in one place, the `defer`
+  argument above (designed in #450). An epoll must notify its own
+  `PollHead` when an interest becomes ready, and doing that inside `wake`
+  would nest one `PollHead` lock in another: an outer epoll's, or a
+  `poll` caller's on the epoll fd. So the notify is **deferred**:
+  - **Push:** under the source's lock, the waker pushes its epoll onto
+    `defer` if the epoll's `queued` flag was clear (set in the same step);
+    it links through the slot's 10e leaf lock and clones the `Arc`, so
+    nothing allocates and an epoll is never queued twice. The waker
+    releases the epoll's `ReadyQueue` lock before it pushes: the two 10e
+    leaves are never held together.
+  - **Drain:** `PollHead::notify`, after releasing its subscriber lock,
+    takes each entry off the list, unlinks it and clears `queued`, and
+    only then runs it (the epoll's own `notify`). A wake that finds
+    `queued` set is covered: it updated the epoll's `ReadyQueue` before
+    looking, and the run comes after the clear. Each epoll's `notify`
+    drains its own `PollDefer`, so a chain unwinds one level at a time, at
+    most `EP_MAX_NESTS` + 1 deep, with no lock held between levels.
+  - **Lifetime:** a drain never runs an epoll's release. The release
+    happens at the epoll description's last end reference, which empties
+    its set and drops every guard first, so no waker can push it again;
+    if a drain's clone turns out to be the last `Arc<Epoll>`, its drop
+    only frees an emptied object and takes no lock.
+  - B5 changes `PollWaker::wake` and adds these types, and updates every
+    existing waker (`PollWait` and the tty and console wakers ignore
+    `defer`), with `cargo:lumen-vfs` tests.
 - Tested by `cargo:lumen-vfs` (`PollMask`, `PollHead`: no change lost
   between a poll and its subscription, a dropped guard unsubscribing),
   `ktest:lumen_kernel::linux::syscall::poll::poll_masks_of_each_file_kind`
@@ -9280,6 +10324,435 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lo
   `usertest`'s capture mode keeps M7's path.
 - Tested by `scenario:test_linux_io::test_console_ash_job_control`
   (section 15).
+
+### `AF_UNIX` sockets (C1, C2; designed in #450, M9)
+
+`kernel/src/net/unix.rs` puts lumen-unix's queues (#466: `StreamPair`,
+`DgramQueue`, `Listener`, `Ancillary`) behind `sock.rs`'s file object.
+lumen-unix holds no locks, wait queues or paths; this section adds them.
+
+- **Objects:**
+  - **The socket:** `UnixSocket { kind, state: SpinLock<UnixState>, cred: Ucred, poll: KernelPollHead, .. }`.
+    `state` (a level-10c leaf) holds what the socket is: unbound, bound
+    (its name), listening (its `Listener`), connected (its `UnixConn` and
+    end), or a datagram socket's peer (`DgramPeer`); it is read and
+    changed briefly, never across another lock.
+  - **Stream:** a connection is one `UnixConn { pair: SleepMutex<StreamPair<InFlightFile>>, polls: [KernelPollHead; 2] }`
+    shared by its two ends (`End::A`, `End::B`), made by `socketpair` or
+    by `connect`. `connect` claims its own `state` first: under it, an
+    unbound or bound socket becomes `Connecting` (a second `connect` then
+    gets `-EALREADY`, a connected one `-EISCONN`). It builds the connection
+    without that lock, queues it under the listener's lock, and after
+    releasing that sets `state` to connected, or back to the old state on
+    failure.
+  - **Listener:** `SleepMutex<Listener<Arc<UnixConn>>>`.
+  - **Datagram:** each socket has its own receive queue,
+    `SleepMutex<DgramQueue<InFlightFile, UnixName, DgramSender>>` (the
+    crate's `<F, A, S>`: rights, sender address, sender handle), and an
+    `Arc<SpinLock<SendBudget>>` (10c leaf). Each `Datagram` carries the
+    sender's name (`addr`), its credentials (`cred: Ucred`, required on
+    every send, as `UNIXCB(skb)`) and `DgramSender`, the handle of the
+    sender's budget: the budget is charged briefly under the receiver's
+    queue lock (`send_charged`), and a `recv`, `purge` or `close` credits
+    it after releasing that lock.
+  - **Seqpacket (in M9):** a connected pair of `DgramQueue`s with a
+    `Listener`, under the same budget rule. Records keep their boundaries,
+    and the peer's close gives EOF (0) and then `-EPIPE`. gVisor's AF_UNIX
+    tests run every case over stream, datagram and seqpacket, and are
+    most of the 7,950 cases that passed natively in A5's batched run.
+  - lumen-unix has no seqpacket queue yet: C1 adds it to that crate (the
+    collector's hooks are already there: below).
+- **Locks:** a connection's `pair`, a datagram socket's queue and a
+  listener's lock are section 9's Lock 0: held across one call's user
+  copies (peek, copy out, commit, as a pipe's), one at a time.
+  - lumen-unix never allocates under a queue lock. Growth comes back as
+    an outcome: `StreamSendOutcome::NeedBuffer` (a `ByteStorage`, swapped
+    in by `grow_buffer`), `StreamSendOutcome::NeedSegment`
+    (`SegmentStorage`, `grow_segments`), `DgramSendOutcome::NeedSlot`
+    (`DgramSlotStorage`, `grow_slots`) and `ListenError::NeedStorage`
+    (`ListenerStorage`, `grow_storage`). The kernel drops the lock,
+    allocates (charged to section 7's socket budget), retakes the lock,
+    swaps the storage in, retries, and drops the old storage after
+    releasing the lock, as lumen-unix's contract says.
+  - A datagram `send` copies the datagram into a `DgramPayload` of its
+    length before it takes the receiver's queue lock (it must arrive
+    whole), then calls `send_charged`.
+  - A stream `send` copies a chunk at a time into a 4 KiB stack buffer
+    under the pair lock.
+- **Path names:**
+  - **`bind`** makes an `S_IFSOCK` inode with `mode & !umask` through
+    `Start::mknod` (section 8's rule 2); a name in use is `-EADDRINUSE`,
+    as Linux's `unix_bind`, and a read-only mount `-EROFS`. Today
+    `mknodat` refuses `S_IFSOCK` with `-EPERM`
+    (`kernel/src/linux/syscall/pipe.rs:89`), and both filesystems' `mknod`
+    refuse every type but regular files and FIFOs
+    (`kernel/src/vfs/tmpfs.rs:850`, `kernel/src/vfs/ext4.rs:4476`). C1
+    adds the socket type to both and to `mknodat`, resolving M8's
+    deviation.
+  - **On tmpfs** a new `Node::Socket`. **On ext4,** ext4plus already has
+    `FileType::Socket` and `InodeMode::S_IFSOCK`
+    (`vendor/ext4plus/src/file_type.rs:33`, `src/inode.rs:133`), so the
+    driver writes a socket inode as it writes a FIFO: `i_block` zeroed and
+    `EXTENTS` cleared, which `e2fsck` accepts for a special file.
+  - **The bound-socket table,** `UNIX_BOUND: SpinLock<BTreeMap<(DevId, Ino), Weak<UnixSocket>>>`
+    (a level-10c leaf). `connect` and `sendto` resolve the path to an inode
+    (a hard link reaches the same socket), then look up its `(dev, ino)`.
+    An inode with no live socket (a stale node, one left on ext4 by an
+    earlier boot) is `-ECONNREFUSED`, as Linux.
+  - **`unlink` while bound** removes the name and frees the path for a new
+    `bind` (a new inode). The old socket keeps working (its entry is keyed
+    by the old inode and goes when the socket closes), as Linux.
+  - An `open` of a socket node is `-ENXIO`, replacing M7's special-file
+    `-EINVAL` (section 9).
+  - `getsockname` reports the path as it was bound.
+- **Abstract names:**
+  - `UNIX_ABSTRACT: SpinLock<BTreeMap<UnixBytes, Weak<UnixSocket>>>`
+    (10c leaf), keyed by the bytes after the leading NUL (lumen-sockabi's
+    `UnixName::Abstract`); a name in use is `-EADDRINUSE`.
+  - **Autobind** (`bind` with `addrlen == 2`, or a `connect` or `send` from
+    an unbound socket with `SO_PASSCRED`, as Linux's `unix_autobind`)
+    takes the next free five-hex-digit abstract name from a wrapping
+    counter (`-ENOSPC` once all 2^20 are taken).
+- **Credentials:**
+  - **`SO_PEERCRED`** is the peer's `{pid, uid, gid}` (its tgid, 0, 0)
+    from the `connect` or `socketpair` that made the connection (Linux
+    takes them at connect and listen time).
+  - **`SCM_CREDENTIALS`:** checked by the handler (section 8's
+    `SockOps` rules). Every send records the writer's credentials (the
+    required `cred: Ucred` of `StreamPair::send` and of `Datagram`); an
+    explicit `SCM_CREDENTIALS` (`Ancillary::cred`) replaces them, as
+    `unix_scm_to_skb`. A receiver with `SO_PASSCRED` (C2) gets what was
+    recorded, and a stream read with it stops where the writer changes
+    (`check_creds`).
+- **`SCM_RIGHTS` (C2):**
+  - **Send:** the handler resolves each descriptor to an `InFlightFile`
+    before any queue lock (section 8). Its reference counts in
+    `KernelFile::end_refs` as a descriptor does, so a description in
+    flight stays open, epoll interests in it survive (section 10), and its
+    release runs only when the last descriptor or in-flight copy goes.
+  - **Receive:** the handler reserves slots and installs the files after
+    the queue lock is released (`O_CLOEXEC` with `MSG_CMSG_CLOEXEC`), with
+    section 8's truncation and `-EMFILE` rules. `MSG_PEEK` clones the
+    rights (new `InFlightFile`s), as Linux's peek duplicates them.
+  - **Releasing without recursion:** a unix socket's release never drops
+    queued rights itself. It drains them under its queue lock and moves
+    them onto the current thread's deferred-release list (a `Vec` on the
+    kernel `Thread`). The outermost release on that thread then drops the
+    list one entry at a time; a release reached from inside that loop (a
+    dropped right that was the last reference to another unix socket)
+    only appends, and a collector request inside it only sets `rerun`. So
+    a chain of sockets in flight in one another unwinds in a loop, not on
+    the stack (section 9's end-release rule holds throughout: nothing is
+    dropped under a lock).
+  - **The cap:** as Linux's `too_many_unix_fds`, checked before adding: a
+    send is refused with `-ETOOMANYREFS` when the global in-flight count
+    (one uid, 0, in Lumen) already exceeds the sender's soft
+    `RLIMIT_NOFILE`. With the limit at 8 and one descriptor a message, the
+    ninth send succeeds and the tenth is refused. Linux exempts
+    `CAP_SYS_ADMIN` and `CAP_SYS_RESOURCE`; Lumen doesn't, as #435 decided for
+    `RLIMIT_NPROC`: everyone is root, so an exemption would leave no cap.
+- **The collector (C2, `kernel/src/net/unix_gc.rs`).** Lumen's own
+  mark-and-sweep, with Linux's death rule: a socket is dead when only
+  in-flight references reach it (Linux's `unix_vertex_dead` compares
+  `file_count()` with those). Linux's current `net/unix/garbage.c` finds
+  such sockets as strongly connected components (Tarjan), run from a
+  workqueue; the simpler walk below gives the same answer for M9's sizes.
+  It must avoid the race behind CVE-2021-0920 (a receive or peek during
+  the walk):
+  - **The registry:** `UNIX_INFLIGHT` (10c leaf) maps each unix socket with
+    a descriptor in flight to its in-flight count, and holds a `gc_seq`.
+    Every increment and decrement (a send queuing rights, a receive
+    taking them, a peek cloning them, a queue dropping them) happens under
+    it and bumps `gc_seq`. A socket is a candidate when every one of its
+    description's end references is in flight (`end_refs` equals that
+    count): only a queue can reach it.
+  - **The walk:** under `UNIX_GC` (section 9's level 00c) it takes each
+    candidate's queue lock in turn, one Lock 0 at a time, and, for every
+    unix socket queued there, subtracts one from that socket's count. For
+    a listener it clones the pending `Arc<UnixConn>`s under the
+    listener's lock into a list allocated before taking it, releases it,
+    then takes each connection's pair lock in turn. A candidate left with a
+    positive count is reachable from outside, as is everything its queue
+    holds, transitively; the rest are garbage.
+  - **The purge:** before purging it re-reads `gc_seq`; if it moved, the
+    walk runs again. Each garbage socket's queue is emptied under its
+    queue lock (`StreamPair::purge_recv` or `DgramQueue::purge`, which
+    change no shutdown, close or reset state), and the rights they return
+    go onto the thread's deferred-release list (above),
+    which is dropped one entry at a time after `UNIX_GC` is released.
+  - **When it runs** (Lumen's choice): on the close of a unix socket while
+    the global in-flight count is non-zero, and once in a `sendmsg` about
+    to fail with `-ETOOMANYREFS` (in the handler, before any socket lock),
+    which then checks the cap again. A request while a collection runs
+    sets `rerun`, and the running one goes round again before it returns.
+  - The walk visits queued descriptors without draining them through
+    `StreamPair::for_each_queued_fd`, `DgramQueue::for_each_queued_fd`
+    and `Listener::pending`.
+- **Receive rules lumen-unix keeps:**
+  - A pending reset (`ECONNRESET`) is taken by the next receive even with
+    `MSG_PEEK`, as Linux's `sock_error` (a stream's once its queue is
+    empty, a datagram queue's at once).
+  - A zero-length `recv` runs once with target 1 (a reset, EOF or
+    `-EAGAIN` on an empty queue; otherwise 0 bytes, taking the head
+    segment's rights), while a zero-length `read` returns 0 at once
+    (`StreamRecvOutcome::ZeroBuffer`) and touches nothing.
+  - A destination on a connected datagram socket is used as given (no
+    `-EISCONN`, as `unix_dgram_sendmsg`); a receiver connected to someone
+    else refuses with `-EPERM` (`DgramPeer::may_accept_from`).
+- **Readiness:** lumen-unix's `Readiness` maps to `POLLIN | POLLRDNORM`,
+  `POLLOUT | POLLWRNORM`, `POLLRDHUP`, `POLLHUP` and `POLLERR` (`err`, a
+  pending reset); every change notifies the affected end's `PollHead`
+  after its lock is released. A datagram socket's `POLLOUT` is its own
+  `SendBudget::writable` and its peer queue's `accepts`, which stays true
+  for a closed or `SHUT_RD` peer so the writer wakes to see the error.
+- **Memory:** `SO_SNDBUF` defaults to 212992 (lumen-unix's
+  `DEFAULT_SNDBUF`) with a floor of 4608 (`MIN_SNDBUF`), doubled and
+  reported as inet's. Queue growth is charged to section 7's
+  `NET_MEM_CAP`, so a guest's socketpairs can't take the heap.
+  - **Datagram:** `SendBudget` admits a datagram while `used < limit` and
+    lets the charge overshoot, as `sock_alloc_send_pskb`; a payload above
+    `sndbuf - 32` is `-EMSGSIZE`. Each datagram is charged its length plus
+    a fixed 32 bytes (`DGRAM_MAX_MSG_OVERHEAD`), a deviation: Linux
+    charges `skb->truesize`.
+  - **Stream:** a strict cap, `wmem <= sndbuf`, charging a fixed 64 bytes
+    (`SEGMENT_OVERHEAD`) per segment, a deviation from Linux's
+    `sndbuf / 2 - 64` chunks with overshoot; partial writes keep a
+    `POLLOUT` writer from spinning.
+- **Tested by** `cargo:lumen-unix` (#466) and
+  `ktest:lumen_kernel::net::unix::path_bind_makes_a_socket_inode_on_tmpfs_and_ext4`
+  (bind on both, `stat` says `S_IFSOCK`, a second bind `-EADDRINUSE`,
+  `connect` by a hard link reaches it, `open` `-ENXIO`),
+  `ktest:lumen_kernel::net::unix::unlink_while_bound_keeps_the_socket_and_frees_the_name`,
+  `ktest:lumen_kernel::vfs::ext4::ext4_socket_mknod_writes_a_special_inode`
+  (no blocks, no `EXTENTS`; as the FIFO ktest),
+  `ktest:lumen_kernel::net::unix_gc::collects_an_unreachable_in_flight_cycle`
+  (two sockets each holding the other in flight, a pipe's write end in
+  one of them, both descriptors closed: the collector runs, the pipe's
+  reader sees EOF, and the heap's in-use bytes return to before; a
+  positive control keeps one descriptor open and the reader sees no EOF),
+  `ktest:lumen_kernel::net::unix_gc::in_flight_cap_gives_etoomanyrefs`
+  (with `RLIMIT_NOFILE` lowered to 8 and one descriptor a message: the
+  ninth send succeeds, the positive control, and the tenth is
+  `-ETOOMANYREFS`),
+  `ktest:lumen_kernel::net::unix_gc::closing_a_long_in_flight_chain_doesnt_recurse`
+  (1000 sockets, each in flight in the next; closing the head on a
+  64 KiB kernel stack releases them all and the heap's in-use bytes return
+  to before) and `scenario:test_net::test_af_unix_and_scm_rights` (section
+  15).
+
+### `epoll` (B5; designed in #450, M9)
+
+`kernel/src/linux/epoll.rs` follows lumen-epoll's protocols (#461, its
+crate docs: `EPOLL_CTL_ADD`, `MOD`, `DEL`, description close, instance
+close, two-phase `epoll_wait`, nested readiness) on the readiness
+interface above.
+
+- **The object:** `Epoll { mtx: SleepMutex<EpState>, rq: SpinLock<ReadyQueue>, wq: WaitQueue, poll: KernelPollHead, id: u64, defer: DeferSlot }`.
+  - `EpState` holds the `EpollSet<Key, Interest>` and the reusable handle
+    buffer.
+  - `mtx` is Linux's `ep->mtx`, section 9's level 00b. `rq` is Linux's
+    `ep->lock`, the 10e leaf nested in a `PollHead`'s subscriber lock.
+  - An epoll file is an anonymous inode (B0's `anon_inode:[eventpoll]`)
+    whose description holds the object in `KernelFile::anon`
+    (`AnonObj::Epoll`); `KernelFile::pollable()` (B0) answers for it, for
+    sockets (through `KernelFile::sock`) and for every other kind, and both
+    `poll` and `epoll_ctl` use it. `fork` shares its description, so
+    parent and child share the interests, as Linux.
+- **Interests are keyed by (description, fd):** `Key = (u64, i32)`, where
+  the `u64` is `KernelFile::id` (B0: a global counter).
+  - **The payload:** an `Interest { target, guard: Option<PollGuard>, mode,
+    nested: Option<u64> }`. `target` is a metadata-only reference to the
+    description, not counted in `end_refs`, so an interest never keeps a
+    description open.
+  - **The waker:** `EpWaker { ep: Arc<Epoll>, handle: Handle }`.
+- **Removal when the description's last reference goes** (Linux's
+  `eventpoll_release`), not at `close(fd)`:
+  - `KernelFile` gains `epitems: SpinLock<EpWatchers>` (10c leaf): each
+    epoll instance watching the description (a `Weak<Epoll>` and a count).
+    `EpWatchers::reserve` (outside the lock, may allocate) and `commit`
+    (under it) let `EPOLL_CTL_ADD` add an entry without allocating under
+    the lock; `DEL` and an epoll's close lower or remove theirs.
+  - **The hook:** `KernelFile`'s end release (`end_refs` from 1 to 0, today
+    `release_pipe_end`) runs `epoll::release_file`. It takes the list out
+    under its lock. If the released file is itself an epoll, it first
+    empties its own set under `EPOLL_LOOPS` and its own `mtx`
+    (`LoopCheck::remove_set`), and releases both. Then, one watcher at a
+    time, it takes `EPOLL_LOOPS` (if the released file is an epoll) and
+    that watcher's `mtx`, runs `set.remove_range((id, i32::MIN)..=(id,
+    i32::MAX))`, `rq.unlink` for each handle under `rq`, and
+    `LoopCheck::remove` for epoll targets, and releases them. A released
+    epoll's `mtx` is never held while a watcher's is taken. Payloads are
+    dropped after each unlock.
+  - The hook runs under section 9's end-release rule (no lock 00–10
+    held).
+  - **What follows:**
+    - closing one of two `dup`s keeps the interest;
+    - closing the last removes it;
+    - a descriptor in flight in `SCM_RIGHTS` keeps it;
+    - an interest whose fd was closed while a `dup` survives still reports
+      under the old fd's `data`, and `EPOLL_CTL_DEL` on the old number is
+      `-EBADF`, as Linux.
+  - **References:** the target's `PollHead` holds the waker, the waker the
+    `Epoll`, and the `Epoll` the target's metadata reference: a cycle,
+    broken by the two removals (the epoll's own close drains its set and
+    drops every guard; the target's last close runs the hook).
+- **`epoll_ctl`:**
+  - **Error order** (Linux's `do_epoll_ctl`): `epfd` or `fd` not open
+    `-EBADF`; then a target with no `pollable` `-EPERM` (Linux's
+    `file_can_poll` refuses regular files, directories, procfs files and
+    `/dev/null`, which `poll` calls always ready, M7's rule, so `epoll`
+    and `poll` differ there as on Linux); then `epfd` not an epoll, or the
+    target the same description as `epfd` (a `dup` of `epfd` counts),
+    `-EINVAL`. Then `EPOLLEXCLUSIVE` on an epoll target is `-EINVAL`, a loop or depth past
+    4 `-ELOOP` (`LoopCheck` under `EPOLL_LOOPS`), and `EpollSet::add`'s
+    `-EEXIST`, `-ENOMEM` and `EPOLLEXCLUSIVE` checks follow, as
+    lumen-epoll lists them.
+  - **`ADD`, `MOD`, `DEL`** run exactly as lumen-epoll's docs give them,
+    including the poll after linking (`ADD`) or after `apply` (`MOD`), and
+    the wake that poll's result calls for, as lumen-epoll's docs give it. `ADD`
+    holds the target's `FileRef` (its `IoFile`) until the interest is
+    linked, so a concurrent last close runs the hook after the interest
+    exists and removes it. That `IoFile` is dropped only after `mtx` and
+    `EPOLL_LOOPS` are released (section 9's end-release rule): dropped
+    under them, a concurrent close's hook would wait on this same epoll.
+  - A target that returned no guard (no wake source, as the interim
+    console's VT path) makes `epoll_wait` re-poll in 5 ms steps, as
+    `poll`'s `console_step`.
+  - Linux's `reverse_path_check` (wake-path fan-out limits) isn't
+    modelled (a deviation).
+- **Modes:**
+  - Level- and edge-triggered and `EPOLLONESHOT` are lumen-epoll's
+    (`finish_scan`: level-triggered entries requeue at the tail, edge
+    entries drop unless woken during the scan, one-shot disarms until
+    `MOD`).
+  - `EPOLLWAKEUP` is accepted and ignored.
+  - `EPOLLEXCLUSIVE` is accepted (with lumen-epoll's
+    `EPOLLEXCLUSIVE_OK_BITS` rule) and every waiter is woken. Wake-one
+    isn't modelled (a deviation; correct, only less efficient).
+- **`epoll_wait`, `epoll_pwait`, `epoll_pwait2`:**
+  - **The wait:** B2's `wait_interruptible` on `wq` with the deadline,
+    ready when `ReadyQueue::events_available` holds; then lumen-epoll's two
+    phases, with each `Pollable::poll` under `mtx` and never under `rq`.
+  - **Copy out** happens under `mtx` (Linux's `ep_send_events`). A fault
+    at event `i` runs `unreport` on the rest and returns `i`, or
+    `-EFAULT` if none was written.
+  - An interrupt is `-EINTR`.
+  - **After a scan:** when `finish_scan`, `finish_peek`, `unreport` or
+    `abort_scan` report a non-empty ready list, the caller wakes only this
+    epoll's own `wq` waiters, **never** the epoll file's `PollHead`
+    subscribers (Linux's `ep_done_scan` wakes `ep->wq` only). Only a source
+    wake that passed the interest's event mask notifies subscribers: every
+    such wake, whether the entry was newly queued (`Wake::Queued`), already
+    queued or in a scan (`Wake::AlreadyQueued`), wakes `wq` and notifies
+    (`should_wake_waiters`, `should_notify_subscribers`), as Linux's
+    `ep_poll_callback` wakes `ep->wq` and `ep->poll_wait` on every matching
+    callback; a wake that the mask or a disarmed one-shot filtered
+    (`Wake::Filtered`), or that names a stale interest (`Wake::Stale`),
+    notifies nobody. Otherwise a peek by an outer
+    edge-triggered epoll would re-wake its own interest and report it
+    forever (Codex on #461).
+  - The census's python3 asyncio and the benchmark use level-triggered
+    `EPOLLIN`/`EPOLLOUT` and `EPOLLIN | EPOLLET` (A2).
+- **Nested epoll:**
+  - **The graph:** `EPOLL_LOOPS: SleepMutex<LoopCheck<u64>>` (level 00a)
+    holds the epoll-in-epoll edges; `ELOOP` for a cycle or a path longer
+    than `EP_MAX_NESTS`, 4 edges, checked downward and upward as Linux
+    v6.17's `ep_loop_check` (lumen-epoll's `LoopCheck`).
+  - **Polling an inner epoll:** an epoll file's `Pollable::poll` is
+    lumen-epoll's nested protocol (the inner `mtx`, `begin_scan`, each
+    interest polled without a waker, `finish_peek`). It returns `POLLIN |
+    POLLRDNORM` when `PeekDone::ready`. Its `mtx` is taken under the
+    outer's: section 9's outer-before-inner rule along a chain, which
+    `LoopCheck` keeps acyclic.
+  - **The nested notify:** on every source wake that passed the mask
+    (above), an epoll's waker wakes `wq` (a 10f lock: allowed) and defers
+    the notify of the epoll file's own `PollHead` through `PollDefer` (the
+    readiness interface above).
+  - **The legacy console's notify** still runs in IRQ 4
+    (`serial_in::on_irq` → `queue_waiting`; devfs's console `pollable`
+    subscribes there on serial, `vfs/devfs.rs:432`), so its drained epolls
+    notify from interrupt context too, taking only level-10e and 10f
+    locks: section 9's serial-bridge exception.
+- **Tested by** `cargo:lumen-epoll` (#461), `cargo:lumen-vfs`
+  (`PollDefer`: a deferred entry runs once after the subscriber lock is
+  released; two notifies racing to queue one entry run it at least once
+  after both wakes), `poll_masks_of_each_file_kind` (B5 adds an epoll
+  file's row), and these ktests:
+  - `ktest:lumen_kernel::linux::epoll::interest_outlives_a_closed_dup_and_goes_with_the_last`;
+  - `ktest:lumen_kernel::linux::epoll::nested_notify_is_deferred_past_the_source_lock`
+    (a waker that try-locks the source's `PollHead` from the deferred run
+    succeeds; under the mutant that notifies inline the try-lock fails
+    and the ktest's assertion fails, with no hang);
+  - `ktest:lumen_kernel::linux::epoll::epoll_ctl_errors_in_linux_order`;
+  - `ktest:lumen_kernel::linux::epoll::copy_out_fault_unreports_the_rest`;
+
+  and `scenario:test_linux_io::test_epoll_edge_and_level_triggered`
+  (section 15).
+
+### `eventfd` and `timerfd` (B6; designed in #450, M9)
+
+`kernel/src/linux/evfd.rs` puts lumen-eventfd's counters (#468) behind
+anonymous inodes (`anon_inode:[eventfd]`, `anon_inode:[timerfd]`).
+
+- Both objects live in their description's `KernelFile::anon`
+  (`AnonObj::EventFd`, `AnonObj::TimerFd`), answered by
+  `KernelFile::pollable()` (B0).
+- **`eventfd`:** `EventFd { counter: SpinLock<EventCounter>, readers: WaitQueue, writers: WaitQueue, poll: KernelPollHead }`
+  (the counter a 10c leaf).
+  - A `read` or `write` of fewer than 8 bytes is `-EINVAL`.
+  - `write` copies its value in before the lock. `EventCounter::write`'s
+    `WouldBlock` waits (interruptible, `-ERESTARTSYS`) or is `-EAGAIN`, and
+    `u64::MAX` is `-EINVAL`.
+  - `read` takes the value (or 1 with `EFD_SEMAPHORE`) under the lock and
+    copies it out after. A fault then is `-EFAULT` with the value
+    consumed, as Linux's `eventfd_read`. An empty counter waits or is
+    `-EAGAIN`.
+  - **The mask:** `POLLIN` when the count is non-zero, `POLLOUT` below
+    `MAX_COUNTER`. Each change wakes the other side and notifies the
+    `PollHead` after the lock is released.
+- **`timerfd`:** `TimerFd { count: SpinLock<TimerCount>, clock: TimerClock, wq: WaitQueue, poll: KernelPollHead, instance: u64 }`.
+  - **`TIMERS` entries:** the timerfd's deadlines go in `linux::timer`'s
+    `TIMERS` (section 8's C13). B6 widens its `Entry` from
+    `(Weak<Process>, TimerId)` to a target enum with a
+    `TimerFd(Weak<TimerFd>)` arm, keyed `(deadline, 0, instance)`.
+  - **`Requeue`:** every `TimerCount` method that can move the deadline
+    (`arm`, `arm_realtime`, `settime`, `disarm`, `on_expiry`, `read`)
+    returns a `#[must_use] Requeue { remove, insert }`. `TimerCount` keeps
+    the key it last queued to itself, so `remove` is always the entry in
+    `TIMERS` (never a recomputed deadline). The caller updates the
+    counter first, then, with the counter's lock still held, takes
+    `TIMERS`, removes `remove` and inserts `insert` (the lock order of
+    section 9's 10c note). A stale entry that fires early is harmless:
+    `on_expiry` before the deadline does nothing.
+  - **Arming:** `settime` calls `TimerCount::settime` with an
+    `ITimer { value, interval }` in nanoseconds, which picks
+    `arm_realtime` for an absolute `CLOCK_REALTIME` setting and `arm`
+    otherwise, and applies the `Requeue`. `close` calls `disarm` and
+    applies its `Requeue`.
+  - **Expiry:** the `timers` worker moves expired entries out of `TIMERS`
+    first, then for each calls `on_expiry(now)` under the timerfd's lock
+    and applies the `Requeue`. While expiries are unread the timer has no
+    entry (`next_wakeup` is `None`, as Linux's `timerfd_tmrproc` returns
+    `HRTIMER_NORESTART`); the `read` that takes them re-enters an interval
+    timer's next deadline through its own `Requeue`. After releasing the
+    lock the worker wakes readers and notifies the `PollHead`.
+  - **Clocks:** `TIMERS` counts in monotonic nanoseconds, so a
+    `CLOCK_REALTIME` setting is converted when armed (Lumen has no
+    `clock_settime`, so the offset never moves), and `CLOCK_BOOTTIME` is
+    monotonic (Lumen doesn't suspend).
+  - **`read`:** the 8-byte expiry count (`TimerCount::read`, which also
+    counts expiries already due that the worker hasn't seen), `-EINVAL`
+    under 8 bytes, `-EAGAIN` or a wait when none. `gettime` is
+    `TimerCount::get`.
+  - **The mask:** `POLLIN` when `TimerCount::readable(now)` holds (unread
+    expiries, or a deadline already passed).
+  - Expiries come at the timer tick's granularity, so tests assert counts
+    of at least the expected (a floor) and never at most.
+- **Tested by** `cargo:lumen-eventfd` (#468),
+  `ktest:lumen_kernel::linux::evfd::timerfd_expiries_count_on_the_timers_worker`
+  (an interval timer read after at least three intervals reports at least
+  3; a disarmed one reports nothing) and
+  `scenario:test_linux_io::test_eventfd_and_timerfd` (section 15).
 
 ## 11. GUI and the automation API (built in M4: designed in #146, built by #147 to #157)
 
@@ -10785,7 +12258,7 @@ kernel. The kernel is the trusted computing base.
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
-| Linux ABI conformance (M7+) | upstream `musl` `libc-test` (M8), gVisor syscall suites (M9–M10), and targeted LTP cases plus unmodified Alpine `ext4` runtime tests | `tests/scenarios/test_linux_*`, `test_alpine.py`, `test_conformance.py`, `test_runtimes.py` |
+| Linux ABI conformance (M7+) | upstream `musl` `libc-test` (M8), gVisor's socket subset (M9, D4) and syscall suites (M10), and targeted LTP cases plus unmodified Alpine `ext4` runtime tests | `tests/scenarios/test_linux_*`, `test_alpine.py`, `test_conformance.py`, `test_runtimes.py` |
 
 **CI tiers, `status.py` feature gate, and deterministic disk images (M7–M10, #230, #246).**
 Starting in M7, Linux-userspace tests run against a deterministic, pre-baked
@@ -10887,11 +12360,13 @@ Because M10's full compiler/runtime tests (multi-file C++20 builds, `go build`,
 reclaim, and full gVisor/LTP suites) require 2–4 GiB guests and would take tens
 of minutes under TCG software emulation (which `ci.yml` uses on failure re-runs
 and macOS uses locally), CI and `status.py` split into two tiers before M10
-issues are filed while keeping `status.py` strictly stateless (Hard Rules 1
+issues are filed (M9's D0 builds the split for D4's gVisor suite, designed
+in #450) while keeping `status.py` strictly stateless (Hard Rules 1
 and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`):
 
 1. **Separate JUnit outputs & feature-gate schema (`tests/features/*.toml` +
-   `status.py`):** every feature defaults to `tier = "pr"`; M10 heavy features
+   `status.py`):** every feature defaults to `tier = "pr"`; M9's gVisor
+   suite (D4) and M10's heavy features
    declare `tier = "heavy"` and their scenarios carry `@pytest.mark.heavy`.
    `make test-scenarios` runs `-m "not heavy"` and writes
    `build/test-results/scenarios.xml`; a new `make test-heavy` target runs
@@ -10900,7 +12375,8 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
    other. `status.py::collect_results()` merges both XML files when present,
    and `status.py` gains `--tier pr|heavy|all`.
 2. **PR gate (fast, KVM, `ci.yml`):** runs `make test-scenarios` (`-m "not
-   heavy"`), `audit:flags`, host tests, ktests, M0–M9 scenarios, and
+   heavy"`), `audit:flags`, host tests, ktests, M0–M9 scenarios (M9's
+   gVisor suite aside: D4, heavy), and
    lightweight M10 smoke tests (`test_go_run_smoke`, `test_rustc_tiny_smoke`,
    `test_node_eval_smoke`), gated by `make status-check`
    (`status.py --check --tier pr`), keeping the 10-minute TCG failure re-run.
@@ -11676,7 +13152,7 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `strptime`, `wordexp`, `regex-backref-oob`, `regexec-backref`, each static
   and dynamic; likely fixed in musl after 1.2.5), 4 PI-futex failures
   (#397: `pthread_mutex_pi` and `pthread_robust`, each linkage), 6 SysV IPC
-  failures (#432), and 2 socket failures (#434, M9).
+  failures (#432), and 2 socket failures (#434, which M9's C5 removes).
   The native reference set remains 274 passes out of 284 (`NATIVE_PASS`
   in `tests/harness/test_libctest.py`); the 10 #398 failures are not missing
   Lumen interfaces.
@@ -11709,6 +13185,318 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   The gates' outer timeouts are generous (the busy-host rule allows only
   outer limits); the TCG re-run's 10-minute step may not finish D2 or D4
   after a failure, which it annotates and doesn't fail on.
+
+**M9's tests (designed in #450).**
+
+- **Scenario files:**
+  - `tests/scenarios/test_net.py` (new, B0: sockets, the stack, `AF_UNIX`,
+    ICMP, stress);
+  - `test_linux_io.py` (`epoll`, `eventfd`, `timerfd`);
+  - `test_linux_proc.py` (C7);
+  - `test_conformance.py` (D4);
+  - `test_alpine.py` (D1–D3).
+- **Feature files:**
+  - `net.toml` (B1–B4, C1–C6, C8, and D4's row with `tier = "heavy"`; the
+    lumen-net, lumen-sockabi and lumen-unix crate rows);
+  - `epoll.toml` (B5, B6; lumen-epoll's and lumen-eventfd's rows);
+  - `process.toml` (C7);
+  - `harness.toml` (D0);
+  - `user.toml` (B0's ABI and census tests, and the gates beside M8's).
+  - A parametrized test's row has a `[*]` suffix.
+- **The network fixture:** every `test_net` scenario and gate boots with
+  #463's `NetFixture` (`Devices(net=True)`, `restrict=on`, `ipv6=off`, its
+  services reached over `guestfwd` on per-run Unix sockets, never host
+  ports), so parallel workers can't collide. The loopback checks run with
+  the NIC present too, which is how they show the two interface sets
+  apart.
+- **`tools/linux-m9/` test programs:** `m9_net` (TCP, UDP and ICMP
+  checks), `m9_unix` (`AF_UNIX`), `m9_io` (`epoll`, `eventfd`, `timerfd`),
+  `m9_proc` (C7) and `dnsd` (C3; the loopback DNS responder: A and AAAA for one
+  name, given on its command line). They are built and staged as
+  `tools/linux-m8/`'s are, print one `ok <check>` line per check, and name
+  the first failure; a check about a syscall calls it by number.
+- **Timed checks** obey the busy-host rule (CLAUDE.md, section 7's TCP
+  timers):
+  - `SO_RCVTIMEO`, `epoll_wait`'s timeout and a blocked `connect` each
+    lasted at least their time (a floor), never at most;
+  - a timerfd's expiry count is at least the intervals waited;
+  - no TCP check names a time, and no test asserts a throughput (C8
+    records it);
+  - exact timer rules (TIME-WAIT's rebind refusal, the TCP timeouts) are
+    host tests in `cargo:lumen-net` over a made-up `Instant`.
+- **Nothing left to chance:**
+  - A check that a peer is blocked first sees it blocked (the `ps`
+    command), as M8's.
+  - A RST check makes the RST deterministically (`SO_LINGER` 0, or a
+    close with unread data), and never relies on a timeout.
+  - A burst against a listener is at most `LISTEN_POOL_MAX` connects,
+    against a backlog of at least the burst less one, and starts only once
+    the previous burst is accepted; no check asserts a dropped SYN.
+  - A signal that should interrupt a wait is sent once the waiter is seen
+    blocked; a "pending before the call" check blocks it first and sends
+    it before the call.
+  - A leak check runs two rounds of the same load: after each, it polls
+    the `net` command until socket memory is back to idle, and then the
+    free-frame count and the heap's in-use bytes after round 2 must equal
+    those after round 1 (round 1 absorbs one-time growth).
+  - A negative check has a positive control.
+
+**What each test checks** (each check tagged with the issue that adds it):
+
+- `ktest:lumen_kernel::linux::m9_abi_constants_match_spec` and
+  `harness:test_syscalls::test_m9_table_covers_the_census` (B0): section
+  8's numbers, flags and layouts; every census syscall in a table or
+  `ENOSYS_BY_DECISION`.
+- `ktest:lumen_kernel::net::sock::socket_and_socketpair_dispatch_by_family`
+  (B1): unsupported families `-EAFNOSUPPORT`, bad type flags `-EINVAL`,
+  `SOCK_CLOEXEC`/`SOCK_NONBLOCK` on the description, `fstat`'s
+  `S_IFSOCK`, `/proc/<pid>/fd`'s `socket:[ino]`.
+- `ktest:lumen_kernel::net::sock::socket_io_and_poll_reach_sockops` (B1): a
+  test `SockOps` sees `read`, `write`, `readv`, `writev`, `FIONREAD` and
+  `poll` as its own calls.
+- `ktest:lumen_kernel::net::config::net_cmdline_parses_off_dhcp_and_static`
+  (B4): `lumen.net=` forms and errors over made-up command lines.
+- `scenario:test_net::test_virtio_net_frames` (B2): the `net` command shows
+  the device's MAC and link up. `net selftest` sends an ARP request for
+  10.0.2.2 and gets slirp's reply naming `52:55:0a:00:02:02` (the exact
+  MAC is the positive control that the frame came from slirp, not an
+  echo). The scenario then polls `net` until the transmit buffers are all
+  free again.
+- `ktest:lumen_kernel::net::stack::loopback_tcp_echo_through_the_net_thread`
+  (B3): two in-kernel sockets over 127.0.0.1 and ::1 exchange 64 KiB in
+  both directions through `NetStack`, with only the thread polling.
+- `ktest:lumen_kernel::net::stack::readiness_notifies_after_the_stack_lock`
+  (B3): a test waker asserts in `wake` that the current thread doesn't
+  hold the stack lock (a ktest-only seam B3 adds, `NetStack::held_by_me`,
+  from an owner field it records when built with `ktest`); the mutant that
+  notifies under the lock fails it.
+- `ktest:lumen_kernel::net::stack::listen_pool_refills_between_polls` (B3):
+  a pool of 4 takes three bursts of 4 connects, each burst started after
+  the previous one is accepted (lumen-net's host tests cover the absence
+  of allocation under the lock).
+- `ktest:lumen_kernel::net::stack::socket_limits_give_enobufs` (B3): with a
+  ktest budget of 1 MiB, the socket that would pass it is `-ENOBUFS` and
+  the budget is unchanged; with the slots of a set used up, the next is
+  `-ENOBUFS`; positive controls below each limit succeed.
+- `scenario:test_net::test_dhcp_dns_and_loopback` (B4 creates it; checks
+  that need socket syscalls are added by the issues that bring them):
+  - the DHCP log line names 10.0.2.15/24, router 10.0.2.2 and DNS
+    10.0.2.3, and the `net` command shows the lease (B4);
+  - two more boots: `lumen.net=10.0.2.20/24,gw=10.0.2.2` shows that static
+    address in `net` and logs no DHCP line; `lumen.net=off` shows `eth0`
+    down while loopback works (B4);
+  - a fixture name from `/etc/hosts` resolves through musl without DNS
+    (B4);
+  - `dnsd` on 127.0.0.1:53 answers musl's `getaddrinfo` for its name, A
+    and AAAA, through the test copy's `resolv.conf` (`nameserver
+    127.0.0.1`) (C3);
+  - TCP to the fixture's echo service (`echo.lumen.test:7`) over `eth0`
+    echoes, and TCP echo over 127.0.0.1 and ::1 works with the NIC present
+    (C4).
+- `scenario:test_net::test_ipv4_and_ipv6_tcp_echo` (C4):
+  - servers on 127.0.0.1, ::1 and the wildcard; a dual-stack `::` listener
+    accepts an IPv4 client and reports its v4-mapped name;
+  - 1 MiB echoed intact (a checksum both ways); 8 simultaneous clients;
+  - a closed port `ECONNREFUSED`; a non-blocking connect's
+    `-EINPROGRESS`, then `-EALREADY` from a second connect, then `POLLOUT`
+    and `SO_ERROR` 0, then `-EISCONN`;
+  - `poll`'s masks through a connection's life (section 7's table): a new
+    socket, connecting, connected with and without data, after the peer's
+    FIN (`POLLRDHUP`), after a reset (`POLLERR`, then `POLLHUP`);
+  - `SO_LINGER` 0 and `close`, and a close with unread data, each give the
+    peer `ECONNRESET`;
+  - after `SHUT_WR` the peer reads EOF and can still reply; after
+    `SHUT_RD`, `recv` returns 0;
+  - a send after the peer's close: `-EPIPE` with `SIGPIPE`, and without it
+    under `MSG_NOSIGNAL`;
+  - `listen(fd, 7)` queues 8 connections before any `accept`;
+  - the same echo over `eth0` to the fixture.
+- `scenario:test_net::test_udp_datagrams_over_loopback` (C3):
+  - datagrams over 127.0.0.1 and ::1 keep their boundaries;
+  - `MSG_PEEK`, then a read of the same datagram; `MSG_TRUNC` returns the
+    full length;
+  - a connected socket filters other senders, and `AF_UNSPEC`
+    disconnects;
+  - a 65507-byte datagram over `lo` arrives, a 65508-byte one is
+    `-EMSGSIZE`;
+  - an ephemeral port lies in 32768–60999;
+  - a non-blocking `recvmsg` with no data is `-EAGAIN`, and `poll` wakes
+    when one arrives (musl's resolver pattern).
+- `scenario:test_net::test_bsd_socket_options_and_nonblocking` (C5):
+  - every option in section 8's list round-trips: `SO_RCVBUF` set to N
+    reads 2N, clamped at both ends; read-only options refuse writes as
+    Linux;
+  - a rebind over TIME-WAIT: the check first sees the port listed in the
+    `net` command's TIME-WAIT ports (B3's command lists them), then
+    rebinds with `SO_REUSEADDR` and succeeds (the refusal without it is
+    `cargo:lumen-net`'s, over a made-up `Instant`); two
+    `SO_REUSEPORT` binds succeed; `IPV6_V6ONLY` decides whether `::` and
+    0.0.0.0 conflict;
+  - non-blocking by `SOCK_NONBLOCK`, `fcntl` and `FIONBIO`: `-EAGAIN` from
+    `recv` and `accept`;
+  - libc-test's two socket tests (#434) pass in
+    `test_musl_libc_test_core`, their xfail entries removed;
+  - `SO_RCVTIMEO` waits at least its time and gives `-EAGAIN`; with an
+    hour's `SO_RCVTIMEO`, a signal sent once the reader is blocked gives
+    `-EINTR`; in an untimed wait with `SA_RESTART` the call restarts and
+    completes;
+  - a blocking `connect` to 192.0.2.1 over `eth0` (slirp drops it) with a
+    short `SO_SNDTIMEO` returns `-EINPROGRESS` after at least that time;
+  - a timed `send` into a full peer: the peer sets a small `SO_RCVBUF` and
+    doesn't read; the sender sends non-blocking until `-EAGAIN` and polls
+    until the peer's `FIONREAD` equals its receive buffer (the window is
+    closed), sends non-blocking again until `-EAGAIN` (its own buffer is
+    full), and then a blocking `send` with `SO_SNDTIMEO` returns `-EAGAIN`
+    after at least that time;
+  - `getsockname` and `getpeername` truncate as Linux;
+  - `sendmsg`/`recvmsg` with several spans, `MSG_WAITALL` and `msg_flags`.
+- `scenario:test_net::test_af_unix_and_scm_rights` (C1, C2):
+  - stream, datagram and seqpacket over `socketpair` and over path and
+    abstract names (C1);
+  - a path socket on `/tmp` and on the ext4 root, `stat` saying
+    `S_IFSOCK`; `unlink` while bound keeps the connection and frees the
+    name; autobind's abstract name; `SO_PEERCRED`'s pid; `ECONNREFUSED`
+    for a stale node; shutdown and EOF; `FIONREAD` (C1);
+  - `SCM_RIGHTS`: a pipe end and a socket passed across `fork`ed
+    processes, read through the received descriptor;
+    `MSG_CMSG_CLOEXEC`; a short control buffer gives `MSG_CTRUNC` and the
+    extra descriptor closed (the pipe's reader sees EOF once the sender
+    closes its copy); `SCM_CREDENTIALS` with `SO_PASSCRED`; with
+    `RLIMIT_NOFILE` lowered to 8 and one descriptor a message, the ninth
+    send succeeds and the tenth is `-ETOOMANYREFS`; an unreachable in-flight cycle holding a pipe's
+    write end collected: the pipe's reader sees EOF and the heap's in-use
+    bytes return to before (two rounds, as the leak rule) (C2).
+  - After the scenario, `e2fsck -fn` on the image passes.
+- `scenario:test_net::test_ping_over_loopback` (C6): busybox `ping -c 3`
+  as root (`SOCK_RAW`) to 127.0.0.1 and to ::1 gets 3 replies each;
+  `m9_net` sends echo requests over ping sockets to 127.0.0.1 and ::1 and
+  gets back messages with its identifier, each of type echo reply (0 or
+  129), never its own request.
+- `scenario:test_linux_io::test_epoll_edge_and_level_triggered` (B5):
+  - level-triggered keeps reporting a readable pipe until drained;
+    edge-triggered reports once per new write; `EPOLLONESHOT` reports
+    once until `MOD`;
+  - `epoll_ctl`'s errors in Linux's order (`-EPERM` for a regular file,
+    `-EINVAL` for a `dup` of `epfd`); `EPOLLEXCLUSIVE` accepted on `ADD`
+    and refused on `MOD` (`-EINVAL`);
+  - closing one `dup` keeps the interest and closing both removes it;
+    `fork` shares the set;
+  - `/proc/self/fd` names `anon_inode:[eventpoll]` (and B6's
+    `anon_inode:[eventfd]`, `anon_inode:[timerfd]`);
+  - a nested epoll reports its inner's readiness; a chain of five
+    instances is accepted and a sixth is `-ELOOP`, as is a cycle; `poll`
+    on an epoll fd wakes;
+  - `epoll_wait`'s timeout waits at least its time;
+  - `epoll_pwait`'s mask: a signal blocked by the caller, made pending
+    before the call and unblocked only by its mask, interrupts it at once
+    with `-EINTR`; one sent once the caller is blocked does too;
+    `epoll_pwait2`'s `timespec` waits at least its time;
+  - a socket, an eventfd and a timerfd in one set (tagged C8, which
+    depends on B5, B6 and C4).
+- `scenario:test_linux_io::test_eventfd_and_timerfd` (B6):
+  - eventfd counter and semaphore modes; blocking and non-blocking reads
+    and writes; the overflow wait; `poll`'s masks;
+  - a one-shot and an interval timerfd on `CLOCK_MONOTONIC`, read counts
+    at least the intervals waited; `TFD_TIMER_ABSTIME` on `CLOCK_REALTIME`
+    set 200 ms ahead: a blocking read returns 1 no earlier than that
+    realtime, and an absolute time already past expires without the
+    caller waiting for it: a blocking `read` returns 1 (no time asserted;
+    the count lands at the worker's next pass); `gettime` after disarm
+    reads zero; both under
+    `poll` (their epoll check is C8's, above).
+- `scenario:test_linux_proc::test_m9_small_syscalls` (C7):
+  - `sendfile` from a file to a pipe and to a unix socket (C7 depends on
+    C1), with and without an offset;
+  - `copy_file_range` within and across files (`-EXDEV` across
+    superblocks);
+  - `getresuid`/`getresgid` read zeros;
+  - `madvise(MADV_FREE)` keeps the contents; an unmapped range is
+    `-ENOMEM` and a file mapping `-EINVAL`;
+  - `CLOCK_PROCESS_CPUTIME_ID` and `CLOCK_THREAD_CPUTIME_ID` advance by at
+    least a tick across a spin of several ticks;
+  - `membarrier(0x10)` stays `-ENOSYS`.
+- `scenario:test_net::test_connection_and_epoll_stress` (C8):
+  - 500 sequential connections and 50 bursts of 8 over loopback, on all
+    CPUs;
+  - one epoll set over 1000 descriptors (pipes and eventfds) per process
+    in 4 processes;
+  - two rounds of that load under the leak rule above (socket memory back
+    to idle; frames and heap in-use bytes equal after both rounds);
+  - loopback throughput is printed and recorded in the PR, never
+    asserted.
+- The gates (D1–D4):
+  - D1: `scenario:test_alpine::test_apk_and_curl_https_local`: `apk add`
+    from the fixture's signed repository (`repo.lumen.test` over HTTPS,
+    its key in the test copy) and `curl` from `https.lumen.test` with the
+    run's test CA, names from `/etc/hosts`;
+  - D2: `scenario:test_alpine::test_python3_asyncio_sqlite_and_c_ext`: an
+    asyncio echo server and client over loopback, `sqlite3`, and a C
+    extension built in the guest with setuptools and imported;
+  - D3: `scenario:test_alpine::test_ruby_http_fibers_and_native_gem`:
+    `Net::HTTP` against a local `TCPServer` and the fixture's
+    `http.lumen.test`, `Fiber`s, and a native gem built and installed from
+    a local `.gem`;
+  - D4: `scenario:test_conformance::test_gvisor_socket_suite` (below).
+
+- **The gVisor subset (D4; A5, #454, #465).** #465 builds 34 gVisor test
+  binaries (socket, epoll, eventfd and timerfd families) with the pinned
+  zig, statically, without Bazel: 63,219,424 bytes. A first native run
+  (workflow run 46062869835, batched) measured all 8,324 listed cases:
+  7,950 pass, 374 skip, 0 fail, 0 timeout. The set is
+  `tests/conformance/gvisor-native.txt` (the pass IDs, and the skips as
+  `# skip:` lines; `# fail:` lines are allowed, none today), and
+  `gvisor-reference.yml` gates on it. The first per-case root run (below)
+  re-records it, and may change those counts.
+  - **The native reference is measured as D4 runs on Lumen:** one case per
+    process (`--gtest_filter=<case>`), each in a fresh network namespace
+    with `lo` up (as gVisor's runner does, and as a Lumen boot starts
+    clean: without it, TCP pair helpers reuse ports a previous case left
+    in TIME_WAIT), as root. Its report records the
+    uid, euid and capability masks, the mode, the zig version and the
+    kernel, and `gvisor record` refuses a run that isn't complete,
+    per-case and root.
+  - **The image:** D4 runs on its own small image, `make rootfs-gvisor`
+    (`build/alpine-gvisor.ext4`: the minirootfs and the binaries). The
+    binaries would fit the developer image's 65.6 MiB free space with
+    only about 5 MiB to spare.
+  - **The runner** runs each case in its own process
+    (`--gtest_filter=<case>`), with a watchdog per case (300 s in the
+    native runner): an outer limit on a hang, generous enough that no slow
+    pass meets it.
+    - **Outcomes:** PASS, FAIL, SKIP, TIMEOUT and ERROR (a crash, or a
+      case that started and never finished).
+    - **Reruns:** every TIMEOUT runs once more, and so does a FAIL under a
+      `flaky` entry; the rerun decides, whatever it gives. The first
+      attempt is kept only in the report.
+  - **`tests/conformance/gvisor-xfail.txt`:** each entry carries a case,
+    a kind, a reason and an issue. The kinds: `fail` (the default, allows
+    FAIL), `skip` (allows SKIP), `timeout` (allows TIMEOUT after the
+    rerun: a deterministic hang) and `flaky` (allows PASS, FAIL or
+    TIMEOUT). No kind excuses an ERROR or a missing result. Every entry's
+    binary must exist in the build (`check_xfail_binaries`), and an entry
+    for a case the baseline doesn't list fails as stale.
+  - **D4's bar:** every baseline pass (`gvisor-native.txt`) passes on
+    Lumen, minus the reviewed xfail entries. A case the baseline marks
+    `# skip:` may skip or pass without an entry. A missing result, or a
+    case the baseline doesn't list, fails the test. The self-tests are
+    `harness:test_gvisor::test_a_timed_out_case_is_run_once_more` and
+    `harness:test_gvisor::test_a_flaky_entry_covers_a_fail_or_timeout_never_an_error`.
+- **Which gates need the heavy tier (D0).** The tier (`tier = "heavy"`,
+  `@pytest.mark.heavy`, `make test-heavy`, `status.py --tier`, a KVM-only
+  workflow) doesn't exist yet; D0 builds it as this section's tier
+  description gives it.
+  - **D4 runs there:** thousands of process launches, and its own image
+    (its `net.toml` row has `tier = "heavy"`).
+  - **D1 stays in the PR tier.**
+  - **D2 and D3 start in the PR tier.** Each PR records its KVM CI time,
+    and one that passes a third of the job's 30-minute limit moves to
+    the heavy tier in an issue of its own (M8's rule).
+  - The gates boot the developer image (#462: 524 MiB, curl 8.14, python3
+    3.12, ruby 3.3; a per-test copy) with 512 MiB of guest RAM.
+  - **A3's open measurement:** the dirty pages of D2's C-extension and
+    D3's gem builds, against the 64 MiB `admit_unreclaimable` cap. Their
+    static load-segment footprints are 19.3 MiB (python3) and 13.7 MiB
+    (ruby).
 
 QEMU exit codes: 33 = tests passed, 35 = a test failed (or `lumen.ktest=` selected none), 37 = crash report.
 A triple fault exits with 0 (`-no-reboot`) and therefore fails; the power-off
