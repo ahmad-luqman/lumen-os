@@ -122,6 +122,7 @@ lumen-futex = { path = "crates/lumen-futex" }
 lumen-signal = { path = "crates/lumen-signal" }
 lumen-pipe = { path = "crates/lumen-pipe" }
 lumen-tty = { path = "crates/lumen-tty" }
+lumen-eventfd = { path = "crates/lumen-eventfd" }
 lumen-epoll = { path = "crates/lumen-epoll" }
 lumen-sockabi = { path = "crates/lumen-sockabi" }
 lumen-unix = { path = "crates/lumen-unix" }

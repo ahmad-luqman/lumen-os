@@ -711,6 +711,22 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   4 bidirectional depth check with refcounted edges) and `Errno`/`EPOLL*`
   constants from `linux-raw-sys` (host-tested, incl. randomized models and
   `tests/zero_alloc.rs`).
+- `crates/lumen-eventfd`: Linux `eventfd` counter and `timerfd` expiry-count
+  logic (M9, #458; #450, PR #469): `EventCounter` (`new`, `write`, `read`,
+  `write_bytes`, `read_bytes`, `readable`, `writable`, `count`,
+  `is_semaphore`, `EventfdFlags`), `TimerCount` (deadlines on the worker's
+  monotonic clock, `u64::MAX` never fires; `ITimer`, `#[must_use] Requeue`,
+  `arm`, `arm_realtime`, `settime`, teardown `disarm`, `on_expiry` matching
+  `lumen_signal::timer::Setting::forward`, read-time forwarding
+  `read`/`read_bytes`/`readable`, `next_wakeup`, `get`, `TimerClock`,
+  `TimerfdCreateFlags`, `TimerfdSettimeFlags`), `itimerspec_to_ns`, error
+  types (`WouldBlock`, `WriteError`, `ReadBytesError`, `InvalidFlags`,
+  `Invalid`, `ClockError`), and UAPI constants (`IO_SIZE`, `MAX_COUNTER`,
+  `KTIME_MAX_NS`, `EFD_{SEMAPHORE,NONBLOCK,CLOEXEC}`,
+  `TFD_{NONBLOCK,CLOEXEC,TIMER_ABSTIME,TIMER_CANCEL_ON_SET}`,
+  `CLOCK_{REALTIME,MONOTONIC,BOOTTIME,REALTIME_ALARM,BOOTTIME_ALARM}`)
+  (host-tested, incl. differential model tests and `Setting` cross-checks in
+  `tests/model.rs` and zero allocations in `tests/zero_alloc.rs`).
 - `crates/lumen-tty`: a terminal line discipline as logic, after Linux's
   n_tty (M8, #340; ARCHITECTURE section 10): `LineDiscipline` (`receive`
   each input byte: canonical editing, echo, `ISIG`'s `JobSignal`; `read`
