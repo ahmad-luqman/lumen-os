@@ -71,6 +71,7 @@ fn d_type(t: InodeType) -> u8 {
         InodeType::BlockDevice => general::DT_BLK,
         InodeType::Fifo => general::DT_FIFO,
         InodeType::Socket => general::DT_SOCK,
+        InodeType::Anon => general::DT_UNKNOWN,
     };
     dt as u8
 }
@@ -1317,6 +1318,7 @@ crate::ktest!(
             (InodeType::BlockDevice, general::DT_BLK),
             (InodeType::Fifo, general::DT_FIFO),
             (InodeType::Socket, general::DT_SOCK),
+            (InodeType::Anon, general::DT_UNKNOWN),
         ];
         for (t, dt) in table {
             kassert_eq!(u32::from(d_type(t)), dt);

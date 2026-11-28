@@ -9,6 +9,7 @@
 //! its ktest, `ext4_crate_smoke`, is in `vfs/tests.rs` with the others of
 //! this file's code).
 
+pub mod anon;
 pub mod devfs;
 pub mod devpts;
 pub mod ext4;
@@ -1011,6 +1012,7 @@ fn vfstest_stat(ctx: &mut Ctx<'_>, path: &str) {
                 InodeType::BlockDevice => "block",
                 InodeType::Fifo => "fifo",
                 InodeType::Socket => "socket",
+                InodeType::Anon => "anon",
             };
             let _ = writeln!(
                 ctx.out,

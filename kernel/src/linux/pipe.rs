@@ -8,7 +8,7 @@
 //! - `PipeObject::pipe` is Lock 0 (`SleepMutex`), held across user copies
 //!   (`peek` / `copy_to_user_partial` / `commit_prefix`; non-blocking chunked writes), never
 //!   taken while holding locks 1–10.
-//! - `KernelFile::pipe_end` and `FifoSlot::inner` are level-10c leaf spinlocks
+//! - `PipePoll::end` and `FifoSlot::inner` are level-10c leaf spinlocks
 //!   (no allocation under either; detached ends and `Arc<PipeObject>`s dropped
 //!   after releasing them).
 //! - `PipeObject::poll` (`KernelPollHead`) is level 10e.
@@ -681,13 +681,13 @@ impl PipeEnd {
     /// Zero except for a nonblocking FIFO reader opened with no writer,
     /// which snapshots w_opens. Otherwise w_opens is at least 1 by the time
     /// open returns, so zero makes a departed writer report HUP immediately.
-    /// KernelFile copies this value to poll without taking its pipe_end lock.
+    /// `PipePoll` copies this value to poll without taking its `end` lock.
     pub fn writer_generation(&self) -> u64 {
         self.writer_generation
     }
 
-    /// Borrow the underlying [`PipeObject`]; KernelFile keeps an Arc copy so
-    /// I/O and polling do not need its pipe_end ownership lock.
+    /// Borrow the underlying [`PipeObject`]; `PipePoll` keeps an Arc copy so
+    /// I/O and polling do not need its `end` ownership lock.
     pub fn pipe(&self) -> &Arc<PipeObject> {
         &self.pipe
     }

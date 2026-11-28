@@ -232,23 +232,26 @@ PLANNED: dict[str, frozenset[str]] = {
         "recvfrom", "sendmsg", "recvmsg", "shutdown", "getsockname", "getpeername", "setsockopt",
         "getsockopt", "epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait",
         "epoll_pwait2", "eventfd", "eventfd2", "timerfd_create", "timerfd_settime",
-        "timerfd_gettime",
+        "timerfd_gettime", "sendfile", "copy_file_range", "getresuid", "getresgid", "madvise",
     }),
     "M10": frozenset({
-        "mremap", "madvise", "memfd_create", "inotify_init", "inotify_init1", "inotify_add_watch",
+        "mremap", "memfd_create", "inotify_init", "inotify_init1", "inotify_add_watch",
         "inotify_rm_watch", "rseq", "io_uring_setup", "io_uring_enter",
         "io_uring_register",
     }),
 }
 # fmt: on
 
-# The syscalls M8 leaves -ENOSYS, each by a decision ARCHITECTURE section 8
-# records ("Stays `-ENOSYS` in M8, and why"): sendfile and membarrier (the
-# callers fall back), clone3 and execveat, futex_waitv, the scheduler-policy
-# calls (no real-time policies), signalfd and signalfd4, and times.
+# The syscalls M8 and M9 leave -ENOSYS, each by a decision ARCHITECTURE section
+# 8 records ("Stays `-ENOSYS` in M8, and why" / "Stays `-ENOSYS` (or refused)
+# in M9, and why"): membarrier (the census calls only register private
+# expedited, which musl ignores), sendmmsg and recvmmsg (no M9 census call),
+# clone3 and execveat, futex_waitv, the scheduler-policy calls (no real-time
+# policies), signalfd and signalfd4 (no census call, not in gVisor's subset),
+# and times.
 # fmt: off
 ENOSYS_BY_DECISION: frozenset[str] = frozenset({
-    "sendfile", "membarrier", "clone3", "execveat", "futex_waitv", "sched_setparam",
+    "membarrier", "sendmmsg", "recvmmsg", "clone3", "execveat", "futex_waitv", "sched_setparam",
     "sched_getparam", "sched_setscheduler", "sched_getscheduler", "sched_get_priority_max",
     "sched_get_priority_min", "sched_rr_get_interval", "signalfd", "signalfd4", "times",
 })
@@ -646,7 +649,27 @@ M8_ARGS: dict[str, int] = {
     "setpriority": 3, "getrusage": 2, "sysinfo": 1, "prctl": 5, "statfs": 2, "fstatfs": 2,
     "clock_getres": 2, "getcpu": 3, "setfsuid": 1, "setfsgid": 1,
 }
+
+# How many arguments each of M9_SYSCALLS takes: Linux's x86-64 signatures
+# (`SYSCALL_DEFINE<n>`), so its arm reads that many registers.
+M9_ARGS: dict[str, int] = {
+    # socket
+    "socket": 3, "connect": 3, "accept": 3, "sendto": 6, "recvfrom": 6, "sendmsg": 3,
+    "recvmsg": 3, "shutdown": 2, "bind": 3, "listen": 2, "getsockname": 3, "getpeername": 3,
+    "socketpair": 4, "setsockopt": 5, "getsockopt": 5, "accept4": 4,
+    # epoll
+    "epoll_create": 1, "epoll_wait": 4, "epoll_ctl": 4, "epoll_pwait": 6, "epoll_create1": 1,
+    "epoll_pwait2": 6,
+    # evfd
+    "timerfd_create": 2, "eventfd": 1, "timerfd_settime": 4, "timerfd_gettime": 2, "eventfd2": 2,
+    # C7
+    "madvise": 3, "sendfile": 4, "copy_file_range": 6, "getresuid": 3, "getresgid": 3,
+}
 # fmt: on
+
+# Expected argument counts for every syscall whose arm is checked for exact
+# register count and exclusivity.
+EXPECTED_ARGS: dict[str, int] = {**M8_ARGS, **M9_ARGS}
 
 # The arms written inline in `dispatch`, calling no handler (M6's), by their
 # first syscall.
@@ -693,8 +716,8 @@ def arm_problems(arms: Iterable[Arm]) -> list[str]:
     - one calling a handler not named after the first syscall of its pattern
       (`sys_<name>`), or more than one, or none (but `INLINE_ARMS`);
     - one reading argument registers other than the first few in order;
-    - an M8 syscall's (`M8_ARGS`) reading other than its argument count, or
-      sharing its arm."""
+    - an M8 or M9 syscall's (`EXPECTED_ARGS`) reading other than its
+      argument count, or sharing its arm."""
     problems = []
     for arm in arms:
         first = arm.names[0]
@@ -702,9 +725,11 @@ def arm_problems(arms: Iterable[Arm]) -> list[str]:
             problems.append(f"{first}: calls {', '.join(arm.handlers) or 'no handler'}")
         if arm.registers != ARG_REGISTERS[: len(arm.registers)]:
             problems.append(f"{first}: reads {', '.join(arm.registers)}")
-        elif first in M8_ARGS and len(arm.registers) != M8_ARGS[first]:
-            problems.append(f"{first}: reads {len(arm.registers)} registers, not {M8_ARGS[first]}")
-        if len(arm.names) > 1 and set(arm.names) & M8_ARGS.keys():
+        elif first in EXPECTED_ARGS and len(arm.registers) != EXPECTED_ARGS[first]:
+            problems.append(
+                f"{first}: reads {len(arm.registers)} registers, not {EXPECTED_ARGS[first]}"
+            )
+        if len(arm.names) > 1 and set(arm.names) & EXPECTED_ARGS.keys():
             problems.append(f"{first}: shares its arm with {', '.join(arm.names[1:])}")
     return problems
 
@@ -715,8 +740,9 @@ _HANDLER = re.compile(
     r"((?:^[ \t]*///[^\n]*\n)*)^(?:pub(?:\([\w ]+\))? )?fn (sys_\w+)\(.*?\)[^{;]*\{\n(.*?)^\}",
     re.DOTALL | re.MULTILINE,
 )
-# What marks a handler as an M8 stub: its doc, "M8 stub, replaced by C7 (#386)."
-STUB_MARK = "M8 stub"
+# What marks a handler as a stub: its doc, "M8 stub, replaced by C7 (#386)."
+# or "M9 stub, replaced by C7 (#484)."
+STUB_MARK = re.compile(r"\b(M\d+) stub\b")
 # The issues a stub's doc names: "replaced by C1 (#380) and C3 (#382)."
 _REPLACED_BY = re.compile(r"replaced by ([^.]*)\.")
 _ISSUE = re.compile(r"\b([BCD]\d+) \(#(\d+)\)")
@@ -724,15 +750,16 @@ _ISSUE = re.compile(r"\b([BCD]\d+) \(#(\d+)\)")
 
 @dataclass(frozen=True)
 class Stub:
-    """An M8 stub (its doc says `STUB_MARK`): its doc's text without the `///`
-    markers, and its body, whitespace collapsed."""
+    """A milestone stub (its doc matches `STUB_MARK`): its doc's text without
+    the `///` markers, and its body, whitespace collapsed."""
 
     doc: str
     body: str
 
 
-def stubs(cluster_sources: Iterable[str]) -> dict[str, Stub]:
-    """The M8 stubs in the cluster files' sources, by syscall. A `fn sys_*`
+def stubs(cluster_sources: Iterable[str], milestone: Milestone | None = None) -> dict[str, Stub]:
+    """The milestone stubs in the cluster files' sources, by syscall (all
+    milestones when `milestone` is None, or only `milestone`). A `fn sys_*`
     this can't read (a one-line body, say) is a `CensusError`: a stub could
     hide there."""
     found = {}
@@ -743,7 +770,7 @@ def stubs(cluster_sources: Iterable[str]) -> dict[str, Stub]:
             raise CensusError(f"a handler of a shape this can't read: {', '.join(names) or '?'}")
         for doc, fn, body in read:
             text = " ".join(re.sub(r"^[ \t]*///", "", doc, flags=re.MULTILINE).split())
-            if STUB_MARK in text:
+            if (m := STUB_MARK.search(text)) and (milestone is None or m.group(1) == milestone):
                 found[fn.removeprefix("sys_")] = Stub(text, " ".join(body.split()))
     return found
 
@@ -775,37 +802,45 @@ def cluster_sources(syscall_dir: Path) -> list[str]:
     return [f.read_text() for f in sorted(syscall_dir.glob("*.rs"))]
 
 
-# A row of ARCHITECTURE section 8's M8 syscall table: `| 122, 123 |
+# A row of ARCHITECTURE section 8's M8 or M9 syscall table: `| 122, 123 |
 # \`setfsuid(uid)\`, \`setfsgid(gid)\` | <its rules> | C12 |`, a `|` inside a
 # cell escaped (`\|`).
 _DESIGN_ROW = re.compile(r"^\| *\d+(?:, *\d+)* *\|.*\| *$", re.MULTILINE)
+_DESIGN_HEADING: dict[Milestone, tuple[str, str]] = {
+    "M8": ("#### M8 processes", "\n#### "),
+    "M9": ("#### M9 sockets", "\n### "),
+}
 
 
-def design_issues(architecture_md: str) -> dict[str, tuple[str, ...]]:
-    """The issues ARCHITECTURE section 8's M8 syscall table names for each of
-    its syscalls (its last column; `—` none), by syscall. A row whose numbers
-    and names disagree is a `CensusError`."""
-    start = architecture_md.find("#### M8 processes")
+def design_issues(architecture_md: str, milestone: Milestone = "M8") -> dict[str, tuple[str, ...]]:
+    """The issues ARCHITECTURE section 8's syscall table for `milestone`
+    names for each of its syscalls (its last column; `—` none), by syscall.
+    A row whose numbers and names disagree is a `CensusError`."""
+    if milestone not in _DESIGN_HEADING:
+        raise CensusError(f"unknown milestone {milestone!r} (expected 'M8' or 'M9')")
+    heading, stop = _DESIGN_HEADING[milestone]
+    start = architecture_md.find(heading)
     if start < 0:
-        raise CensusError("no M8 syscall table in ARCHITECTURE.md")
-    end = architecture_md.find("\n#### ", start + 1)
+        raise CensusError(f"no {milestone} syscall table in ARCHITECTURE.md")
+    end = architecture_md.find(stop, start + 1)
+    section = architecture_md[start:] if end < 0 else architecture_md[start:end]
     rows: dict[str, tuple[str, ...]] = {}
-    for line in _DESIGN_ROW.findall(architecture_md[start:end]):
+    for line in _DESIGN_ROW.findall(section):
         cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)[1:-1]]
         nrs, cell, labels = cells[0], cells[1], cells[-1]
         names = re.findall(r"`(\w+)[(`]", cell)
         numbers = [int(n) for n in nrs.split(",")]
         if [X86_64.get(n) for n in names] != numbers:
-            raise CensusError(f"M8 table: row {nrs} names {', '.join(names)}")
+            raise CensusError(f"{milestone} table: row {nrs} names {', '.join(names)}")
         for name in names:
             rows[name] = tuple(re.findall(r"[BCD]\d+", labels))
     if not rows:
-        raise CensusError("no rows in ARCHITECTURE.md's M8 syscall table")
+        raise CensusError(f"no rows in ARCHITECTURE.md's {milestone} syscall table")
     return rows
 
 
 # The kernel's syscall tables (kernel/src/linux/mod.rs): `pub const M6_SYSCALLS:
-# &[(u32, &str)] = &[ ... ];` and its M7 and M8 siblings, each row
+# &[(u32, &str)] = &[ ... ];` and its M7, M8 and M9 siblings, each row
 # `(general::__NR_<name>, "<name>"),`.
 _TABLE = re.compile(r"pub const (M\d+)_SYSCALLS: &\[\(u32, &str\)\] = &\[(.*?)\];", re.DOTALL)
 _ROW = re.compile(r'\(general::__NR_(\w+), "(\w+)"\),?')
@@ -813,10 +848,10 @@ _ROW = re.compile(r'\(general::__NR_(\w+), "(\w+)"\),?')
 
 def kernel_tables(linux_mod_rs: str) -> dict[str, list[str]]:
     """The syscall names in each of `kernel/src/linux/mod.rs`'s tables, by
-    milestone (`M6`, `M7`, `M8`), in their order (a name twice is kept, for
-    the caller to refuse). A row whose constant and name differ, a name x86-64
-    doesn't have, anything in a table that isn't a row, a table declared in a
-    shape this can't read, or no tables at all is a `CensusError`."""
+    milestone (`M6`, `M7`, `M8`, `M9`), in their order (a name twice is kept,
+    for the caller to refuse). A row whose constant and name differ, a name
+    x86-64 doesn't have, anything in a table that isn't a row, a table declared
+    in a shape this can't read, or no tables at all is a `CensusError`."""
     code = re.sub(r"//[^\n]*", "", linux_mod_rs)
     tables: dict[str, list[str]] = {}
     for milestone, body in _TABLE.findall(code):
@@ -840,7 +875,7 @@ def kernel_tables(linux_mod_rs: str) -> dict[str, list[str]]:
 def uncovered(census_names: Iterable[str], tables: dict[str, list[str]]) -> list[str]:
     """The census's syscalls that are in none of the kernel's tables and not
     -ENOSYS by a recorded decision (`ENOSYS_BY_DECISION`), in number order:
-    M8's table must leave none (ARCHITECTURE section 8)."""
+    each milestone's table must leave none (ARCHITECTURE section 8)."""
     known = set(ENOSYS_BY_DECISION).union(*tables.values())
     return sorted(set(census_names) - known, key=X86_64.__getitem__)
 
@@ -897,7 +932,7 @@ def report(data: dict, implemented: set[str], verbose: bool = False) -> str:
             out += ["", f"{cls} ({len(rows[cls])}):", *rows[cls]]
     out += [
         "",
-        "implemented: the kernel dispatches the number (an M8 stub returning -ENOSYS until",
+        "implemented: the kernel dispatches the number (a stub returning -ENOSYS until",
         "its issue lands is listed under its milestone); neither the arguments",
         "seen nor the semantics (a thread's exit, each ioctl request) are checked. ENOSYS:",
         "-ENOSYS by a decision ARCHITECTURE section 8 records (ENOSYS_BY_DECISION).",
@@ -950,7 +985,7 @@ def _probe_call(syscalls_map: dict, name: str) -> str:
 
 def report_m9(data: dict, tables: dict[str, list[str]], verbose: bool = False) -> str:
     """Compare an M9 census against the M6–M8 kernel tables and ROADMAP's
-    M9/M10 lists, surfacing unplanned calls, M10 rows, M8 `ENOSYS_BY_DECISION`
+    M9/M10 lists, surfacing unplanned calls, M10 rows, `ENOSYS_BY_DECISION`
     calls (plus CPU-time clocks separately), any M8 planned calls missing from
     `tables`, M9 planned calls, M6–M8 table hits, and #450 design probes."""
     m6_m8: set[str] = set().union(*(tables.get(m, ()) for m in ("M6", "M7", "M8")))
@@ -972,7 +1007,7 @@ def report_m9(data: dict, tables: dict[str, list[str]], verbose: bool = False) -
     sections = (
         ("unplanned", "unplanned"),
         ("M10", "M10 rows seen in the M9 census"),
-        ("ENOSYS", "M8 ENOSYS_BY_DECISION seen in the M9 census"),
+        ("ENOSYS", "ENOSYS_BY_DECISION seen in the M9 census"),
         ("M8", "M8 planned"),
         ("M9", "M9 planned"),
         ("implemented", "M6-M8 tables"),

@@ -97,7 +97,7 @@ if [[ -f "$STAGE/usr/local/lib/libm7.so" ]]; then
     PYTHONPATH="$ROOT/tools/harness" uv run --frozen --project "$ROOT" \
         python -m lumen_harness.rootfs "$STAGE/usr/local/lib/libm7.so" --rootfs-dir "$STAGE" --no-interp
 fi
-for bin in m7_test m7_vfs m8_proc m8_io m8_vm ptyrun m8_pty; do
+for bin in m7_test m7_vfs m8_proc m8_io m8_vm ptyrun m8_pty m9_net m9_unix m9_io m9_proc dnsd; do
     if [[ -f "$STAGE/usr/local/bin/$bin" ]]; then
         PYTHONPATH="$ROOT/tools/harness" uv run --frozen --project "$ROOT" \
             python -m lumen_harness.rootfs "$STAGE/usr/local/bin/$bin" --rootfs-dir "$STAGE"

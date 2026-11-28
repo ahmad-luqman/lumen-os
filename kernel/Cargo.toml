@@ -19,7 +19,7 @@ ktest = ["lumen-bcache/test-util", "lumen-proc/test-util"]
 [dependencies]
 ext4plus.workspace = true
 limine.workspace = true
-linux-raw-sys.workspace = true
+linux-raw-sys = { workspace = true, features = ["net"] }
 log.workspace = true
 lumen-acpi.workspace = true
 lumen-app-api.workspace = true
@@ -41,6 +41,7 @@ lumen-queue.workspace = true
 lumen-rand.workspace = true
 lumen-shell.workspace = true
 lumen-signal.workspace = true
+lumen-sockabi.workspace = true
 lumen-synth.workspace = true
 lumen-term.workspace = true
 lumen-time.workspace = true

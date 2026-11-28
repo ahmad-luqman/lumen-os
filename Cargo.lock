@@ -521,6 +521,7 @@ dependencies = [
  "lumen-rand",
  "lumen-shell",
  "lumen-signal",
+ "lumen-sockabi",
  "lumen-synth",
  "lumen-term",
  "lumen-time",

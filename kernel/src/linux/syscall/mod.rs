@@ -67,6 +67,8 @@
 
 mod at;
 mod dir;
+mod epoll;
+mod evfd;
 mod fd;
 mod futex;
 mod io;
@@ -78,6 +80,7 @@ mod pipe;
 mod poll;
 mod proc;
 mod signal;
+mod socket;
 mod stat;
 mod sys;
 mod task;
@@ -203,8 +206,9 @@ fn first_report(nr: u64) -> bool {
     false
 }
 
-/// Log a syscall answered `-ENOSYS` (a number with no arm) once per number,
-/// with its name when one of the kernel's tables has it.
+/// Log an unimplemented syscall (a number with no dispatch arm, or a stub via
+/// [`not_implemented`]) once per boot, with its name when one of the kernel's
+/// tables has it.
 fn log_unknown_once(nr: u64) {
     if first_report(nr) {
         match u32::try_from(nr).ok().and_then(crate::linux::syscall_name) {
@@ -212,6 +216,12 @@ fn log_unknown_once(nr: u64) {
             None => log::debug!(target: "linux", "unimplemented syscall #{nr}"),
         }
     }
+}
+
+/// Log an unimplemented syscall once per boot and return `-ENOSYS`.
+fn not_implemented(nr: u32) -> u64 {
+    log_unknown_once(u64::from(nr));
+    neg_errno(errno::ENOSYS)
 }
 
 /// Dispatch one Linux x86-64 syscall (`rax` = nr, `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` = args).
@@ -754,6 +764,174 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         }
         Ok(general::__NR_setfsgid) => {
             frame.rax = sys::sys_setfsgid(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+
+        // M9 (`crate::linux::M9_SYSCALLS`), by cluster: B0's typed `-ENOSYS`
+        // stubs, replaced by B1, B5, B6 and C7.
+        Ok(general::__NR_socket) => {
+            frame.rax = socket::sys_socket(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_connect) => {
+            frame.rax = socket::sys_connect(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_accept) => {
+            frame.rax = socket::sys_accept(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_sendto) => {
+            frame.rax = socket::sys_sendto(
+                reg(frame.rdi),
+                reg(frame.rsi),
+                reg(frame.rdx),
+                reg(frame.r10),
+                reg(frame.r8),
+                reg(frame.r9),
+            );
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_recvfrom) => {
+            frame.rax = socket::sys_recvfrom(
+                reg(frame.rdi),
+                reg(frame.rsi),
+                reg(frame.rdx),
+                reg(frame.r10),
+                reg(frame.r8),
+                reg(frame.r9),
+            );
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_sendmsg) => {
+            frame.rax = socket::sys_sendmsg(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_recvmsg) => {
+            frame.rax = socket::sys_recvmsg(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_shutdown) => {
+            frame.rax = socket::sys_shutdown(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_bind) => {
+            frame.rax = socket::sys_bind(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_listen) => {
+            frame.rax = socket::sys_listen(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getsockname) => {
+            frame.rax = socket::sys_getsockname(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getpeername) => {
+            frame.rax = socket::sys_getpeername(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_socketpair) => {
+            frame.rax = socket::sys_socketpair(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_setsockopt) => {
+            frame.rax =
+                socket::sys_setsockopt(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getsockopt) => {
+            frame.rax =
+                socket::sys_getsockopt(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_accept4) => {
+            frame.rax = socket::sys_accept4(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_epoll_create) => {
+            frame.rax = epoll::sys_epoll_create(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_epoll_wait) => {
+            frame.rax = epoll::sys_epoll_wait(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_epoll_ctl) => {
+            frame.rax = epoll::sys_epoll_ctl(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_epoll_pwait) => {
+            frame.rax = epoll::sys_epoll_pwait(
+                reg(frame.rdi),
+                reg(frame.rsi),
+                reg(frame.rdx),
+                reg(frame.r10),
+                reg(frame.r8),
+                reg(frame.r9),
+            );
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_epoll_create1) => {
+            frame.rax = epoll::sys_epoll_create1(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_epoll_pwait2) => {
+            frame.rax = epoll::sys_epoll_pwait2(
+                reg(frame.rdi),
+                reg(frame.rsi),
+                reg(frame.rdx),
+                reg(frame.r10),
+                reg(frame.r8),
+                reg(frame.r9),
+            );
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_timerfd_create) => {
+            frame.rax = evfd::sys_timerfd_create(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_eventfd) => {
+            frame.rax = evfd::sys_eventfd(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_timerfd_settime) => {
+            frame.rax = evfd::sys_timerfd_settime(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_timerfd_gettime) => {
+            frame.rax = evfd::sys_timerfd_gettime(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_eventfd2) => {
+            frame.rax = evfd::sys_eventfd2(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_madvise) => {
+            frame.rax = mem::sys_madvise(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_sendfile) => {
+            frame.rax = io::sys_sendfile(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_copy_file_range) => {
+            frame.rax = io::sys_copy_file_range(
+                reg(frame.rdi),
+                reg(frame.rsi),
+                reg(frame.rdx),
+                reg(frame.r10),
+                reg(frame.r8),
+                reg(frame.r9),
+            );
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getresuid) => {
+            frame.rax = sys::sys_getresuid(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getresgid) => {
+            frame.rax = sys::sys_getresgid(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
 

@@ -63,7 +63,7 @@ use lumen_vfs::{AccessMode, DevId, InodeType};
 use lumen_vm::PAGE_SIZE;
 
 use super::at::{Fd, reg};
-use super::neg_errno;
+use super::{neg_errno, not_implemented};
 use crate::linux::{errno, general};
 use crate::mm::user_vm::{MappedFile, Sharing, map_place, prot_from_linux};
 use crate::sched;
@@ -260,6 +260,11 @@ fn msync(addr: u64, length: u64, flags: i32) -> Result<(), u32> {
         }
     }
     if found.hole { Err(errno::ENOMEM) } else { Ok(()) }
+}
+
+/// `madvise(addr, len, advice)` (28): M9 stub, replaced by C7 (#484).
+pub(super) fn sys_madvise(_addr: u64, _len: u64, _advice: i32) -> u64 {
+    not_implemented(general::__NR_madvise)
 }
 
 #[cfg(feature = "ktest")]

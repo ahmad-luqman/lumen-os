@@ -495,6 +495,12 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
     }
+    if !flags.is_path() && file.inode().inode_type() == InodeType::Anon {
+        // Anonymous inodes (`alloc_anon_inode`, Linux `fs/inode.c`) leave
+        // `i_fop = &no_open_fops`: reopening through `/proc/<pid>/fd/N` is
+        // `-ENXIO` unless `O_PATH` is set.
+        return Err(errno::ENXIO);
+    }
     if !flags.is_path() && file.inode().inode_type() == InodeType::Fifo {
         let end = crate::linux::pipe::open_fifo(file.inode(), file.access_mode(), flags.has_nonblock())?;
         file.attach_pipe_end(end);
@@ -548,6 +554,9 @@ fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
         // at 0, whatever is asked (Linux's `null_lseek`; their offset is
         // never read).
         InodeType::CharDevice => Ok(0),
+        // Anonymous inodes (`anon_inodefs`): Linux's `noop_llseek` leaves
+        // `f_pos` unchanged and returns it.
+        InodeType::Anon => Ok(*file.offset.lock()),
         InodeType::Fifo | InodeType::Socket => Err(errno::ESPIPE),
         _ => {
             let mut off = file.offset.lock();

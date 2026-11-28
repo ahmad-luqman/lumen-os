@@ -4845,14 +4845,16 @@ Lumen runs two kinds of user code:
   cluster's module (`fd`, `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's
   `mem` and `proc`; M8's `task`, `signal`, `futex`, `poll`, `pipe`, `timer`
   and `sys`, the clusters listed under "B0's stubs" below, #371, plus
-  `time.rs` (#383) shared by blocking syscalls). M7's and M8's stubs are
-  gone; of the M8 table's rows only `sendfile` and `membarrier` stay
-  `-ENOSYS` (M9's C7 implements `sendfile`; M9's clusters are
-  `syscall/socket.rs`, `epoll.rs` and `evfd.rs`, B0's stubs in the M9
-  subsection below); with `clone3`, `execveat`, `futex_waitv`, the scheduler-policy
-  calls, `signalfd*` and `times` they make up `ENOSYS_BY_DECISION` in
-  `tools/harness/lumen_harness/syscalls.py` ("Stays `-ENOSYS` in M8"
-  below). M7's and M8's handlers follow three rules:
+  and `time.rs` (#383) shared by blocking syscalls). M7's and M8's stubs are
+  gone; M9's 32 new rows live as B0's stubs in `syscall/socket.rs`, `epoll.rs`
+  and `evfd.rs` plus C7's in `io.rs`, `mem.rs` and `sys.rs` (including
+  `sendfile`, moved from M8's `-ENOSYS` list to an M9 stub until C7). Of the
+  M8 and M9 tables' decided refusals, `membarrier`, `sendmmsg`, `recvmmsg`,
+  `clone3`, `execveat`, `futex_waitv`, the scheduler-policy calls, `signalfd*`
+  and `times` make up `ENOSYS_BY_DECISION` in
+  `tools/harness/lumen_harness/syscalls.py` ("Stays `-ENOSYS` in M8" / "Stays
+  `-ENOSYS` (or refused) in M9" below). M7's, M8's and M9's handlers follow
+  three rules:
   1. **Decode first.** An M7 or M8 arm decodes each register with
      `syscall/at.rs`'s `reg` into the handler's parameter type, as Linux
      reads it: an `int`, `mode_t` or flags argument is the register's low
@@ -5312,8 +5314,8 @@ section 7's stack and is a dependency of B2 and B3. The developer image
 
 | Label | Scope | Depends on | Owns (files; interfaces; tests) | Sections |
 |---|---|---|---|---|
-| B0 | the skeleton | #450, #464 | `M9_SYSCALLS` (appended to `linux/mod.rs`), stub modules `syscall/socket.rs`, `syscall/epoll.rs`, `syscall/evfd.rs`, `vfs/anon.rs` (anonymous inodes, dev `0:9`, named `anon_inode:[eventpoll]`, `[eventfd]`, `[timerfd]`), `KernelFile::id` (a global counter), `KernelFile::anon: Option<AnonObj>` (B5 and B6 append their arms) and `KernelFile::pollable()`, which `poll_file` and `epoll_ctl` both use, `syscalls.py`'s `PLANNED`/`ENOSYS_BY_DECISION` changes, empty `tests/scenarios/test_net.py`, `tools/linux-m9/` (modes `m9_net`, `m9_unix`, `m9_io`, `m9_proc`, `dnsd`; in `test_rootfs_dev.py`'s fixture tuple); `cargo:lumen-sockabi` (#464), `ktest:lumen_kernel::linux::m9_abi_constants_match_spec`, `harness:test_syscalls::test_m9_table_covers_the_census` | 8, 15 |
-| B1 | socket file objects and every socket handler | B0 | `kernel/src/net/mod.rs`, `kernel/src/net/sock.rs`: `SockOps`, `block_on`, `InFlightFile`, sockfs (dev `0:8`), `KernelFile::sock`; every handler in `syscall/socket.rs` written once as generic `SockOps` dispatch (address decode, `msghdr`, `CmsgIter`/`CmsgWriter`, slot reservation and install), so families only implement `SockOps`; `socket`/`socketpair` dispatch by family, `read`/`write`/`readv`/`writev` as send and receive, `S_IFSOCK` `fstat`, `/proc/<pid>/fd` `socket:[ino]`, `FIONBIO`, `FIONREAD`; `ktest:lumen_kernel::net::sock::socket_and_socketpair_dispatch_by_family`, `ktest:lumen_kernel::net::sock::socket_io_and_poll_reach_sockops` | 8 |
+| B0 | the skeleton | #450, #464 | `M9_SYSCALLS` (appended to `linux/mod.rs`), stub modules `syscall/socket.rs`, `syscall/epoll.rs`, `syscall/evfd.rs`, `vfs/anon.rs` (anonymous inodes on dev `0:9` sharing one inode number, `InodeType::Anon` with `st_mode == 0600` and no `S_IFMT` bits, `noop_llseek`, `pread64`/`pwrite64` `-ESPIPE`, `/proc/<pid>/fd/N` reopen `-ENXIO` unless `O_PATH`, `mmap` `-ENODEV`, named `anon_inode:[eventpoll]`, `[eventfd]`, `[timerfd]`), `KernelFile::id()` (`OpenFile::id` from `lumen_vfs::next_open_file_id`), `KernelFile::obj: Option<FileObj>` (`Pipe`, `Tty`, `Anon(AnonObj)` with `AnonObj::{kind, pollable, release}` via `release_end`; B1 adds `Sock`, B5 and B6 append `AnonObj` arms) and `KernelFile::pollable()`, which `poll_file` and `epoll_ctl` both use, `syscalls.py`'s `PLANNED`/`ENOSYS_BY_DECISION` changes, empty `tests/scenarios/test_net.py`, `tools/linux-m9/` (modes `m9_net`, `m9_unix`, `m9_io`, `m9_proc`, `dnsd`; in `test_rootfs_dev.py`'s fixture tuple); `cargo:lumen-sockabi` (#464), `ktest:lumen_kernel::linux::m9_abi_constants_match_spec`, `ktest:lumen_kernel::vfs::anon::anon_inodes_report_dev_0_9_and_proc_fd_names`, `ktest:lumen_kernel::linux::syscall::poll::pollable_routes_each_file_kind`, `harness:test_syscalls::test_m9_table_covers_the_census`, `harness:test_syscalls::test_each_m9_stub_returns_enosys_and_names_its_issue` | 8, 15 |
+| B1 | socket file objects and every socket handler | B0 | `kernel/src/net/mod.rs`, `kernel/src/net/sock.rs`: `SockOps`, `block_on`, `InFlightFile`, sockfs (dev `0:8`), `FileObj::Sock(Arc<dyn SockOps>)` (reached through `pollable()` and `release_end`); every handler in `syscall/socket.rs` written once as generic `SockOps` dispatch (address decode, `msghdr`, `CmsgIter`/`CmsgWriter`, slot reservation and install), so families only implement `SockOps`; `socket`/`socketpair` dispatch by family, `read`/`write`/`readv`/`writev` as send and receive, `S_IFSOCK` `fstat`, `/proc/<pid>/fd` `socket:[ino]`, `FIONBIO`, `FIONREAD`; `ktest:lumen_kernel::net::sock::socket_and_socketpair_dispatch_by_family`, `ktest:lumen_kernel::net::sock::socket_io_and_poll_reach_sockops` | 8 |
 | B2 | `NetDevice` and virtio-net | B0, #459's PR 2, #463 | `kernel/src/net/virtio_net.rs` (in `DRIVERS`), `share`'s no-bounce path for recorded DMA runs (`virtio.rs`), the `net` shell command and its `selftest`, `RUNS` if its count needs it; `scenario:test_net::test_virtio_net_frames` | 7 |
 | B3 | the stack and the `net` thread | B1, B2, #459's PR 2 | `kernel/src/net/stack.rs` (`NetStack`, the thread, readiness, listener refill, the SYN filter's kernel side, the `net` command's TIME-WAIT list), `kernel/src/net/inet.rs` (`InetSocket` and its `Proto` enum, whose arms C3, C4 and C6 append; section 7's code block); `cargo:lumen-net` (#459), `ktest:lumen_kernel::net::stack::loopback_tcp_echo_through_the_net_thread`, `ktest:lumen_kernel::net::stack::readiness_notifies_after_the_stack_lock`, `ktest:lumen_kernel::net::stack::listen_pool_refills_between_polls`, `ktest:lumen_kernel::net::stack::socket_limits_give_enobufs` | 7, 9 |
 | B4 | address configuration | B3, #463 | `kernel/src/net/config.rs` (`lumen.net=`, DHCPv4, the lease log line); `ktest:lumen_kernel::net::config::net_cmdline_parses_off_dhcp_and_static`, `scenario:test_net::test_dhcp_dns_and_loopback` (its B4 checks; C3 and C4 add theirs) | 7 |
@@ -5356,8 +5358,7 @@ check per issue), and these append-only regions with named owners:
 option arms (C2's `SO_PASSCRED`, C5's table), lumen-sockabi's `SockOpt`
 variants (C6's ICMPv6 options) and `AnonObj`'s arms (B5, B6).
 `net/inet.rs` is B3's, then C5's (after C3 and C4 merge);
-`linux/process.rs` gains B0's `KernelFile::id` and `anon`, B1's
-`KernelFile::sock`, and B5's `KernelFile::epitems` and release hook. Each issue updates its area's `docs/MAP.md` entry.
+`linux/process.rs` gains B0's `KernelFile::id()` (`OpenFile::id`), `FileObj` (`Pipe`, `Tty`, `Anon(AnonObj)`), `release_end` and `pollable()`, B1's `FileObj::Sock`, and B5's `KernelFile::epitems` and release hook. Each issue updates its area's `docs/MAP.md` entry.
 
 **B0's stubs.** Only new numbers get typed `-ENOSYS` stubs, each issue in
 the last column replacing its own. B0 appends `M9_SYSCALLS` to
@@ -5412,12 +5413,13 @@ syscall is in neither `M6_SYSCALLS`–`M9_SYSCALLS` nor that list.
 | 441 | `epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)` | `epoll_pwait` with a `timespec` (`NULL` waits forever; a bad one `-EINVAL`): not in the census, but gVisor's `epoll_test` (D4) calls it and it shares `epoll_pwait`'s path | B5 |
 
 **The socket file object (B1, `kernel/src/net/sock.rs`).** Every family
-implements one trait, and the handlers reach it through
-`KernelFile::sock: Option<Arc<dyn SockOps>>`, set when the description is
-made (as `pipe` is) and never changed. B1 writes every handler in
-`syscall/socket.rs` once, generic over it: address decoding, `msghdr`,
-`CmsgIter`/`CmsgWriter`, slot reservation and install. C1, C3, C4 and C6
-only implement it, in parallel:
+implements one trait, and the description holds it in `KernelFile::obj` as
+`FileObj::Sock(Arc<dyn SockOps>)` (set when the description is made, as
+`Pipe`, `Tty` and `Anon` are, and never changed), reached by
+`KernelFile::pollable()` and `KernelFile::release_end()`. B1 writes every
+handler in `syscall/socket.rs` once, generic over it: address decoding,
+`msghdr`, `CmsgIter`/`CmsgWriter`, slot reservation and install. C1, C3, C4
+and C6 only implement it, in parallel:
 
 ```rust
 // kernel/src/net/sock.rs (B1)
@@ -5501,7 +5503,20 @@ The rules every implementor keeps:
   UDP, the next datagram's length); other socket requests `-ENOTTY` (the census saw
   only `FIONBIO` and `FIOCLEX`).
 - `fcntl`'s `F_SETFL` `O_NONBLOCK` reaches sockets, epoll, eventfd and
-  timerfd; `lseek` on them `-ESPIPE`.
+  timerfd; `lseek` on sockets is `-ESPIPE`, while anonymous inodes (`epoll`,
+  `eventfd`, `timerfd`) leave the offset unchanged and return it
+  (`noop_llseek`, as Linux v6.12's `eventpoll_fops`/`eventfd_fops`/
+  `timerfd_fops`), refuse `pread64`/`pwrite64` (and `preadv`/`pwritev`) with
+  `-ESPIPE` (no `FMODE_PREAD`/`FMODE_PWRITE` from `alloc_file_pseudo`),
+  refuse reopening through `/proc/<pid>/fd/N` with `-ENXIO` unless `O_PATH`
+  is set (`alloc_anon_inode` leaves `i_fop = &no_open_fops` in Linux
+  `fs/inode.c`), report `st_mode == 0600` with no `S_IFMT` bits
+  (`InodeType::Anon`) and one shared inode number on dev `0:9`
+  (`alloc_anon_inode`), and refuse `mmap` with `-ENODEV`. Keeping per-object
+  mode, owner and advisory locks behind that shared inode number is a
+  deliberate deviation from Linux (which shares one `anon_inode_inode`, so
+  `fchmod` or `flock` on one anonymous file would show on another; no
+  workload depends on that cross-file sharing).
 - `poll`, `ppoll`, `select`, `pselect6` reach every new kind through
   `Pollable`.
 - `mknodat` (259) makes `S_IFSOCK` nodes (C1, section 10), and an `open`
@@ -9721,7 +9736,7 @@ order: a lock may be taken while holding only locks above it.
        Process::mm, Process::files and Process::fs (the Option<Arc> slots),
        Process::exe_path, Process::console and Process::exit (B1's M7
        state), Files::table, FsState::inner, TIMERS, an inode's mappers list
-       (section 5), FIFO slot and `KernelFile::pipe_end` (section 10), and `syscall/lock.rs`'s POSIX_WAITERS (a
+       (section 5), FIFO slot and `PipePoll::end` (section 10), and `syscall/lock.rs`'s POSIX_WAITERS (a
        PosixWaitGraph record's insert and removal allocate and free under
        it; never held with PROCS, an inode's lock or the lock wait queue's);
        from M9: KernelFile::epitems, UNIX_BOUND, UNIX_ABSTRACT,
@@ -10553,13 +10568,14 @@ interface above.
   - `mtx` is Linux's `ep->mtx`, section 9's level 00b. `rq` is Linux's
     `ep->lock`, the 10e leaf nested in a `PollHead`'s subscriber lock.
   - An epoll file is an anonymous inode (B0's `anon_inode:[eventpoll]`)
-    whose description holds the object in `KernelFile::anon`
-    (`AnonObj::Epoll`); `KernelFile::pollable()` (B0) answers for it, for
-    sockets (through `KernelFile::sock`) and for every other kind, and both
-    `poll` and `epoll_ctl` use it. `fork` shares its description, so
+    whose description holds the object in `KernelFile::obj` as
+    `FileObj::Anon(AnonObj::Epoll)`; `KernelFile::pollable()` (B0) answers
+    for it, for sockets (through `FileObj::Sock`) and for every other kind,
+    and both `poll` and `epoll_ctl` use it. `fork` shares its description, so
     parent and child share the interests, as Linux.
 - **Interests are keyed by (description, fd):** `Key = (u64, i32)`, where
-  the `u64` is `KernelFile::id` (B0: a global counter).
+  the `u64` is `KernelFile::id()` (`OpenFile::id`, allocated by
+  `lumen_vfs::next_open_file_id`).
   - **The payload:** an `Interest { target, guard: Option<PollGuard>, mode,
     nested: Option<u64> }`. `target` is a metadata-only reference to the
     description, not counted in `end_refs`, so an interest never keeps a
@@ -10572,10 +10588,15 @@ interface above.
     `EpWatchers::reserve` (outside the lock, may allocate) and `commit`
     (under it) let `EPOLL_CTL_ADD` add an entry without allocating under
     the lock; `DEL` and an epoll's close lower or remove theirs.
-  - **The hook:** `KernelFile`'s end release (`end_refs` from 1 to 0, today
-    `release_pipe_end`) runs `epoll::release_file`. It takes the list out
-    under its lock. If the released file is itself an epoll, it first
-    empties its own set under `EPOLL_LOOPS` and its own `mtx`
+  - **The hook:** `KernelFile::release_end` (`end_refs` from 1 to 0) runs
+    target-side `epoll::release_file` first, before matching `self.obj`, for
+    every description kind (pipes, ttys, sockets, eventfds, timerfds, epolls
+    and inode-pollable files); `AnonObj::release` performs only an anonymous
+    object's own teardown (an epoll instance closing its own set, or B6's
+    timerfd disarming; idempotent so a never-installed `KernelFile`'s `Drop`
+    can call it too). `epoll::release_file` takes the `epitems` list out
+    under its lock. If the released file is itself an epoll, it first empties
+    its own set under `EPOLL_LOOPS` and its own `mtx`
     (`LoopCheck::remove_set`), and releases both. Then, one watcher at a
     time, it takes `EPOLL_LOOPS` (if the released file is an epoll) and
     that watcher's `mtx`, runs `set.remove_range((id, i32::MIN)..=(id,
@@ -10694,9 +10715,10 @@ interface above.
 `kernel/src/linux/evfd.rs` puts lumen-eventfd's counters (#468) behind
 anonymous inodes (`anon_inode:[eventfd]`, `anon_inode:[timerfd]`).
 
-- Both objects live in their description's `KernelFile::anon`
-  (`AnonObj::EventFd`, `AnonObj::TimerFd`), answered by
-  `KernelFile::pollable()` (B0).
+- Both objects live in their description's `KernelFile::obj` as
+  `FileObj::Anon(AnonObj::EventFd)` and `FileObj::Anon(AnonObj::TimerFd)`,
+  answered by `KernelFile::pollable()` (B0) and torn down by
+  `AnonObj::release()` via `KernelFile::release_end()`.
 - **`eventfd`:** `EventFd { counter: SpinLock<EventCounter>, readers: WaitQueue, writers: WaitQueue, poll: KernelPollHead }`
   (the counter a 10c leaf).
   - A `read` or `write` of fewer than 8 bytes is `-EINVAL`.
@@ -13243,10 +13265,17 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 
 **What each test checks** (each check tagged with the issue that adds it):
 
-- `ktest:lumen_kernel::linux::m9_abi_constants_match_spec` and
-  `harness:test_syscalls::test_m9_table_covers_the_census` (B0): section
-  8's numbers, flags and layouts; every census syscall in a table or
-  `ENOSYS_BY_DECISION`.
+- `ktest:lumen_kernel::linux::m9_abi_constants_match_spec`,
+  `ktest:lumen_kernel::vfs::anon::anon_inodes_report_dev_0_9_and_proc_fd_names`,
+  `ktest:lumen_kernel::linux::syscall::poll::pollable_routes_each_file_kind`,
+  `harness:test_syscalls::test_m9_table_covers_the_census`, and
+  `harness:test_syscalls::test_each_m9_stub_returns_enosys_and_names_its_issue`
+  (B0): section 8's numbers, flags and layouts; Linux v6.12 anonymous-inode
+  `fstat`, `lseek`, `pread64`/`pwrite64`, `mmap`, `/proc/<pid>/fd/N` reopen
+  and fd names; `KernelFile::pollable()` routing across pipes, PTYs and
+  inodes; every census syscall in a table or `ENOSYS_BY_DECISION`; and every
+  M9 stub returning `-ENOSYS` for its own number while naming its replacing
+  issues.
 - `ktest:lumen_kernel::net::sock::socket_and_socketpair_dispatch_by_family`
   (B1): unsupported families `-EAFNOSUPPORT`, bad type flags `-EINVAL`,
   `SOCK_CLOEXEC`/`SOCK_NONBLOCK` on the description, `fstat`'s

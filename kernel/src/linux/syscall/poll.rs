@@ -233,21 +233,7 @@ fn wait_ready(
 /// `waker` when provided and pushing any returned [`PollGuard`] onto `guards`.
 fn poll_file(file: &KernelFile, waker: Option<&Arc<dyn PollWaker>>, guards: &mut Vec<PollGuard>) -> PollMask {
     static WARNED_NO_GUARD: AtomicBool = AtomicBool::new(false);
-    if let Some(pipe) = file.pipe() {
-        let (mask, guard) = pipe.poll_open(file.access_mode(), file.writer_generation(), waker);
-        if let Some(guard) = guard {
-            guards.push(guard);
-        }
-        return mask;
-    }
-    if let Some(end) = file.tty() {
-        let (mask, guard) = end.tty.poll(end.master, file.access_mode(), waker);
-        if let Some(guard) = guard {
-            guards.push(guard);
-        }
-        return mask;
-    }
-    match file.inode().pollable() {
+    match file.pollable() {
         Some(pollable) => {
             let (mask, guard) = pollable.poll(file.access_mode(), waker);
             match guard {
@@ -1694,5 +1680,98 @@ crate::ktest!(
             kassert_eq!(super::fd::sys_close(at::reg(r_fd as u64)), 0);
             Ok(())
         })?
+    }
+);
+
+crate::ktest!(
+    fn pollable_routes_each_file_kind() {
+        use super::at;
+        use super::fd::{ktest_install_file, ktest_open, ktest_unlink};
+        use crate::{kassert, kassert_eq};
+        use alloc::format;
+        use ktest_pollable::{TestPollableInode, open_tmp_regular};
+        use lumen_vfs::OpenFlags;
+
+        const TMP_FILE: &[u8] = b"/tmp/pollable-routes-ktest-regular";
+
+        let res = process::in_test_process(|_| -> crate::ktest::TestResult {
+            let base = process::KTEST_USER_VA;
+            let pair_va = base + 512;
+            let buf_va = base + 544;
+            let ptn_va = base + 576;
+
+            // 1. Pipe: both ends route through `PipePoll` (`poll_open`).
+            kassert_eq!(super::pipe::sys_pipe(UserPtr::from_reg(pair_va)), 0);
+            // SAFETY: `[i32; 2]` is 8 bytes with no padding.
+            let pair = unsafe { copy_pod_from_user::<[i32; 2]>(pair_va) }.map_err(|_| "read pipe fds")?;
+            let (r_fd, w_fd) = (pair[0], pair[1]);
+            let r_file = process::current_io_file(r_fd).ok_or("pipe read fd missing")?;
+            let w_file = process::current_io_file(w_fd).ok_or("pipe write fd missing")?;
+            let r_poll = r_file.pollable().ok_or("pipe read not pollable")?;
+            let w_poll = w_file.pollable().ok_or("pipe write not pollable")?;
+            kassert_eq!(r_poll.poll(r_file.access_mode(), None).0, PollMask::EMPTY);
+            kassert_eq!(w_poll.poll(w_file.access_mode(), None).0, PollMask::OUT | PollMask::WRNORM);
+
+            copy_to_user(buf_va, b"x").map_err(|_| "write pipe byte")?;
+            kassert_eq!(super::fd::sys_write(at::reg(w_fd as u64), UserPtr::from_reg(buf_va), 1), 1);
+            kassert_eq!(r_poll.poll(r_file.access_mode(), None).0, PollMask::IN | PollMask::RDNORM);
+            drop((r_file, w_file));
+            kassert_eq!(super::fd::sys_close(at::reg(w_fd as u64)), 0);
+            kassert_eq!(super::fd::sys_close(at::reg(r_fd as u64)), 0);
+
+            // 2. PTY: master and slave route through `TtyPoll` with distinct sides.
+            let master_fd = ktest_open(0, b"/dev/ptmx", OpenFlags::O_RDWR | OpenFlags::O_NOCTTY)?;
+            // Unlock slave (`TIOCSPTLCK` = 0) and query its number (`TIOCGPTN`).
+            copy_to_user(ptn_va, &0u32.to_ne_bytes()).map_err(|_| "write unlock")?;
+            kassert_eq!(super::fd::sys_ioctl(master_fd, crate::linux::ioctl::TIOCSPTLCK, ptn_va), 0);
+            kassert_eq!(super::fd::sys_ioctl(master_fd, crate::linux::ioctl::TIOCGPTN, ptn_va), 0);
+            // SAFETY: `u32` is 4 bytes with no padding.
+            let ptn = unsafe { copy_pod_from_user::<u32>(ptn_va) }.map_err(|_| "read ptn")?;
+            let slave_path = format!("/dev/pts/{ptn}");
+            let slave_fd = ktest_open(1, slave_path.as_bytes(), OpenFlags::O_RDWR | OpenFlags::O_NOCTTY)?;
+
+            let m_file = process::current_io_file(master_fd.raw()).ok_or("master fd missing")?;
+            let s_file = process::current_io_file(slave_fd.raw()).ok_or("slave fd missing")?;
+            let m_poll = m_file.pollable().ok_or("master not pollable")?;
+            let s_poll = s_file.pollable().ok_or("slave not pollable")?;
+            kassert!(!m_poll.poll(m_file.access_mode(), None).0.contains(PollMask::IN));
+            kassert!(!s_poll.poll(s_file.access_mode(), None).0.contains(PollMask::IN));
+            // Write a canonical line into master so slave becomes readable.
+            copy_to_user(buf_va, b"hi\n").map_err(|_| "write pty line")?;
+            kassert_eq!(super::fd::sys_write(master_fd, UserPtr::from_reg(buf_va), 3), 3);
+            kassert!(s_poll.poll(s_file.access_mode(), None).0.contains(PollMask::IN | PollMask::RDNORM));
+            drop((m_file, s_file));
+            kassert_eq!(super::fd::sys_close(slave_fd), 0);
+            kassert_eq!(super::fd::sys_close(master_fd), 0);
+
+            // 3. Plain inode without `VfsInode::pollable`: returns `None`.
+            let reg_fd = ktest_install_file(open_tmp_regular(TMP_FILE).map_err(|_| "open tmp file")?)?;
+            let null_fd = ktest_open(0, b"/dev/null", OpenFlags::O_RDWR)?;
+            kassert!(process::current_io_file(reg_fd.raw()).ok_or("reg fd")?.pollable().is_none());
+            kassert!(process::current_io_file(null_fd.raw()).ok_or("null fd")?.pollable().is_none());
+            kassert_eq!(super::fd::sys_close(reg_fd), 0);
+            kassert_eq!(super::fd::sys_close(null_fd), 0);
+
+            // 4. Plain inode implementing `VfsInode::pollable`: falls through to inode.
+            let test_inode = TestPollableInode::new(PollMask::EMPTY);
+            let test_file = KernelFile::new_unchecked_flags(
+                Arc::clone(&test_inode) as Arc<dyn lumen_vfs::VfsInode>,
+                Arc::from(&b"/dev/test-pollable"[..]),
+                OpenFlags::from_bits(OpenFlags::O_RDWR),
+            )
+            .map_err(|_| "test KernelFile")?;
+            let test_fd = ktest_install_file(test_file)?;
+            let tf = process::current_io_file(test_fd.raw()).ok_or("test fd")?;
+            let tp = tf.pollable().ok_or("test inode not pollable")?;
+            kassert_eq!(tp.poll(tf.access_mode(), None).0, PollMask::EMPTY);
+            test_inode.set_mask_quiet(PollMask::IN | PollMask::PRI);
+            kassert_eq!(tp.poll(tf.access_mode(), None).0, PollMask::IN | PollMask::PRI);
+            drop(tf);
+            kassert_eq!(super::fd::sys_close(test_fd), 0);
+
+            Ok(())
+        });
+        let _ = ktest_unlink(TMP_FILE);
+        res?
     }
 );

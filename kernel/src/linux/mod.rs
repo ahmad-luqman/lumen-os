@@ -25,7 +25,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 #[allow(unused_imports)]
-pub use linux_raw_sys::{auxvec, ctypes, errno, general, ioctl, prctl, system};
+pub use linux_raw_sys::{auxvec, ctypes, errno, general, ioctl, net, prctl, system};
 
 use crate::arch;
 use crate::linux::exec::{Exec, ExecError};
@@ -205,9 +205,53 @@ pub const M8_SYSCALLS: &[(u32, &str)] = &[
     (general::__NR_getcpu, "getcpu"),
 ];
 
-/// Look up the name of an M6, M7 or M8 Linux x86-64 syscall by number.
+/// The 32 Linux x86-64 syscalls M9 adds (`docs/ARCHITECTURE.md` section 8's
+/// M9 table, less `clock_gettime` (228), which M6 already has and C7 extends).
+/// Each has its own arm in `syscall::dispatch`; B0 (#471) wires typed `-ENOSYS`
+/// stubs until the issue the design names for each replaces it.
+pub const M9_SYSCALLS: &[(u32, &str)] = &[
+    (general::__NR_madvise, "madvise"),
+    (general::__NR_sendfile, "sendfile"),
+    (general::__NR_socket, "socket"),
+    (general::__NR_connect, "connect"),
+    (general::__NR_accept, "accept"),
+    (general::__NR_sendto, "sendto"),
+    (general::__NR_recvfrom, "recvfrom"),
+    (general::__NR_sendmsg, "sendmsg"),
+    (general::__NR_recvmsg, "recvmsg"),
+    (general::__NR_shutdown, "shutdown"),
+    (general::__NR_bind, "bind"),
+    (general::__NR_listen, "listen"),
+    (general::__NR_getsockname, "getsockname"),
+    (general::__NR_getpeername, "getpeername"),
+    (general::__NR_socketpair, "socketpair"),
+    (general::__NR_setsockopt, "setsockopt"),
+    (general::__NR_getsockopt, "getsockopt"),
+    (general::__NR_getresuid, "getresuid"),
+    (general::__NR_getresgid, "getresgid"),
+    (general::__NR_epoll_create, "epoll_create"),
+    (general::__NR_epoll_wait, "epoll_wait"),
+    (general::__NR_epoll_ctl, "epoll_ctl"),
+    (general::__NR_epoll_pwait, "epoll_pwait"),
+    (general::__NR_timerfd_create, "timerfd_create"),
+    (general::__NR_eventfd, "eventfd"),
+    (general::__NR_timerfd_settime, "timerfd_settime"),
+    (general::__NR_timerfd_gettime, "timerfd_gettime"),
+    (general::__NR_accept4, "accept4"),
+    (general::__NR_eventfd2, "eventfd2"),
+    (general::__NR_epoll_create1, "epoll_create1"),
+    (general::__NR_copy_file_range, "copy_file_range"),
+    (general::__NR_epoll_pwait2, "epoll_pwait2"),
+];
+
+/// Look up the name of an M6, M7, M8 or M9 Linux x86-64 syscall by number.
 pub fn syscall_name(nr: u32) -> Option<&'static str> {
-    M6_SYSCALLS.iter().chain(M7_SYSCALLS).chain(M8_SYSCALLS).find_map(|&(num, name)| (num == nr).then_some(name))
+    M6_SYSCALLS
+        .iter()
+        .chain(M7_SYSCALLS)
+        .chain(M8_SYSCALLS)
+        .chain(M9_SYSCALLS)
+        .find_map(|&(num, name)| (num == nr).then_some(name))
 }
 
 /// Copy an ASCII string into a fixed-size NUL-terminated `c_char` field,
@@ -260,10 +304,11 @@ pub fn log_abi_summary() {
     let mods = modules::list();
     log::debug!(
         target: "linux",
-        "abi: {} M6 syscalls, {} M7, {} M8 (#{uname_nr} {uname_name}: {} {} {}, -ENOSYS={}), {} boot module(s)",
+        "abi: {} M6 syscalls, {} M7, {} M8, {} M9 (#{uname_nr} {uname_name}: {} {} {}, -ENOSYS={}), {} boot module(s)",
         M6_SYSCALLS.len(),
         M7_SYSCALLS.len(),
         M8_SYSCALLS.len(),
+        M9_SYSCALLS.len(),
         read_uts_field(&uts.sysname),
         read_uts_field(&uts.release),
         read_uts_field(&uts.machine),
@@ -596,14 +641,12 @@ crate::ktest!(
         crate::kassert_eq!(m6_rows.len() + m7_rows.len(), 49);
         crate::kassert_eq!(M7_SYSCALLS.len(), 47);
         crate::kassert_eq!(m7_rows.len(), M7_SYSCALLS.len());
-        let in_m6 = |nr: u32| M6_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m7 = |nr: u32| M7_SYSCALLS.iter().any(|&(n, _)| n == nr);
         for &(nr, name) in m6_rows {
-            crate::kassert!(in_m6(nr) && !in_m7(nr));
+            crate::kassert_eq!(tables_of(nr), (true, false, false, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m7_rows {
-            crate::kassert!(in_m7(nr) && !in_m6(nr));
+            crate::kassert_eq!(tables_of(nr), (false, true, false, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         // No number twice: with the lengths above, `M7_SYSCALLS` is exactly
@@ -723,17 +766,23 @@ crate::ktest!(
     }
 );
 
+#[cfg(feature = "ktest")]
+fn tables_of(nr: u32) -> (bool, bool, bool, bool) {
+    let has = |t: &[(u32, &str)]| t.iter().any(|&(n, _)| n == nr);
+    (has(M6_SYSCALLS), has(M7_SYSCALLS), has(M8_SYSCALLS), has(M9_SYSCALLS))
+}
+
 crate::ktest!(
     fn m8_abi_constants_match_spec() {
         use core::mem::{offset_of, size_of};
 
         // 1. Every row of ARCHITECTURE.md section 8's M8 syscall table, by
         //    number. Eleven are M6's and four M7's (changed in M8, still in
-        //    their tables); two stay `-ENOSYS` by decision (in no table, and
-        //    `syscalls.py`'s `ENOSYS_BY_DECISION`); the other 60 are
-        //    `M8_SYSCALLS`. Each spec number's name through `syscall_name`
-        //    must be the row's, so the tables' `linux-raw-sys` constants
-        //    equal these numbers.
+        //    their tables); `membarrier` stays `-ENOSYS` by decision (in no
+        //    table, and `syscalls.py`'s `ENOSYS_BY_DECISION`), while `sendfile`
+        //    moved to `M9_SYSCALLS` in M9; the other 60 are `M8_SYSCALLS`.
+        //    Each spec number's name through `syscall_name` must be the row's,
+        //    so the tables' `linux-raw-sys` constants equal these numbers.
         let m6_rows: &[(u32, &str)] = &[
             (13, "rt_sigaction"),
             (14, "rt_sigprocmask"),
@@ -748,7 +797,7 @@ crate::ktest!(
             (302, "prlimit64"),
         ];
         let m7_rows: &[(u32, &str)] = &[(72, "fcntl"), (73, "flock"), (76, "truncate"), (77, "ftruncate")];
-        let enosys_rows: &[(u32, u32)] = &[(40, general::__NR_sendfile), (324, general::__NR_membarrier)];
+        let enosys_rows: &[(u32, u32)] = &[(324, general::__NR_membarrier)];
         let m8_rows: &[(u32, &str)] = &[
             (7, "poll"),
             (15, "rt_sigreturn"),
@@ -813,25 +862,27 @@ crate::ktest!(
         ];
         crate::kassert_eq!(M8_SYSCALLS.len(), 60);
         crate::kassert_eq!(m8_rows.len(), M8_SYSCALLS.len());
-        let in_m6 = |nr: u32| M6_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m7 = |nr: u32| M7_SYSCALLS.iter().any(|&(n, _)| n == nr);
-        let in_m8 = |nr: u32| M8_SYSCALLS.iter().any(|&(n, _)| n == nr);
         for &(nr, name) in m6_rows {
-            crate::kassert!(in_m6(nr) && !in_m7(nr) && !in_m8(nr));
+            crate::kassert_eq!(tables_of(nr), (true, false, false, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m7_rows {
-            crate::kassert!(in_m7(nr) && !in_m6(nr) && !in_m8(nr));
+            crate::kassert_eq!(tables_of(nr), (false, true, false, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(nr, name) in m8_rows {
-            crate::kassert!(in_m8(nr) && !in_m6(nr) && !in_m7(nr));
+            crate::kassert_eq!(tables_of(nr), (false, false, true, false));
             crate::kassert_eq!(syscall_name(nr), Some(name));
         }
         for &(spec_nr, actual) in enosys_rows {
             crate::kassert_eq!(actual, spec_nr);
+            crate::kassert_eq!(tables_of(spec_nr), (false, false, false, false));
             crate::kassert_eq!(syscall_name(spec_nr), None);
         }
+        // `sendfile` was `-ENOSYS` in M8 and moved to `M9_SYSCALLS` in M9 (C7).
+        crate::kassert_eq!(general::__NR_sendfile, 40);
+        crate::kassert_eq!(tables_of(40), (false, false, false, true));
+        crate::kassert_eq!(syscall_name(40), Some("sendfile"));
         // No number twice: with the lengths above, `M8_SYSCALLS` is exactly
         // the 60 rows.
         for (i, &(nr, _)) in M8_SYSCALLS.iter().enumerate() {
@@ -1163,6 +1214,322 @@ crate::ktest!(
         crate::kassert_eq!(size_of::<general::__kernel_fd_set>(), 128);
         crate::kassert_eq!(size_of::<general::kernel_sigset_t>(), 8);
         crate::kassert_eq!(size_of::<general::kernel_sigaction>(), 32);
+
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn m9_abi_constants_match_spec() {
+        use core::mem::{offset_of, size_of};
+
+        // 1. Every row of ARCHITECTURE.md section 8's M9 syscall table, by
+        //    number. `clock_gettime` (228) is M6's (extended in C7); the other
+        //    32 are `M9_SYSCALLS`.
+        let m9_rows: &[(u32, &str)] = &[
+            (28, "madvise"),
+            (40, "sendfile"),
+            (41, "socket"),
+            (42, "connect"),
+            (43, "accept"),
+            (44, "sendto"),
+            (45, "recvfrom"),
+            (46, "sendmsg"),
+            (47, "recvmsg"),
+            (48, "shutdown"),
+            (49, "bind"),
+            (50, "listen"),
+            (51, "getsockname"),
+            (52, "getpeername"),
+            (53, "socketpair"),
+            (54, "setsockopt"),
+            (55, "getsockopt"),
+            (118, "getresuid"),
+            (120, "getresgid"),
+            (213, "epoll_create"),
+            (232, "epoll_wait"),
+            (233, "epoll_ctl"),
+            (281, "epoll_pwait"),
+            (283, "timerfd_create"),
+            (284, "eventfd"),
+            (286, "timerfd_settime"),
+            (287, "timerfd_gettime"),
+            (288, "accept4"),
+            (290, "eventfd2"),
+            (291, "epoll_create1"),
+            (326, "copy_file_range"),
+            (441, "epoll_pwait2"),
+        ];
+        crate::kassert_eq!(M9_SYSCALLS.len(), 32);
+        crate::kassert_eq!(m9_rows.len(), M9_SYSCALLS.len());
+        crate::kassert_eq!(tables_of(228), (true, false, false, false));
+        crate::kassert_eq!(syscall_name(228), Some("clock_gettime"));
+        for &(nr, name) in m9_rows {
+            crate::kassert_eq!(tables_of(nr), (false, false, false, true));
+            crate::kassert_eq!(syscall_name(nr), Some(name));
+        }
+        // No duplicate numbers in `M9_SYSCALLS`.
+        for (i, &(nr, _)) in M9_SYSCALLS.iter().enumerate() {
+            crate::kassert!(M9_SYSCALLS[i + 1..].iter().all(|&(other, _)| other != nr));
+        }
+        // Section 8 "Stays `-ENOSYS` in M9": M9's additions and re-checked rows
+        // (M8's other `-ENOSYS` decisions are pinned in `m8_abi_constants_match_spec`).
+        for &(spec_nr, actual) in &[
+            (282, general::__NR_signalfd),
+            (289, general::__NR_signalfd4),
+            (299, general::__NR_recvmmsg),
+            (307, general::__NR_sendmmsg),
+            (324, general::__NR_membarrier),
+        ] {
+            crate::kassert_eq!(actual, spec_nr);
+            crate::kassert_eq!(syscall_name(spec_nr), None);
+        }
+        crate::kassert_eq!(general::membarrier_cmd::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as u32, 0x10);
+
+        // 2. M9 socket, epoll, eventfd, timerfd, madvise and ioctl constants.
+        //    Address families.
+        crate::kassert_eq!(net::AF_UNSPEC, 0);
+        crate::kassert_eq!(net::AF_UNIX, 1);
+        crate::kassert_eq!(net::AF_INET, 2);
+        crate::kassert_eq!(net::AF_INET6, 10);
+        crate::kassert_eq!(net::AF_NETLINK, 16);
+        crate::kassert_eq!(net::AF_PACKET, 17);
+        //    Socket types and creation flags (`linux-raw-sys` 0.12.1 lacks
+        //    `SOCK_NONBLOCK`/`SOCK_CLOEXEC`, so they stay pinned through
+        //    `O_NONBLOCK`/`O_CLOEXEC`, which have the same values on x86-64).
+        crate::kassert_eq!(net::SOCK_STREAM, 1);
+        crate::kassert_eq!(net::SOCK_DGRAM, 2);
+        crate::kassert_eq!(net::SOCK_RAW, 3);
+        crate::kassert_eq!(net::SOCK_SEQPACKET, 5);
+        crate::kassert_eq!(general::O_NONBLOCK, 0o4000);
+        crate::kassert_eq!(general::O_CLOEXEC, 0o2_000_000);
+        //    Protocols.
+        crate::kassert_eq!(net::IPPROTO_IP as u32, 0);
+        crate::kassert_eq!(net::IPPROTO_ICMP as u32, 1);
+        crate::kassert_eq!(net::IPPROTO_TCP as u32, 6);
+        crate::kassert_eq!(net::IPPROTO_UDP as u32, 17);
+        crate::kassert_eq!(net::IPPROTO_IPV6 as u32, 41);
+        crate::kassert_eq!(net::IPPROTO_ICMPV6, 58);
+        //    `shutdown` modes.
+        crate::kassert_eq!(net::SHUT_RD, 0);
+        crate::kassert_eq!(net::SHUT_WR, 1);
+        crate::kassert_eq!(net::SHUT_RDWR, 2);
+        //    `sendmsg`/`recvmsg` flags.
+        crate::kassert_eq!(net::MSG_OOB, 0x0001);
+        crate::kassert_eq!(net::MSG_PEEK, 0x0002);
+        crate::kassert_eq!(net::MSG_DONTROUTE, 0x0004);
+        crate::kassert_eq!(net::MSG_CTRUNC, 0x0008);
+        crate::kassert_eq!(net::MSG_TRUNC, 0x0020);
+        crate::kassert_eq!(net::MSG_DONTWAIT, 0x0040);
+        crate::kassert_eq!(net::MSG_EOR, 0x0080);
+        crate::kassert_eq!(net::MSG_WAITALL, 0x0100);
+        crate::kassert_eq!(net::MSG_ERRQUEUE, 0x2000);
+        crate::kassert_eq!(net::MSG_NOSIGNAL, 0x4000);
+        crate::kassert_eq!(net::MSG_MORE, 0x8000);
+        crate::kassert_eq!(net::MSG_CMSG_CLOEXEC, 0x4000_0000);
+        //    Control messages (`SOL_SOCKET`).
+        crate::kassert_eq!(net::SCM_RIGHTS, 1);
+        crate::kassert_eq!(net::SCM_CREDENTIALS, 2);
+        crate::kassert_eq!(lumen_sockabi::SCM_MAX_FD, 253);
+        crate::kassert_eq!(general::UIO_MAXIOV, 1024);
+        //    Option levels and names (section 8's option table).
+        crate::kassert_eq!(net::SOL_IP, 0);
+        crate::kassert_eq!(net::SOL_SOCKET, 1);
+        crate::kassert_eq!(net::SOL_TCP, 6);
+        crate::kassert_eq!(net::SOL_IPV6, 41);
+        crate::kassert_eq!(net::SOL_ICMPV6, 58);
+        crate::kassert_eq!(net::SO_DEBUG, 1);
+        crate::kassert_eq!(net::SO_REUSEADDR, 2);
+        crate::kassert_eq!(net::SO_TYPE, 3);
+        crate::kassert_eq!(net::SO_ERROR, 4);
+        crate::kassert_eq!(net::SO_DONTROUTE, 5);
+        crate::kassert_eq!(net::SO_BROADCAST, 6);
+        crate::kassert_eq!(net::SO_SNDBUF, 7);
+        crate::kassert_eq!(net::SO_RCVBUF, 8);
+        crate::kassert_eq!(net::SO_KEEPALIVE, 9);
+        crate::kassert_eq!(net::SO_OOBINLINE, 10);
+        crate::kassert_eq!(net::SO_LINGER, 13);
+        crate::kassert_eq!(net::SO_REUSEPORT, 15);
+        crate::kassert_eq!(net::SO_PASSCRED, 16);
+        crate::kassert_eq!(net::SO_PEERCRED, 17);
+        crate::kassert_eq!(net::SO_RCVLOWAT, 18);
+        crate::kassert_eq!(net::SO_SNDLOWAT, 19);
+        crate::kassert_eq!(net::SO_RCVTIMEO_OLD, 20);
+        crate::kassert_eq!(net::SO_SNDTIMEO_OLD, 21);
+        crate::kassert_eq!(net::SO_ACCEPTCONN, 30);
+        crate::kassert_eq!(net::SO_SNDBUFFORCE, 32);
+        crate::kassert_eq!(net::SO_RCVBUFFORCE, 33);
+        crate::kassert_eq!(net::SO_PROTOCOL, 38);
+        crate::kassert_eq!(net::SO_DOMAIN, 39);
+        crate::kassert_eq!(net::SO_RCVTIMEO_NEW, 66);
+        crate::kassert_eq!(net::SO_SNDTIMEO_NEW, 67);
+        crate::kassert_eq!(net::TCP_NODELAY, 1);
+        crate::kassert_eq!(net::TCP_MAXSEG, 2);
+        crate::kassert_eq!(net::TCP_CORK, 3);
+        crate::kassert_eq!(net::TCP_KEEPIDLE, 4);
+        crate::kassert_eq!(net::TCP_KEEPINTVL, 5);
+        crate::kassert_eq!(net::TCP_KEEPCNT, 6);
+        crate::kassert_eq!(net::TCP_QUICKACK, 12);
+        crate::kassert_eq!(net::TCP_USER_TIMEOUT, 18);
+        crate::kassert_eq!(net::IP_TOS, 1);
+        crate::kassert_eq!(net::IP_TTL, 2);
+        crate::kassert_eq!(net::IP_RECVERR, 11);
+        crate::kassert_eq!(net::IPV6_CHECKSUM, 7);
+        crate::kassert_eq!(net::IPV6_UNICAST_HOPS, 16);
+        crate::kassert_eq!(net::IPV6_RECVERR, 25);
+        crate::kassert_eq!(net::IPV6_V6ONLY, 26);
+        crate::kassert_eq!(net::IPV6_RECVHOPLIMIT, 51);
+        crate::kassert_eq!(net::IPV6_HOPLIMIT, 52);
+        //    `epoll` ops, flags and event bits.
+        crate::kassert_eq!(general::EPOLL_CLOEXEC, 0o2_000_000);
+        crate::kassert_eq!(general::EPOLL_CTL_ADD, 1);
+        crate::kassert_eq!(general::EPOLL_CTL_DEL, 2);
+        crate::kassert_eq!(general::EPOLL_CTL_MOD, 3);
+        crate::kassert_eq!(general::EPOLLIN, 0x0001);
+        crate::kassert_eq!(general::EPOLLPRI, 0x0002);
+        crate::kassert_eq!(general::EPOLLOUT, 0x0004);
+        crate::kassert_eq!(general::EPOLLERR, 0x0008);
+        crate::kassert_eq!(general::EPOLLHUP, 0x0010);
+        crate::kassert_eq!(general::EPOLLRDNORM, 0x0040);
+        crate::kassert_eq!(general::EPOLLWRNORM, 0x0100);
+        crate::kassert_eq!(general::EPOLLRDHUP, 0x2000);
+        crate::kassert_eq!(general::EPOLLEXCLUSIVE, 1 << 28);
+        crate::kassert_eq!(general::EPOLLWAKEUP, 1 << 29);
+        crate::kassert_eq!(general::EPOLLONESHOT, 1 << 30);
+        crate::kassert_eq!(general::EPOLLET, 1 << 31);
+        //    `eventfd`, `timerfd`, `madvise`, `ioctl` and CPU-time clocks.
+        crate::kassert_eq!(general::EFD_SEMAPHORE, 1);
+        crate::kassert_eq!(general::EFD_NONBLOCK, 0o4000);
+        crate::kassert_eq!(general::EFD_CLOEXEC, 0o2_000_000);
+        crate::kassert_eq!(general::TFD_NONBLOCK, 0o4000);
+        crate::kassert_eq!(general::TFD_CLOEXEC, 0o2_000_000);
+        crate::kassert_eq!(general::TFD_TIMER_ABSTIME, 1);
+        crate::kassert_eq!(general::TFD_TIMER_CANCEL_ON_SET, 2);
+        crate::kassert_eq!(general::MADV_FREE, 8);
+        crate::kassert_eq!(ioctl::FIONREAD, 0x541b);
+        crate::kassert_eq!(ioctl::FIONBIO, 0x5421);
+        crate::kassert_eq!(ioctl::FIOCLEX, 0x5451);
+        crate::kassert_eq!(general::CLOCK_PROCESS_CPUTIME_ID, 2);
+        crate::kassert_eq!(general::CLOCK_THREAD_CPUTIME_ID, 3);
+
+        // 3. The errnos the M9 table returns.
+        let errnos: &[(u32, u32)] = &[
+            (errno::EPERM, 1),
+            (errno::ENOENT, 2),
+            (errno::ESRCH, 3),
+            (errno::EINTR, 4),
+            (errno::ENXIO, 6),
+            (errno::EBADF, 9),
+            (errno::EAGAIN, 11),
+            (errno::ENOMEM, 12),
+            (errno::EFAULT, 14),
+            (errno::EEXIST, 17),
+            (errno::EXDEV, 18),
+            (errno::EISDIR, 21),
+            (errno::EINVAL, 22),
+            (errno::EMFILE, 24),
+            (errno::ENOTTY, 25),
+            (errno::ESPIPE, 29),
+            (errno::EPIPE, 32),
+            (errno::EDOM, 33),
+            (errno::ENOSYS, 38),
+            (errno::ELOOP, 40),
+            (errno::ENOTSOCK, 88),
+            (errno::EDESTADDRREQ, 89),
+            (errno::EMSGSIZE, 90),
+            (errno::EPROTOTYPE, 91),
+            (errno::ENOPROTOOPT, 92),
+            (errno::EPROTONOSUPPORT, 93),
+            (errno::ESOCKTNOSUPPORT, 94),
+            (errno::EOPNOTSUPP, 95),
+            (errno::EAFNOSUPPORT, 97),
+            (errno::EADDRINUSE, 98),
+            (errno::EADDRNOTAVAIL, 99),
+            (errno::ENETUNREACH, 101),
+            (errno::ECONNABORTED, 103),
+            (errno::ECONNRESET, 104),
+            (errno::ENOBUFS, 105),
+            (errno::EISCONN, 106),
+            (errno::ENOTCONN, 107),
+            (errno::ETOOMANYREFS, 109),
+            (errno::ETIMEDOUT, 110),
+            (errno::ECONNREFUSED, 111),
+            (errno::EALREADY, 114),
+            (errno::EINPROGRESS, 115),
+        ];
+        for &(actual, spec) in errnos {
+            crate::kassert_eq!(actual, spec);
+        }
+
+        // 4. The user-visible M9 structs' Linux x86-64 sizes and key offsets:
+        //    sizes are pinned against `linux-raw-sys` and `lumen-sockabi`
+        //    (except `itimerspec`, which `lumen-sockabi` does not define);
+        //    field offsets are checked against `linux-raw-sys` only.
+        crate::kassert_eq!(size_of::<net::sockaddr_in>(), 16);
+        crate::kassert_eq!(lumen_sockabi::SOCKADDR_IN_LEN, 16);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in, sin_family), 0);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in, sin_port), 2);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in, sin_addr), 4);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in, __pad), 8);
+
+        crate::kassert_eq!(size_of::<net::sockaddr_in6>(), 28);
+        crate::kassert_eq!(lumen_sockabi::SOCKADDR_IN6_LEN, 28);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in6, sin6_family), 0);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in6, sin6_port), 2);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in6, sin6_flowinfo), 4);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in6, sin6_addr), 8);
+        crate::kassert_eq!(offset_of!(net::sockaddr_in6, sin6_scope_id), 24);
+
+        crate::kassert_eq!(size_of::<net::sockaddr_un>(), 110);
+        crate::kassert_eq!(lumen_sockabi::SOCKADDR_UN_LEN, 110);
+        crate::kassert_eq!(offset_of!(net::sockaddr_un, sun_family), 0);
+        crate::kassert_eq!(offset_of!(net::sockaddr_un, sun_path), 2);
+
+        crate::kassert_eq!(size_of::<net::__kernel_sockaddr_storage>(), 128);
+        crate::kassert_eq!(lumen_sockabi::SOCKADDR_STORAGE_LEN, 128);
+
+        crate::kassert_eq!(size_of::<net::msghdr>(), 56);
+        crate::kassert_eq!(lumen_sockabi::MSGHDR_LEN, 56);
+        crate::kassert_eq!(offset_of!(net::msghdr, msg_name), 0);
+        crate::kassert_eq!(offset_of!(net::msghdr, msg_namelen), 8);
+        crate::kassert_eq!(offset_of!(net::msghdr, msg_iov), 16);
+        crate::kassert_eq!(offset_of!(net::msghdr, msg_iovlen), 24);
+        crate::kassert_eq!(offset_of!(net::msghdr, msg_control), 32);
+        crate::kassert_eq!(offset_of!(net::msghdr, msg_controllen), 40);
+        crate::kassert_eq!(offset_of!(net::msghdr, msg_flags), 48);
+
+        crate::kassert_eq!(size_of::<net::cmsghdr>(), 16);
+        crate::kassert_eq!(lumen_sockabi::CMSG_HDRLEN, 16);
+        crate::kassert_eq!(offset_of!(net::cmsghdr, cmsg_len), 0);
+        crate::kassert_eq!(offset_of!(net::cmsghdr, cmsg_level), 8);
+        crate::kassert_eq!(offset_of!(net::cmsghdr, cmsg_type), 12);
+
+        crate::kassert_eq!(size_of::<net::ucred>(), 12);
+        crate::kassert_eq!(lumen_sockabi::UCRED_LEN, 12);
+        crate::kassert_eq!(offset_of!(net::ucred, pid), 0);
+        crate::kassert_eq!(offset_of!(net::ucred, uid), 4);
+        crate::kassert_eq!(offset_of!(net::ucred, gid), 8);
+
+        crate::kassert_eq!(size_of::<net::linger>(), 8);
+        crate::kassert_eq!(lumen_sockabi::LINGER_LEN, 8);
+        crate::kassert_eq!(offset_of!(net::linger, l_onoff), 0);
+        crate::kassert_eq!(offset_of!(net::linger, l_linger), 4);
+
+        crate::kassert_eq!(size_of::<general::timeval>(), 16);
+        crate::kassert_eq!(size_of::<general::__kernel_old_timeval>(), 16);
+        crate::kassert_eq!(lumen_sockabi::TIMEVAL_LEN, 16);
+        crate::kassert_eq!(offset_of!(general::timeval, tv_sec), 0);
+        crate::kassert_eq!(offset_of!(general::timeval, tv_usec), 8);
+
+        // x86-64 `epoll_event` is packed: 12 bytes, `u32` events at 0, `u64` data at 4.
+        crate::kassert_eq!(size_of::<general::epoll_event>(), 12);
+        crate::kassert_eq!(lumen_sockabi::EPOLL_EVENT_LEN, 12);
+        crate::kassert_eq!(offset_of!(general::epoll_event, events), 0);
+        crate::kassert_eq!(offset_of!(general::epoll_event, data), 4);
+
+        crate::kassert_eq!(size_of::<general::__kernel_itimerspec>(), 32);
+        crate::kassert_eq!(offset_of!(general::__kernel_itimerspec, it_interval), 0);
+        crate::kassert_eq!(offset_of!(general::__kernel_itimerspec, it_value), 16);
 
         Ok(())
     }
