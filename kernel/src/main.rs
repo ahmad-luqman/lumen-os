@@ -48,6 +48,7 @@ mod ktest;
 mod linux;
 mod mm;
 mod mouse;
+mod net;
 mod pci;
 mod perf;
 mod power;
@@ -243,6 +244,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     rng::init();
     vfs::init();
     linux::init();
+    net::init();
     linux::log_abi_summary();
     vfs::log_ext4_crate_summary();
 
