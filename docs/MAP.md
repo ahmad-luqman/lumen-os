@@ -555,14 +555,23 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `stat_from_metadata`/`statx_from_metadata`; the handlers' rules are in
   ARCHITECTURE section 8, "Handlers".
   `net/` (M9; ARCHITECTURE sections 7, 8 and 10): `net/mod.rs` (`net::init`,
-  called at boot after `linux::init` and populated by B3/B4, #472) and
+  called at boot after `linux::init`, #472/#474) and
   `net/virtio_net.rs` (#473: `VirtioNetDevice` implements lumen-net's
   `NetDevice` with 16 RX and 16 TX DMA buffers, single-descriptor frames,
   nonblocking receive/transmit/reclaim, MSI-X `BELL`, frame/drop counters,
   and the `net`/`net selftest` commands; `Health` distinguishes recoverable
   failure from permanent queue corruption; `DeviceSlot` (`Empty | Probed | Taken`)
   declines a second NIC even after `take_device`, which transfers ownership
-  (for B3) to its stack; RX budget exhaustion rings `BELL` for another poll) and
+  to its stack; RX budget exhaustion rings `BELL` for another poll; #474 adds
+  `VirtioNet`, which checks TX lengths and observes the worker-driven ARP
+  selftest, and routes IRQ kicks and shell diagnostics to the stack) and
+  `net/stack.rs` (#474: `NetStack::inner`, boot-reserved weak socket table,
+  fixed SocketSets (499,712 bytes each on x86-64) and shared buffer budget,
+  independent RNG seeds (inet opens fail with ENETDOWN without a seeded pool),
+  the sole `net` polling thread,
+  post-lock readiness notifications, listener refill, and socket/TIME-WAIT
+  diagnostics), `net/inet.rs` (#474: `InetSocket`, `Proto` arms for C3/C4/C6,
+  Lock 0 I/O locks, options leaf and `KernelPollHead`, readiness mapping), and
   `net/sock.rs` (#472: the generic socket file object: `SockKind`,
   `ShutdownHow`, `UserSpan`/`UserIovec`, `InFlightFile`, `SendIo` (with
   `named`), `RecvIo`, `RecvDone`, `SockOps` (with required `disconnect`),

@@ -1754,6 +1754,17 @@ impl<D: NetDevice> Stack<D> {
     pub fn eth_tx_ready(&self) -> bool {
         self.eth.as_ref().is_some_and(Adapter::tx_ready)
     }
+
+    /// Borrows the attached device with exclusive access to the stack.
+    /// The owner must serialize diagnostics with polling, just as socket I/O.
+    pub fn device_mut(&mut self) -> Option<&mut D> {
+        self.eth.as_mut().map(|adapter| &mut adapter.device)
+    }
+
+    /// Configured addresses of one interface, or an empty slice if absent.
+    pub fn interface_addresses(&self, iface: IfaceId) -> &[IpCidr] {
+        self.interfaces[iface.index()].as_ref().map_or(&[], |state| state.iface.ip_addrs())
+    }
 }
 
 impl<D: NetDevice> Stack<D> {
@@ -2376,5 +2387,52 @@ fn configure_datagram(prep: &mut ConnectPrep, proto: Proto, req: Bound, i: usize
             if raw { Ok(()) } else { p.socket.bind(icmp::Endpoint::Ident(req.port)).map_err(|_| NetError::Inval) }
         }
         _ => Err(NetError::Inval),
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    struct Device {
+        ready: bool,
+    }
+    impl NetDevice for Device {
+        fn info(&self) -> NetInfo {
+            NetInfo { mac: [2, 0, 0, 0, 0, 1], mtu: 1500, link_up: true }
+        }
+        fn tx_ready(&self) -> bool {
+            self.ready
+        }
+        fn receive(&mut self, _: &mut [u8; ETH_FRAME_MAX]) -> Option<usize> {
+            None
+        }
+        fn transmit<R>(&mut self, _: usize, _: impl FnOnce(&mut [u8]) -> R) -> Result<R, TxError> {
+            Err(TxError::Full)
+        }
+        fn reclaim(&mut self) -> usize {
+            0
+        }
+    }
+    #[test]
+    fn diagnostics_follow_the_attached_device_and_address_configuration() {
+        let mut stack = Stack::<Device>::try_new(Loopback::try_new(65535, 16).unwrap(), Instant::ZERO, 474).unwrap();
+        assert!(stack.device_mut().is_none());
+        assert!(stack.interface_addresses(IfaceId::Eth0).is_empty());
+        assert_eq!(
+            stack.interface_addresses(IfaceId::Lo),
+            &[IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8), IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128),]
+        );
+        let addr = Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24);
+        stack
+            .attach_eth(Device { ready: false }, EthConfig::Static { addr, router: None }, Instant::ZERO, 475)
+            .unwrap();
+        assert!(!stack.eth_tx_ready());
+        stack.device_mut().unwrap().ready = true;
+        assert!(stack.eth_tx_ready());
+        assert_eq!(stack.interface_addresses(IfaceId::Eth0), &[IpCidr::Ipv4(addr)]);
+        stack.configure_eth(None, None).unwrap();
+        assert!(stack.interface_addresses(IfaceId::Eth0).is_empty());
+        assert_eq!(stack.interface_addresses(IfaceId::Lo).len(), 2);
     }
 }
