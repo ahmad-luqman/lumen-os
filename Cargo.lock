@@ -399,6 +399,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-eventfd"
+version = "0.0.1"
+dependencies = [
+ "lumen-signal",
+]
+
+[[package]]
 name = "lumen-font"
 version = "0.0.1"
 dependencies = [
