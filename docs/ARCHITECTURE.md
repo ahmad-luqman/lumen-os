@@ -5321,9 +5321,9 @@ section 7's stack and is a dependency of B2 and B3. The developer image
 | B6 | `eventfd` and `timerfd` | B0, #468 | `kernel/src/linux/evfd.rs`, `syscall/evfd.rs`, `linux::timer`'s timerfd target; `cargo:lumen-eventfd`, `ktest:lumen_kernel::linux::evfd::timerfd_expiries_count_on_the_timers_worker`, `scenario:test_linux_io::test_eventfd_and_timerfd` | 8, 10 |
 | C1 | `AF_UNIX` stream, datagram and seqpacket | B1, #464, #466 | `kernel/src/net/unix.rs` (bound-socket and abstract tables, autobind, `SO_PEERCRED`), `S_IFSOCK` in `vfs/tmpfs.rs`'s and `vfs/ext4.rs`'s `mknod`, `mknodat`'s socket type, a socket node's open `-ENXIO`; `cargo:lumen-unix`, `ktest:lumen_kernel::net::unix::path_bind_makes_a_socket_inode_on_tmpfs_and_ext4`, `ktest:lumen_kernel::net::unix::unlink_while_bound_keeps_the_socket_and_frees_the_name`, `ktest:lumen_kernel::vfs::ext4::ext4_socket_mknod_writes_a_special_inode`, `scenario:test_net::test_af_unix_and_scm_rights` (its checks tagged C1) | 9, 10 |
 | C2 | `SCM_RIGHTS`, `SCM_CREDENTIALS` and the collector | C1 | `kernel/src/net/unix_gc.rs` (the in-flight registry, the cap, `unix_gc`); `ktest:lumen_kernel::net::unix_gc::collects_an_unreachable_in_flight_cycle`, `ktest:lumen_kernel::net::unix_gc::in_flight_cap_gives_etoomanyrefs`, `ktest:lumen_kernel::net::unix_gc::closing_a_long_in_flight_chain_doesnt_recurse`, `scenario:test_net::test_af_unix_and_scm_rights` (its checks tagged C2) | 9, 10 |
-| C3 | UDP over IPv4 and IPv6 | B3, #464 | `kernel/src/net/udp.rs`; `scenario:test_net::test_udp_datagrams_over_loopback`, `test_dhcp_dns_and_loopback`'s DNS check | 7, 8 |
-| C4 | TCP over IPv4 and IPv6 | B3, B4, #464 | `kernel/src/net/tcp.rs` (connect, listen and its pool, accept, shutdown, errors, `SIGPIPE`); `tests/conformance/libc-test-xfail.txt` loses #434's two entries; `scenario:test_net::test_ipv4_and_ipv6_tcp_echo`, `test_dhcp_dns_and_loopback`'s TCP checks | 7, 8 |
-| C5 | options, names and message calls | C1, C3, C4 | the option table in `net/inet.rs` and `net/unix.rs`, `getsockname`/`getpeername`, `sendmsg`/`recvmsg` control paths, `SO_RCVTIMEO`/`SO_SNDTIMEO`; `scenario:test_net::test_bsd_socket_options_and_nonblocking` | 7, 8 |
+| C3 | UDP over IPv4 and IPv6 | B3, B4, #464 | `kernel/src/net/udp.rs`; `scenario:test_net::test_udp_datagrams_over_loopback`, `test_dhcp_dns_and_loopback`'s DNS check | 7, 8 |
+| C4 | TCP over IPv4 and IPv6 | B3, B4, #464 | `kernel/src/net/tcp.rs` (connect, listen and its pool, accept, shutdown, errors, `SIGPIPE`); `scenario:test_net::test_ipv4_and_ipv6_tcp_echo`, `test_dhcp_dns_and_loopback`'s TCP checks | 7, 8 |
+| C5 | options, names and message calls | C1, C3, C4 | `tests/conformance/libc-test-xfail.txt` loses #434's two entries (libc-test's `socket.c` needs C3's UDP and C5's `getsockname` and `SO_RCVTIMEO`; the PR says `Fixes #434`); the option table in `net/inet.rs` and `net/unix.rs`, `getsockname`/`getpeername`, `sendmsg`/`recvmsg` control paths, `SO_RCVTIMEO`/`SO_SNDTIMEO`; `scenario:test_net::test_bsd_socket_options_and_nonblocking` | 7, 8 |
 | C6 | ICMP: ping sockets and raw echo | B3 | `kernel/src/net/icmp.rs`, its `Proto` arm; appends `Icmp6Filter`, `Ipv6Checksum`, `Ipv6HopLimit` and `Ipv6RecvHopLimit` to lumen-sockabi's `SockOpt` (append-only) and answers them; `scenario:test_net::test_ping_over_loopback` | 7 |
 | C7 | the census's leftovers | B1, C1 | `sendfile`, `copy_file_range`, `getresuid`/`getresgid`, `madvise(MADV_FREE)`, the CPU-time clocks in `clock_gettime`/`clock_getres`; `scenario:test_linux_proc::test_m9_small_syscalls` | 8 |
 | C8 | network and epoll stress, SMP | B5, B6, C4 | `scenario:test_net::test_connection_and_epoll_stress`, `test_epoll_edge_and_level_triggered`'s mixed-set check (a socket, an eventfd and a timerfd) | 15 |
@@ -5506,7 +5506,7 @@ The rules every implementor keeps:
   `Pollable`.
 - `mknodat` (259) makes `S_IFSOCK` nodes (C1, section 10), and an `open`
   of a socket node is `-ENXIO`, as Linux.
-- `sendfile` (40) leaves M8's `-ENOSYS`.
+- `sendfile` (40) is no longer `-ENOSYS` (M8's answer): C7 implements it.
 
 **Options (C5).** Each lumen-sockabi `SockOpt` variant (`decode_opt`);
 an inet or unix socket answers those of its family and `-ENOPROTOOPT` for
@@ -5542,7 +5542,7 @@ the rest:
   pipe write's (section 10), unless `MSG_NOSIGNAL` (the census saw it on
   `sendto` and `sendmsg`). A seqpacket send in the same state is `-EPIPE`
   with no signal: Linux sends it through `unix_dgram_sendmsg`, and only
-  `unix_stream_sendmsg` raises `SIGPIPE`. So C2 maps lumen-unix's
+  `unix_stream_sendmsg` raises `SIGPIPE`. So C1 maps lumen-unix's
   `PeerClosed` by type: `-EPIPE` for seqpacket, `-ECONNREFUSED` for a
   connected datagram socket (`af_unix.c`, v6.12).
 - **A signal during a blocking socket wait** returns `-EINTR` when the
@@ -10360,8 +10360,8 @@ lumen-unix holds no locks, wait queues or paths; this section adds them.
     and the peer's close gives EOF (0) and then `-EPIPE`. gVisor's AF_UNIX
     tests run every case over stream, datagram and seqpacket, and are
     most of the 7,950 cases that passed natively in A5's batched run.
-  - Any queue method lumen-unix lacks for seqpacket is C1's addition to
-    that crate (the collector's hooks are already there: below).
+  - lumen-unix has no seqpacket queue yet: C1 adds it to that crate (the
+    collector's hooks are already there: below).
 - **Locks:** a connection's `pair`, a datagram socket's queue and a
   listener's lock are section 9's Lock 0: held across one call's user
   copies (peek, copy out, commit, as a pipe's), one at a time.
@@ -13152,7 +13152,7 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `strptime`, `wordexp`, `regex-backref-oob`, `regexec-backref`, each static
   and dynamic; likely fixed in musl after 1.2.5), 4 PI-futex failures
   (#397: `pthread_mutex_pi` and `pthread_robust`, each linkage), 6 SysV IPC
-  failures (#432), and 2 socket failures (#434, which M9's C4 removes).
+  failures (#432), and 2 socket failures (#434, which M9's C5 removes).
   The native reference set remains 274 passes out of 284 (`NATIVE_PASS`
   in `tests/harness/test_libctest.py`); the 10 #398 failures are not missing
   Lumen interfaces.
@@ -13211,7 +13211,7 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   apart.
 - **`tools/linux-m9/` test programs:** `m9_net` (TCP, UDP and ICMP
   checks), `m9_unix` (`AF_UNIX`), `m9_io` (`epoll`, `eventfd`, `timerfd`),
-  `m9_proc` (C7) and `dnsd` (the loopback DNS responder: A and AAAA for one
+  `m9_proc` (C7) and `dnsd` (C3; the loopback DNS responder: A and AAAA for one
   name, given on its command line). They are built and staged as
   `tools/linux-m8/`'s are, print one `ok <check>` line per check, and name
   the first failure; a check about a syscall calls it by number.
@@ -13311,8 +13311,6 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
     under `MSG_NOSIGNAL`;
   - `listen(fd, 7)` queues 8 connections before any `accept`;
   - the same echo over `eth0` to the fixture.
-  - libc-test's two socket tests (#434) pass in
-    `test_musl_libc_test_core`, their xfail entries removed.
 - `scenario:test_net::test_udp_datagrams_over_loopback` (C3):
   - datagrams over 127.0.0.1 and ::1 keep their boundaries;
   - `MSG_PEEK`, then a read of the same datagram; `MSG_TRUNC` returns the
@@ -13336,6 +13334,8 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
     0.0.0.0 conflict;
   - non-blocking by `SOCK_NONBLOCK`, `fcntl` and `FIONBIO`: `-EAGAIN` from
     `recv` and `accept`;
+  - libc-test's two socket tests (#434) pass in
+    `test_musl_libc_test_core`, their xfail entries removed;
   - `SO_RCVTIMEO` waits at least its time and gives `-EAGAIN`; with an
     hour's `SO_RCVTIMEO`, a signal sent once the reader is blocked gives
     `-EINTR`; in an untimed wait with `SA_RESTART` the call restarts and
