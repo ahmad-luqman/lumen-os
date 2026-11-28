@@ -10359,7 +10359,7 @@ lumen-unix holds no locks, wait queues or paths; this section adds them.
     `Listener`, under the same budget rule. Records keep their boundaries,
     and the peer's close gives EOF (0) and then `-EPIPE`. gVisor's AF_UNIX
     tests run every case over stream, datagram and seqpacket, and are
-    most of the 7,950 cases that passed natively in A5's batched run.
+    6,144 of the 8,031 cases that pass natively (A5's reference).
   - lumen-unix has no seqpacket queue yet: C1 adds it to that crate (the
     collector's hooks are already there: below).
 - **Locks:** a connection's `pair`, a datagram socket's queue and a
@@ -13440,18 +13440,19 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 
 - **The gVisor subset (D4; A5, #454, #465).** #465 builds 34 gVisor test
   binaries (socket, epoll, eventfd and timerfd families) with the pinned
-  zig, statically, without Bazel: 63,219,424 bytes. A first native run
-  (workflow run 46062869835, batched) measured all 8,324 listed cases:
-  7,950 pass, 374 skip, 0 fail, 0 timeout. The set is
+  zig, statically, without Bazel: 63,094,880 bytes. The reference
+  (workflow run 46096200249, measured as below) passes 8,031 of the 8,324
+  listed cases and skips 293. The set is
   `tests/conformance/gvisor-native.txt` (the pass IDs, and the skips as
   `# skip:` lines; `# fail:` lines are allowed, none today), and
-  `gvisor-reference.yml` gates on it. The first per-case root run (below)
-  re-records it, and may change those counts.
+  `gvisor-reference.yml` gates on it.
   - **The native reference is measured as D4 runs on Lumen:** one case per
     process (`--gtest_filter=<case>`), each in a fresh network namespace
     with `lo` up (as gVisor's runner does, and as a Lumen boot starts
-    clean: without it, TCP pair helpers reuse ports a previous case left
-    in TIME_WAIT), as root. Its report records the
+    clean: gVisor's root stress tests shrink `ip_local_port_range` to 50
+    ports and never restore it (`socket_util.cc`
+    `MaybeLimitEphemeralPorts`), and a shared namespace then failed 1,028
+    later TCP cases with `EADDRINUSE`), as root. Its report records the
     uid, euid and capability masks, the mode, the zig version and the
     kernel, and `gvisor record` refuses a run that isn't complete,
     per-case and root.
