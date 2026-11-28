@@ -23,7 +23,7 @@ use super::{
 };
 #[cfg(feature = "ktest")]
 use crate::linux::process::FileRef;
-use crate::linux::process::{self, ConsoleIo, KernelFile, with_current_console};
+use crate::linux::process::{self, AnonObj, ConsoleIo, KernelFile, with_current_console};
 use crate::linux::{errno, general, ioctl};
 use crate::user::{CopyError, copy_from_user, copy_to_user};
 use lumen_vfs::{DevId, InodeType, OpenFlags, SeekFrom, VfsError, VfsInode, VfsLock};
@@ -216,6 +216,32 @@ fn read_tty(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     read_into_user(io, user_buf, count).map(|n| n as u64)
 }
 
+/// Read one 8-byte `u64` from an `eventfd` or `timerfd` into `user_buf`.
+///
+/// Buffers shorter than 8 bytes return `-EINVAL`. After consuming the counter
+/// value:
+/// - `eventfd` (Linux v6.12 `fs/eventfd.c:242` `eventfd_read`): any short copy
+///   returns `-EFAULT` with the value consumed.
+/// - `timerfd` (Linux v6.12 `fs/timerfd.c:292` `timerfd_read_iter`): a partial
+///   copy returns the bytes copied; only 0 bytes copied returns `-EFAULT`
+///   (either way with ticks consumed).
+fn read_to_user(anon: &AnonObj, user_buf: u64, count: u64, nonblock: bool) -> Result<u64, u32> {
+    if count < lumen_eventfd::IO_SIZE as u64 {
+        return Err(errno::EINVAL);
+    }
+    let bytes = anon.read_u64(nonblock)?.to_ne_bytes();
+    match anon {
+        AnonObj::EventFd(_) => {
+            copy_to_user(user_buf, &bytes).map_err(|_| errno::EFAULT)?;
+            Ok(lumen_eventfd::IO_SIZE as u64)
+        }
+        AnonObj::TimerFd(_) => {
+            let copied = crate::user::copy_to_user_partial(user_buf, &bytes);
+            partial(copied, errno::EFAULT)
+        }
+    }
+}
+
 fn read(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     let _pos = file.lock_pos();
@@ -226,6 +252,9 @@ fn read(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     }
     if let Some(sock) = file.sock() {
         return super::socket::read_sock(&**sock, buf, count, file.is_nonblock());
+    }
+    if let Some(anon) = file.anon() {
+        return read_to_user(anon, buf.addr(), count, file.is_nonblock());
     }
     if file.inode().is_tty() {
         return read_tty(&file, buf.addr(), count);
@@ -247,6 +276,13 @@ fn write(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     }
     if let Some(sock) = file.sock() {
         return super::socket::write_sock(&**sock, buf, count, file.is_nonblock());
+    }
+    if let Some(anon) = file.anon() {
+        return match anon {
+            AnonObj::EventFd(ev) => ev.write(buf.addr(), count, file.is_nonblock()),
+            // Linux v6.12 `fs/timerfd.c`: `timerfd_fops` has no write handler (`-EINVAL`).
+            AnonObj::TimerFd(_) => Err(errno::EINVAL),
+        };
     }
     if let Some(tty) = file.tty() {
         return tty.write(buf.addr(), count, file.is_nonblock());
@@ -356,6 +392,47 @@ fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     if let Some(sock) = file.sock() {
         return super::socket::readv_sock(&**sock, &iovs, file.is_nonblock());
     }
+    if let Some(anon) = file.anon() {
+        // Linux v6.12 `fs/read_write.c` `vfs_readv`: 0 total bytes returns 0;
+        // otherwise `eventfd_read` (`fs/eventfd.c:242`, short copy -> `-EFAULT`)
+        // and `timerfd_read_iter` (`fs/timerfd.c:292`, partial copy returns
+        // bytes copied, 0 -> `-EFAULT`) require >= 8 bytes and scatter the
+        // 8-byte u64 across the iovecs (`copy_to_iter`).
+        let planned: usize = iovs.iter().map(|span| span.len as usize).sum();
+        if planned == 0 {
+            return Ok(0);
+        }
+        if planned < lumen_eventfd::IO_SIZE {
+            return Err(errno::EINVAL);
+        }
+        let bytes = anon.read_u64(file.is_nonblock())?.to_ne_bytes();
+        let mut rem = &bytes[..];
+        let mut copied = 0usize;
+        for span in &iovs {
+            if rem.is_empty() {
+                break;
+            }
+            let (chunk, rest) = rem.split_at(rem.len().min(span.len as usize));
+            if !chunk.is_empty() {
+                let n = crate::user::copy_to_user_partial(span.base, chunk);
+                copied += n;
+                if n < chunk.len() {
+                    break;
+                }
+            }
+            rem = rest;
+        }
+        return match anon {
+            AnonObj::EventFd(_) => {
+                if copied == lumen_eventfd::IO_SIZE {
+                    Ok(lumen_eventfd::IO_SIZE as u64)
+                } else {
+                    Err(errno::EFAULT)
+                }
+            }
+            AnonObj::TimerFd(_) => partial(copied, errno::EFAULT),
+        };
+    }
     if let Some(pipe) = file.pipe() {
         // copy_iovecs already checked that the sum fits isize::MAX.
         let planned = iovs.iter().map(|span| span.len as usize).sum();
@@ -426,9 +503,49 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     let _pos = file.lock_pos();
     file.require_writable().map_err(vfs)?;
+    // Linux v6.12 `fs/read_write.c` `vfs_writev` checks `FMODE_CAN_WRITE`
+    // (`-EINVAL`) before `import_iovec`, so a non-writable anon file such as
+    // `timerfd` (`timerfd_fops` has no write handler) returns `-EINVAL` even
+    // for a faulting `iov` pointer.
+    if file.anon().is_some_and(|anon| !anon.can_write()) {
+        return Err(errno::EINVAL);
+    }
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
     if let Some(sock) = file.sock() {
         return super::socket::writev_sock(&**sock, &iovs, file.is_nonblock());
+    }
+    if let Some(anon) = file.anon() {
+        return match anon {
+            AnonObj::EventFd(ev) => {
+                // Linux v6.12 `fs/read_write.c` `vfs_writev` +
+                // `do_loop_readv_writev`: total length 0 returns 0; otherwise
+                // `eventfd_fops` defines `.write` (not `.write_iter`), so
+                // `iov_iter_init` passes a leading zero-length segment as is
+                // (`eventfd_write` len=0 -> `-EINVAL`), while
+                // `iov_iter_advance` skips zero-length segments only after a
+                // write.
+                if iovs.iter().all(|s| s.len == 0) {
+                    return Ok(0);
+                }
+                let mut total = 0usize;
+                for (idx, span) in iovs.iter().enumerate() {
+                    if idx > 0 && span.len == 0 {
+                        continue;
+                    }
+                    match ev.write(span.base, span.len, file.is_nonblock()) {
+                        Ok(n) => {
+                            total += n as usize;
+                            if n < span.len {
+                                break;
+                            }
+                        }
+                        Err(e) => return partial(total, e),
+                    }
+                }
+                Ok(total as u64)
+            }
+            AnonObj::TimerFd(_) => Err(errno::EINVAL),
+        };
     }
     if let Some(pipe) = file.pipe() {
         let nonblock = file.is_nonblock();

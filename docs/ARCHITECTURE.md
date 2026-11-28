@@ -10979,7 +10979,7 @@ anonymous inodes (`anon_inode:[eventfd]`, `anon_inode:[timerfd]`).
   `FileObj::Anon(AnonObj::EventFd)` and `FileObj::Anon(AnonObj::TimerFd)`,
   answered by `KernelFile::pollable()` (B0) and torn down by
   `AnonObj::release()` via `KernelFile::release_end()`.
-- **`eventfd`:** `EventFd { counter: SpinLock<EventCounter>, readers: WaitQueue, writers: WaitQueue, poll: KernelPollHead }`
+- **`eventfd`:** `EventFd { counter: SpinLock<EventCounter>, readers_seq: AtomicU64, writers_seq: AtomicU64, readers: WaitQueue, writers: WaitQueue, poll: KernelPollHead }`
   (the counter a 10c leaf).
   - A `read` or `write` of fewer than 8 bytes is `-EINVAL`.
   - `write` copies its value in before the lock. `EventCounter::write`'s
@@ -10992,11 +10992,12 @@ anonymous inodes (`anon_inode:[eventfd]`, `anon_inode:[timerfd]`).
   - **The mask:** `POLLIN` when the count is non-zero, `POLLOUT` below
     `MAX_COUNTER`. Each change wakes the other side and notifies the
     `PollHead` after the lock is released.
-- **`timerfd`:** `TimerFd { count: SpinLock<TimerCount>, clock: TimerClock, wq: WaitQueue, poll: KernelPollHead, instance: u64 }`.
+- **`timerfd`:** `TimerFd { count: SpinLock<TimerCount>, clock: TimerClock, seq: AtomicU64, wq: WaitQueue, poll: KernelPollHead, instance: u64 }`.
   - **`TIMERS` entries:** the timerfd's deadlines go in `linux::timer`'s
     `TIMERS` (section 8's C13). B6 widens its `Entry` from
     `(Weak<Process>, TimerId)` to a target enum with a
-    `TimerFd(Weak<TimerFd>)` arm, keyed `(deadline, 0, instance)`.
+    `TimerFd(Weak<TimerFd>)` arm, keyed `(deadline, TIMERFD_OWNER, instance)`
+    (`TIMERFD_OWNER` is `0`).
   - **`Requeue`:** every `TimerCount` method that can move the deadline
     (`arm`, `arm_realtime`, `settime`, `disarm`, `on_expiry`, `read`)
     returns a `#[must_use] Requeue { remove, insert }`. `TimerCount` keeps
@@ -11004,7 +11005,9 @@ anonymous inodes (`anon_inode:[eventfd]`, `anon_inode:[timerfd]`).
     `TIMERS` (never a recomputed deadline). The caller updates the
     counter first, then, with the counter's lock still held, takes
     `TIMERS`, removes `remove` and inserts `insert` (the lock order of
-    section 9's 10c note). A stale entry that fires early is harmless:
+    section 9's 10c note); if `insert` is already due, the caller wakes the
+    `timers` worker only after releasing the counter lock (`requeue_timerfd`
+    returns the flag). A stale entry that fires early is harmless:
     `on_expiry` before the deadline does nothing.
   - **Arming:** `settime` calls `TimerCount::settime` with an
     `ITimer { value, interval }` in nanoseconds, which picks
@@ -11033,8 +11036,9 @@ anonymous inodes (`anon_inode:[eventfd]`, `anon_inode:[timerfd]`).
 - **Tested by** `cargo:lumen-eventfd` (#468),
   `ktest:lumen_kernel::linux::evfd::timerfd_expiries_count_on_the_timers_worker`
   (an interval timer read after at least three intervals reports at least
-  3; a disarmed one reports nothing) and
-  `scenario:test_linux_io::test_eventfd_and_timerfd` (section 15).
+  3; a disarmed one reports nothing),
+  `ktest:lumen_kernel::linux::evfd::eventfd_and_timerfd_syscall_edges_and_faults`
+  and `scenario:test_linux_io::test_eventfd_and_timerfd` (section 15).
 
 ## 11. GUI and the automation API (built in M4: designed in #146, built by #147 to #157)
 

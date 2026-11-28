@@ -881,18 +881,22 @@ B1_SOCKET_SYSCALLS = {
     "accept4",
 }  # fmt: skip
 
+B6_EVFD_SYSCALLS = {
+    "timerfd_create", "eventfd", "timerfd_settime", "timerfd_gettime", "eventfd2",
+}  # fmt: skip
+
 
 def test_each_m9_stub_returns_enosys_and_names_its_issue():
     """ARCHITECTURE section 8, "B0's stubs": every remaining M9 stub (its doc
     says "M9 stub") only returns `not_implemented`'s -ENOSYS for its own
     number, its doc names the exact issues section 8's M9 table names for it,
     and the remaining stubs are exactly M9's table minus B1's 16 socket
-    syscalls."""
+    syscalls and B6's 5 eventfd/timerfd syscalls."""
     found = syscalls.stubs(syscalls.cluster_sources(DISPATCH_FILE.parent), milestone="M9")
     design = syscalls.design_issues(ARCHITECTURE_MD.read_text(), milestone="M9")
     assert syscalls.stub_problems(found, design, M9_ISSUES) == []
     tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
-    assert set(found) == set(tables["M9"]) - B1_SOCKET_SYSCALLS
+    assert set(found) == set(tables["M9"]) - B1_SOCKET_SYSCALLS - B6_EVFD_SYSCALLS
 
 
 def test_the_report_lists_a_stub_under_its_milestone(capsys):
