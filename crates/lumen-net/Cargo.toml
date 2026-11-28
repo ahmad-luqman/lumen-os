@@ -1,0 +1,12 @@
+[package]
+name = "lumen-net"
+description = "Linux socket semantics over smoltcp with bounded, allocation-free polling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smoltcp.workspace = true
+
+[lints]
+workspace = true

@@ -13,8 +13,36 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `kernel/Cargo.toml` consumes it for the dependency check:
   binary checks on both ELFs; IR checks on the kernel crate and the smoltcp
   generics it instantiates (`tests/features/net.toml`). Functions compiled
-  in smoltcp's own rlib receive only binary checks. `crates/lumen-net`
-  is #459 PR 2, the Linux socket semantics layer following the stack design.
+  in smoltcp's own rlib receive only binary checks.
+- `crates/lumen-net` (#459 PR 2, M9): Linux TCP/UDP semantics over the
+  pinned smoltcp, with separate loopback and Ethernet interfaces/socket sets.
+  `device.rs`: `NetDevice`, `NetInfo`, `TxError`, the Ethernet `Adapter` and
+  the preallocated `Loopback` ring and bound ICMP source adapter.
+  `memory.rs`: atomic `Budget`/`Charge`,
+  fallible `prepare_tcp`/`prepare_udp`/`prepare_icmp` buffers. `port.rs`:
+  `PortTable`, protocol/family bind conflicts, next-fit ephemeral ports and
+  TIME-WAIT port and four-tuple reservations. `packet.rs`: checksum-checked TCP/UDP tuples for
+  family-aware ingress selection, the SYN backlog filter and reset
+  classification. `stack.rs`: `Stack`,
+  generational `SockId` entries, bounded LISTEN pools, accept queues,
+  event-based `changed` (including packet metadata capacity), per-state
+  timers, orphan cleanup, shutdown readiness, datagram tickets, wildcard
+  receive fairness, TCP tuple uniqueness and listener precedence,
+  UDP recipient specificity and broadcast fan-out, connected-interface send
+  readiness, ICMP local/peer filtering, first-send raw identifiers, hop limits,
+  ping owner selection and listener option inheritance. Caller-timed deadlines
+  count transmitted keepalive probes and reap unreachable orphans; retired
+  TCP transports preserve unread data without duplicate receive buffers.
+  Seeded interfaces, typed preparations, explicit `Family`/`V6Only`, ICMP
+  destination metadata and independent TIME-WAIT capacity bound stack work.
+  `src/tests.rs` checks private invariants; `tests/linux_regressions.rs` and
+  `tests/transport_regressions.rs` cover Linux v6.12 semantics and wake paths.
+  `tests/delivery.rs` checks tuple collisions, TIME-WAIT and recipient precedence;
+  `tests/allocation.rs` also covers broadcast fan-out without allocation.
+  `lib.rs`: shared types, errno mapping, buffer-size and backlog clamps.
+  Host tests drive made-up time over loopback and a frame wire pair,
+  including allocation counters, capacity limits, port exhaustion and
+  randomized connection churn.
 - `kernel/src/main.rs`: boot sequence. `boot.rs`: the Limine requests
   (and, by hand, the TSC-frequency and bootloader-performance ones;
   `before_kmain`).

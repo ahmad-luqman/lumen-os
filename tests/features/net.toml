@@ -34,3 +34,8 @@ tests = [
     "ktest:lumen_kernel::net::sock::socket_sendmsg_rights_and_flock",
     "ktest:lumen_kernel::net::sock::socket_recvmsg_control_and_block_on",
 ]
+
+[[feature]]
+name = "TCP and UDP socket semantics over smoltcp (logic)"
+milestone = "M9"
+tests = ["cargo:lumen-net"]

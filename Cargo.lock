@@ -549,6 +549,13 @@ name = "lumen-mm"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-net"
+version = "0.0.1"
+dependencies = [
+ "smoltcp",
+]
+
+[[package]]
 name = "lumen-pci"
 version = "0.0.1"
 
